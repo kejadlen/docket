@@ -41,14 +41,13 @@ Chosen setup: **one credential per login, no JMAP sharing.** The household login
 
 ## Model
 
-The primitive is the **message**. Each received message has four independent values:
+The primitive is the **message**. Each received message has three independent values:
 
 - **State**: what's happening with it.
 - **Folder**: where it's filed.
 - **Assignees**: who it's on.
-- **Comments**: internal discussion attached to it.
 
-None of these changes another. A **thread** is a grouping the UI draws from JMAP `threadId` (and headers); it has no values of its own. Sent messages have no state, folder, or assignees.
+None of these changes another. A **thread** is a grouping the UI draws from JMAP `threadId` (and headers). Its only data of its own is **comments**. Sent messages have no state, folder, or assignees.
 
 ### State
 
@@ -88,21 +87,18 @@ Folders are for filing and are managed by Fastmail (including server-side rules)
 
 ### Comments
 
-Internal comments are attached to a message and appear right after it in the thread. They never go to the sender and are Docket-only. They replace notes.
+Internal comments belong to the thread and appear in the chain in time order, between messages. They never go to the sender and are Docket-only. They replace notes.
 
-### Acting on threads
+### Editing values
 
-Values are per message, but most work is per thread, so the UI makes the thread the default scope:
-
-- Changing state, folder, or assignees applies by default to every message in the thread that is still in Inbox, with an option to narrow it to the selected message.
-- Selecting individual messages in the thread view scopes the change to them.
+There is no toolbar and no thread-level action. Each message's state, folder, and assignees are shown on the message, and clicking a value is how you change it. A change applies to that message only.
 
 ## Core flows
 
-- **Landing — For me**: messages assigned to me (any state) plus unassigned Inbox messages, grouped by state, then by thread. A thread row headlines the message that matches the group and shows "+N in thread".
-- **Triage**: from the list or the thread view. One control each for state, folder, and assignees. No modals; an undo toast after each change.
-- **Thread view**: messages in order, each with its own state, folder, and assignees inline; comments under the message they belong to; events ("Sam moved to Do", "filed via another client"). Older messages collapse. The toolbar acts on the selected messages.
-- **Lane views**: one list component, grouped by thread:
+- **Landing — For me**: individual messages assigned to me (any state) plus unassigned Inbox messages, grouped by state, then by thread. A thread group lists only its messages in that state, with a count ("2 of 4"); the rest of the thread is omitted.
+- **Triage**: from the list or the thread view. Click the value to change it. No modals; an undo toast after each change.
+- **Thread view**: received messages, sent messages, and comments in time order, as ruled rows of equal weight. Each row has the sender (and cc/bcc when present) and body on the left; a right gutter holds the date and, for received messages, state, folder, and assignees in fixed positions so they line up down the thread. Sent messages show the recipient after the sender and no values. Comments sit on a filled row. Events ("Sam moved to Do", "filed via another client"). Older messages collapse; their values stay clickable.
+- **Lane views**: one list component showing individual messages, grouped by thread (only messages in that lane):
   - Inbox: assigned to me / to them / no one.
   - Do: Mine / Unassigned / Theirs, oldest first.
   - Wait: oldest first.
@@ -123,7 +119,7 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 ## Data and sync
 
 - **Mail server (JMAP)**: messages, folders, and `Docket/` state labels — source of truth for mail and filing.
-- **App database**: users, credentials (token references), accounts (credential + `accountId`), per-message state and assignees, per-user read, comments, history, sync state.
+- **App database**: users, credentials (token references), accounts (credential + `accountId`), per-message state and assignees, per-user read, per-thread comments, history, sync state.
 - Records are keyed by account + Message-ID; JMAP ids and `threadId` are cached alongside, since they can change on reimport.
 - One JMAP session and push connection (EventSource) per credential; `Email/changes` / `Mailbox/changes` per account, with periodic polling as a fallback.
 - Rights are re-read on session refresh.
