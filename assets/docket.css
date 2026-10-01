@@ -31,15 +31,18 @@ button { font: inherit; color: inherit; }
 .badge.success { color: var(--gl-color-success); }
 
 /* ── mailboxes ── */
-.side { padding: var(--gl-space-m) var(--gl-space-s); display: flex; flex-direction: column; gap: var(--gl-space-m); min-height: 0; overflow-y: auto; }
+.side { padding: var(--gl-space-m) var(--gl-space-s) var(--gl-space-2xs); display: flex; flex-direction: column; gap: var(--gl-space-m); min-height: 0; overflow-y: auto; }
+.brand-row { display: flex; justify-content: space-between; align-items: center; }
+.search-btn { all: unset; display: flex; cursor: pointer; color: var(--gl-color-text-tertiary); transition: color var(--gl-dur-fast) var(--gl-ease); }
+.search-btn:hover { color: var(--gl-color-text-primary); }
+.search-btn:focus-visible { outline: 2px solid var(--gl-color-accent); outline-offset: 2px; border-radius: 2px; }
 .brand { font: 600 var(--gl-step-0)/1.2 var(--gl-font-text); letter-spacing: -.01em; padding: 0 2px; }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-item { display: flex; justify-content: space-between; align-items: baseline; padding: 7px 8px; margin: 0 -8px; border-radius: var(--gl-radius); color: inherit; text-decoration: none; transition: background var(--gl-dur-fast) var(--gl-ease); }
 .nav-item:hover { background: var(--gl-color-surface-fill-2); color: inherit; }
 .nav-item.on { background: var(--gl-color-surface-card); font-weight: 600; }
-.who { display: flex; flex-direction: column; gap: 3px; padding: 0 2px; }
-.who.ctrl { padding: 0; }
-.who-btn { all: unset; cursor: pointer; display: flex; flex-direction: column; gap: 3px; padding: 4px 2px; border-radius: var(--gl-radius); }
+.who { display: flex; flex-direction: column; gap: 3px; }
+.who-btn { all: unset; cursor: pointer; display: flex; flex-direction: column; gap: 3px; padding: 7px 8px; margin: 0 -8px; border-radius: var(--gl-radius); }
 .who-btn:hover { background: var(--gl-color-surface-fill-2); }
 .who-name { font-weight: 600; }
 .who-login { text-transform: none; letter-spacing: 0; color: var(--gl-color-text-tertiary); }
