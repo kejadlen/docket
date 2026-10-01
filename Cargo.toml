@@ -1,0 +1,33 @@
+[package]
+name = "docket"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "docket"
+path = "src/bin/docket/main.rs"
+
+[dependencies]
+axum = "*"
+clap = { version = "*", features = ["derive", "env"] }
+fs-err = "*"
+miette = { version = "*", features = ["fancy"] }
+thiserror = "*"
+tokio = { version = "*", features = ["full"] }
+tower = "*"
+tower-http = { version = "*", features = ["trace"] }
+tracing = "*"
+tracing-subscriber = { version = "*", features = ["env-filter"] }
+
+[dev-dependencies]
+hegeltest = "*"
+reqwest = "*"
+tempfile = "*"
+
+[lints.clippy]
+self_named_module_files = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"

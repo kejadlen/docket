@@ -1,0 +1,3 @@
+# Skip ignored files when copying the tree: ramekin bind-mounts a
+# character device over the direnv file, which aborts the copy.
+gitignore = true
