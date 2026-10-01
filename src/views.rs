@@ -198,7 +198,7 @@ fn list_section(p: &Page<'_>, section: &Section<'_>) -> Markup {
                     span.sub { (section.sub) }
                 }
             }
-            div.gl-ledger {
+            div.groups {
                 @for group in &section.groups {
                     div.group {
                         div.group-head {
@@ -207,8 +207,10 @@ fn list_section(p: &Page<'_>, section: &Section<'_>) -> Markup {
                                 span.type-label.more { (more) }
                             }
                         }
-                        @for m in &group.rows {
-                            (row(p, m, section.compact))
+                        div.rail {
+                            @for m in &group.rows {
+                                (row(p, m, section.compact))
+                            }
                         }
                     }
                 }
