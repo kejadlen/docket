@@ -11,7 +11,10 @@ path = "src/bin/docket/main.rs"
 axum = "*"
 clap = { version = "*", features = ["derive", "env"] }
 fs-err = "*"
+jiff = "*"
+maud = { version = "*", features = ["axum"] }
 miette = { version = "*", features = ["fancy"] }
+serde = { version = "*", features = ["derive"] }
 thiserror = "*"
 tokio = { version = "*", features = ["full"] }
 tower = "*"
@@ -21,7 +24,7 @@ tracing-subscriber = { version = "*", features = ["env-filter"] }
 
 [dev-dependencies]
 hegeltest = "*"
-reqwest = "*"
+reqwest = { version = "*", features = ["form"] }
 tempfile = "*"
 
 [lints.clippy]

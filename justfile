@@ -25,5 +25,9 @@ mutants:
 
 all: fmt clippy coverage
 
+# Serve the fixture-backed UI without Tailscale on http://127.0.0.1:3000.
+dev:
+    cargo run -- --dev
+
 install:
     cargo install --locked --path .

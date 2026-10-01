@@ -17,7 +17,9 @@ async fn main() -> miette::Result<()> {
         .init();
 
     let config = config::Config::parse();
-    let app = docket::routes::router();
+    // Fixtures stand in for the database and JMAP sync until they exist.
+    let state = docket::routes::AppState::new(docket::fixtures::store(), config.dev);
+    let app = docket::routes::router(state);
 
     let listener = TcpListener::bind(config.bind).await.into_diagnostic()?;
     tracing::info!(addr = %config.bind, "listening");
