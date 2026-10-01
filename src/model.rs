@@ -109,6 +109,8 @@ pub enum Kind {
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: MessageId,
+    /// The RFC 5322 Message-ID, without angle brackets.
+    pub message_id: String,
     pub thread: ThreadId,
     pub at: DateTime,
     pub cc: Vec<String>,

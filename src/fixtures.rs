@@ -21,6 +21,10 @@ fn at(month: i8, day: i8, hour: i8, minute: i8) -> DateTime {
     date(2026, month, day).at(hour, minute, 0, 0)
 }
 
+fn message_id(id: MessageId) -> String {
+    format!("{id}@fixtures.docket.invalid")
+}
+
 fn strings(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|&x| x.to_owned()).collect()
 }
@@ -51,6 +55,7 @@ impl Builder {
     ) {
         self.store.messages.push(Message {
             id,
+            message_id: message_id(id),
             thread,
             at,
             cc: strings(cc),
@@ -82,6 +87,7 @@ impl Builder {
     ) {
         self.store.messages.push(Message {
             id,
+            message_id: message_id(id),
             thread,
             at,
             cc: strings(cc),

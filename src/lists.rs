@@ -2,8 +2,6 @@
 //! individual messages, grouped by thread; a group holds only the thread's
 //! messages that belong in that section.
 
-use std::collections::BTreeSet;
-
 use crate::model::{Kind, Message, State, Thread, User};
 use crate::store::Store;
 
@@ -11,7 +9,6 @@ use crate::store::Store;
 pub enum View {
     ForMe,
     Lane(State),
-    Folder(String),
     Search(String),
 }
 
@@ -20,7 +17,6 @@ impl View {
         match self {
             View::ForMe => "For me".to_owned(),
             View::Lane(state) => state.name().to_owned(),
-            View::Folder(folder) => folder.clone(),
             View::Search(_) => "Search".to_owned(),
         }
     }
@@ -32,22 +28,12 @@ enum Order {
     OldestFirst,
 }
 
-/// What a section already says about its rows, so rows needn't repeat it.
-#[derive(Debug, Clone, Default)]
-pub struct Context {
-    pub show_state: bool,
-    pub show_folder: bool,
-    /// Rows assigned to exactly these people leave assignees off.
-    pub implied: Option<BTreeSet<String>>,
-}
-
 #[derive(Debug)]
 pub struct Section<'a> {
     pub head: String,
     pub sub: String,
     /// Compact rows drop the snippet (Watch).
     pub compact: bool,
-    pub context: Context,
     pub groups: Vec<Group<'a>>,
 }
 
@@ -69,7 +55,6 @@ impl Group<'_> {
 pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>> {
     let received = || store.messages.iter().filter(|m| m.values().is_some());
     let in_state = move |state| received().filter(move |m| m.state() == Some(state));
-    let me_only: BTreeSet<String> = BTreeSet::from([me.slug.clone()]);
     let to_me = format!("→ {}", me.name.to_uppercase());
     let them: Vec<_> = store
         .users
@@ -78,10 +63,6 @@ pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>
         .map(|u| u.name.to_uppercase())
         .collect();
     let to_them = format!("→ {}", them.join(", "));
-    let folder_context = Context {
-        show_folder: true,
-        ..Context::default()
-    };
 
     let mut out = Vec::new();
     match view {
@@ -91,10 +72,6 @@ pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>
                 out.push(section(
                     store,
                     (state.name().to_uppercase(), to_me.clone()),
-                    Context {
-                        implied: Some(me_only.clone()),
-                        ..folder_context.clone()
-                    },
                     mine.collect(),
                     Order::NewestFirst,
                 ));
@@ -102,7 +79,6 @@ pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>
                     out.push(section(
                         store,
                         (state.name().to_uppercase(), "NO ONE’S".to_owned()),
-                        folder_context.clone(),
                         in_state(state).filter(|m| m.is_unassigned()).collect(),
                         Order::NewestFirst,
                     ));
@@ -115,9 +91,6 @@ pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>
             } else {
                 Order::NewestFirst
             };
-            let mine = (to_me, String::new());
-            let nobody = ("NO ONE’S".to_owned(), String::new());
-            let theirs = (to_them, String::new());
             let mine_msgs = in_state(*state)
                 .filter(|m| m.is_assigned_to(&me.slug))
                 .collect();
@@ -125,18 +98,14 @@ pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>
             let theirs_msgs = in_state(*state)
                 .filter(|m| !m.is_unassigned() && !m.is_assigned_to(&me.slug))
                 .collect();
-            let mine = section(
+            let mine = section(store, (to_me, String::new()), mine_msgs, order);
+            let nobody = section(
                 store,
-                mine,
-                Context {
-                    implied: Some(me_only),
-                    ..folder_context.clone()
-                },
-                mine_msgs,
+                ("NO ONE’S".to_owned(), String::new()),
+                nobody_msgs,
                 order,
             );
-            let nobody = section(store, nobody, folder_context.clone(), nobody_msgs, order);
-            let theirs = section(store, theirs, folder_context, theirs_msgs, order);
+            let theirs = section(store, (to_them, String::new()), theirs_msgs, order);
             // Inbox reads me / them / no one; Do reads mine / unassigned / theirs.
             if *state == State::Do {
                 out.extend([mine, nobody, theirs]);
@@ -153,29 +122,11 @@ pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>
             let mut s = section(
                 store,
                 (String::new(), String::new()),
-                folder_context,
                 in_state(*state).collect(),
                 order,
             );
             s.compact = *state == State::Watch;
             out.push(s);
-        }
-        View::Folder(folder) => {
-            for state in State::ALL {
-                out.push(section(
-                    store,
-                    (state.name().to_uppercase(), String::new()),
-                    Context::default(),
-                    in_state(state)
-                        .filter(|m| m.values().and_then(|v| v.folder.as_ref()) == Some(folder))
-                        .collect(),
-                    if state == State::Done {
-                        Order::NewestFirst
-                    } else {
-                        Order::OldestFirst
-                    },
-                ));
-            }
         }
         View::Search(query) => {
             let query = query.trim().to_lowercase();
@@ -188,10 +139,6 @@ pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>
                 out.push(section(
                     store,
                     ("RESULTS".to_owned(), String::new()),
-                    Context {
-                        show_state: true,
-                        ..folder_context
-                    },
                     hits,
                     Order::NewestFirst,
                 ));
@@ -225,7 +172,6 @@ fn matches(store: &Store, m: &Message, query: &str) -> bool {
 fn section<'a>(
     store: &'a Store,
     (head, sub): (String, String),
-    context: Context,
     mut msgs: Vec<&'a Message>,
     order: Order,
 ) -> Section<'a> {
@@ -252,7 +198,6 @@ fn section<'a>(
         head,
         sub,
         compact: false,
-        context,
         groups,
     }
 }
@@ -382,19 +327,6 @@ mod tests {
     }
 
     #[test]
-    fn folders_group_by_every_state() {
-        let store = fixtures::store();
-        assert_eq!(
-            heads(&store, "sam", &View::Folder("House".into())),
-            ["INBOX|", "WAIT|", "WATCH|", "DONE|"]
-        );
-        assert_eq!(
-            heads(&store, "sam", &View::Folder("Medical".into())),
-            ["INBOX|", "DONE|"]
-        );
-    }
-
-    #[test]
     fn search_covers_every_message() {
         let store = fixtures::store();
         let hits = summary(&store, "sam", &View::Search("downspout".into()));
@@ -411,7 +343,6 @@ mod tests {
     fn titles() {
         assert_eq!(View::ForMe.title(), "For me");
         assert_eq!(View::Lane(State::Do).title(), "Do");
-        assert_eq!(View::Folder("House".into()).title(), "House");
         assert_eq!(View::Search("x".into()).title(), "Search");
     }
 }

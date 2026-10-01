@@ -1,11 +1,11 @@
-//! HTML for the three-pane mail layout: mailboxes and folders, the message
-//! list, and the thread. Alpine handles the menus and collapsing; every
-//! change is a plain form post.
+//! HTML for the three-pane mail layout: mailboxes, the message list, and the
+//! thread. Alpine handles the menus and collapsing; every change is a plain
+//! form post.
 
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::dates;
-use crate::lists::{self, Context, Section, View};
+use crate::lists::{self, Section, View};
 use crate::model::{Comment, Kind, Message, State, User, Values};
 use crate::store::{Flash, Item, Store};
 
@@ -25,7 +25,6 @@ pub fn view_path(view: &View) -> String {
     match view {
         View::ForMe => "/".to_owned(),
         View::Lane(state) => format!("/{}", state.slug()),
-        View::Folder(folder) => format!("/folders/{}", encode(folder)),
         View::Search(query) => format!("/search?q={}", encode(query)),
     }
 }
@@ -49,14 +48,27 @@ pub fn encode(s: &str) -> String {
     out
 }
 
-fn state_mark(state: State) -> &'static str {
+/// Replies happen in Fastmail. Whether its search URLs are a stable way to
+/// land on one message is still an open question in DESIGN.md.
+pub fn fastmail_url(m: &Message) -> String {
+    format!(
+        "https://app.fastmail.com/mail/search:{}",
+        encode(&format!("msgid:<{}>", m.message_id))
+    )
+}
+
+/// Gloss Badge tones: Do takes the project accent, Done the fixed success
+/// green, everything else stays neutral.
+fn tone(state: State) -> &'static str {
     match state {
-        State::Inbox => "var(--gl-color-text-tertiary)",
-        State::Do => "var(--gl-color-text-primary)",
-        State::Wait => "var(--gl-color-text-secondary)",
-        State::Watch => "var(--gl-color-accent)",
-        State::Done => "var(--gl-color-success)",
+        State::Do => "accent",
+        State::Done => "success",
+        State::Inbox | State::Wait | State::Watch => "neutral",
     }
+}
+
+fn badge(state: State) -> Markup {
+    html! { span.badge.(tone(state)) { span.mark {} (state.name()) } }
 }
 
 fn assignee_label(store: &Store, values: &Values) -> Option<String> {
@@ -69,6 +81,9 @@ fn assignee_label(store: &Store, values: &Values) -> Option<String> {
         format!("→ {}", names.join(", "))
     })
 }
+
+/// Lucide's external-link, at Gloss's icon weight.
+const EXTERNAL_ICON: &str = r#"<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>"#;
 
 pub fn page(p: &Page<'_>) -> Markup {
     html! {
@@ -108,19 +123,17 @@ fn sidebar(p: &Page<'_>) -> Markup {
     let views = std::iter::once(View::ForMe).chain(State::LANES.map(View::Lane));
     html! {
         nav.side {
-            form.search action="/search" method="get" {
-                input type="search" name="q" placeholder="Search mail" value=(query) aria-label="Search mail";
+            span.brand { "Docket" }
+            form action="/search" method="get" {
+                input.field type="search" name="q" placeholder="Search mail" value=(query) aria-label="Search mail";
             }
-            @for view in views {
-                a.nav-item.on[&view == p.view] href=(view_path(&view)) {
-                    span { (view.title()) }
-                    span.count { (lists::count(p.store, p.me, &view)) }
+            div.nav {
+                @for view in views {
+                    a.nav-item.on[&view == p.view] href=(view_path(&view)) {
+                        span { (view.title()) }
+                        span.type-figure.count { (lists::count(p.store, p.me, &view)) }
+                    }
                 }
-            }
-            div.side-head { "FOLDERS" }
-            @for folder in &p.store.folders {
-                @let view = View::Folder(folder.clone());
-                a.nav-item.on[&view == p.view] href=(view_path(&view)) { span { (folder) } }
             }
             div.grow {}
             (whoami(p))
@@ -131,18 +144,19 @@ fn sidebar(p: &Page<'_>) -> Markup {
 fn whoami(p: &Page<'_>) -> Markup {
     let who = html! {
         span.who-name { (p.me.name) }
-        span.who-login { (p.me.login) }
+        span.type-label.who-login { (p.me.login) }
     };
     html! {
         @if p.dev {
             div.who.ctrl x-data="{ open: false }" "@click.outside"="open = false" "@keydown.escape"="open = false" {
                 button.who-btn type="button" "@click"="open = !open" { (who) }
-                form.menu.menu-up method="post" action="/dev/user" x-show="open" x-cloak {
+                form.menu.up method="post" action="/dev/user" x-show="open" x-cloak {
                     (back(p.here))
                     @for user in &p.store.users {
-                        button.opt.cur[user.slug == p.me.slug] type="submit" name="user" value=(user.slug) {
-                            span.box.on[user.slug == p.me.slug] {}
-                            (user.name)
+                        @let on = user.slug == p.me.slug;
+                        button.opt.cur[on] type="submit" name="user" value=(user.slug) {
+                            span { (user.name) }
+                            span.check { @if on { "✓" } }
                         }
                     }
                 }
@@ -164,7 +178,7 @@ fn list(p: &Page<'_>) -> Markup {
         section.list aria-label="Messages" {
             header.list-head {
                 h1 { (p.view.title()) }
-                span.mono { (total) }
+                span.type-figure.count { (total) }
             }
             @if sections.is_empty() {
                 p.empty { "Nothing here." }
@@ -178,22 +192,26 @@ fn list(p: &Page<'_>) -> Markup {
 
 fn list_section(p: &Page<'_>, section: &Section<'_>) -> Markup {
     html! {
-        @if !section.head.is_empty() {
-            div.section-head {
-                span { (section.head) }
-                span.sub { (section.sub) }
-            }
-        }
-        @for group in &section.groups {
-            div.group {
-                div.group-head {
-                    span.subj { (group.thread.subject) }
-                    @if let Some(more) = group.more() {
-                        span.more { (more) }
-                    }
+        div {
+            @if !section.head.is_empty() {
+                div.type-section.section-head {
+                    span { (section.head) }
+                    span.sub { (section.sub) }
                 }
-                @for m in &group.rows {
-                    (row(p, m, &section.context, section.compact))
+            }
+            div.gl-ledger {
+                @for group in &section.groups {
+                    div.group {
+                        div.group-head {
+                            span.subj { (group.thread.subject) }
+                            @if let Some(more) = group.more() {
+                                span.type-label.more { (more) }
+                            }
+                        }
+                        @for m in &group.rows {
+                            (row(p, m, section.compact))
+                        }
+                    }
                 }
             }
         }
@@ -207,41 +225,15 @@ fn sender(store: &Store, m: &Message) -> String {
     }
 }
 
-fn row_meta(store: &Store, m: &Message, context: &Context) -> String {
-    let Some(values) = m.values() else {
-        return String::new();
-    };
-    let mut parts = Vec::new();
-    if context.show_state {
-        parts.push(values.state.name().to_uppercase());
-    }
-    if context.show_folder
-        && let Some(folder) = &values.folder
-    {
-        parts.push(folder.to_uppercase());
-    }
-    if context.implied.as_ref() != Some(&values.assignees)
-        && let Some(label) = assignee_label(store, values)
-    {
-        parts.push(label);
-    }
-    parts.join(" · ")
-}
-
-fn row(p: &Page<'_>, m: &Message, context: &Context, compact: bool) -> Markup {
+fn row(p: &Page<'_>, m: &Message, compact: bool) -> Markup {
     let selected = p.selected.is_some_and(|s| s.id == m.id);
     let unread = p.store.is_unread(&p.me.slug, m);
-    let meta = row_meta(p.store, m, context);
     html! {
         a.row.sel[selected].unread[unread] href=(select_path(p.view, m.id)) {
-            span.dot {}
             span.from { (sender(p.store, m)) }
-            span.age { (dates::short(p.store.now, m.at)) }
+            span.type-figure.age { (dates::short(p.store.now, m.at)) }
             @if !compact {
                 span.snip { (m.body) }
-            }
-            @if !meta.is_empty() {
-                span.meta { (meta) }
             }
         }
     }
@@ -264,41 +256,34 @@ fn thread(p: &Page<'_>, selected: &Message) -> Markup {
     let subject = store
         .thread(selected.thread)
         .map_or("", |t| t.subject.as_str());
-    let account = store.thread_account(selected.thread);
-    let read_only = account.is_some_and(|a| a.read_only);
-    let msgs = store.thread_messages(selected.thread);
-    let latest = msgs.last().map(|m| m.id);
-    let count = match msgs.len() {
-        1 => "1 MESSAGE".to_owned(),
-        n => format!("{n} MESSAGES"),
-    };
-    let mut meta = vec![account.map_or(String::new(), |a| a.name.to_uppercase())];
-    if read_only {
-        meta.push("READ-ONLY".to_owned());
-    }
-    meta.push(count);
+    let read_only = store
+        .thread_account(selected.thread)
+        .is_some_and(|a| a.read_only);
+    let latest = store.thread_messages(selected.thread).last().map(|m| m.id);
     html! {
         article.thread {
             header.thread-head {
                 h2 { (subject) }
-                span.mono { (meta.join(" · ")) }
+                @if read_only {
+                    span.type-label { "Read-only" }
+                }
             }
-            @for item in store.timeline(selected.thread) {
-                @match item {
-                    Item::Comment(c) => (comment(store, c)),
-                    Item::Message(m) => {
-                        @let open = m.id == selected.id || Some(m.id) == latest;
-                        (message(p, m, open, m.id == selected.id, read_only))
+            div.chain {
+                @for item in store.timeline(selected.thread) {
+                    @match item {
+                        Item::Comment(c) => (comment(store, c)),
+                        Item::Message(m) => {
+                            @let open = m.id == selected.id || Some(m.id) == latest;
+                            (message(p, m, open, m.id == selected.id, read_only))
+                        }
                     }
                 }
             }
-            form.comment-box method="post" action=(format!("/threads/{}/comments", selected.thread))
-                x-data="{ text: '' }" {
+            form.comment-box method="post" action=(format!("/threads/{}/comments", selected.thread)) {
                 (back(p.here))
-                textarea name="text" rows="1" placeholder="Add an internal comment to this thread"
-                    aria-label="Internal comment" x-model="text"
-                    "@keydown.enter"="if (!$event.shiftKey) { $event.preventDefault(); if (text.trim()) $el.form.requestSubmit() }" {}
-                button.btn type="submit" x-show="text.trim()" x-cloak { "COMMENT" }
+                input.field type="text" name="text" required placeholder="Add an internal comment to this thread"
+                    aria-label="Internal comment" autocomplete="off";
+                button.btn.primary type="submit" { "Comment" }
             }
         }
     }
@@ -308,10 +293,10 @@ fn comment(store: &Store, c: &Comment) -> Markup {
     html! {
         div.item.comment {
             div.body {
-                b { (store.user_name(&c.author)) }
+                span.author { b { (store.user_name(&c.author)) } span.type-label { "Internal" } }
                 span.text { (c.text) }
             }
-            div.gutter { span.date { (dates::short(store.now, c.at)) } }
+            div.gutter { span.type-figure.date { (dates::short(store.now, c.at)) } }
         }
     }
 }
@@ -338,7 +323,7 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, read_only: boo
         "{ open: false }"
     };
     html! {
-        div.item.sel[selected] id=(format!("m{}", m.id)) x-data=(state) {
+        div.item.card.sel[selected] id=(format!("m{}", m.id)) x-data=(state) {
             div.body {
                 div.from "@click"="open = !open" {
                     b { (who) } " " span.addr { (addr) }
@@ -350,20 +335,28 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, read_only: boo
                 span.text.closed x-show="!open" x-cloak[open] "@click"="open = true" { (m.body) }
             }
             div.gutter {
-                span.date { (dates::short(store.now, m.at)) }
-                @if let Some(values) = m.values() {
-                    (values_controls(p, m.id, values, read_only))
+                span.when {
+                    span.type-figure.date { (dates::short(store.now, m.at)) }
+                    a.icon-btn href=(fastmail_url(m)) target="_blank" rel="noopener"
+                        title="Open in Fastmail" aria-label="Open in Fastmail" { (PreEscaped(EXTERNAL_ICON)) }
+                }
+                @match m.values() {
+                    Some(values) => (values_controls(p, m.id, values, read_only)),
+                    None => span.type-label.sent { "Sent" },
                 }
             }
         }
     }
 }
 
+/// A value that opens its menu when clicked. Menus open upward, as in the
+/// design, unless that would run off the top of the pane.
 fn menu(label: Markup, action: String, here: &str, options: Markup) -> Markup {
     html! {
-        div.ctrl x-data="{ open: false }" "@click.outside"="open = false" "@keydown.escape"="open = false" {
-            button.ctrl-btn type="button" "@click"="open = !open" ":class"="open && 'on'" { (label) }
-            form.menu method="post" action=(action) x-show="open" x-cloak {
+        div.ctrl x-data="{ open: false, up: true }" "@click.outside"="open = false" "@keydown.escape"="open = false" {
+            button.ctrl-btn type="button" ":class"="open && 'on'"
+                "@click"="up = $el.getBoundingClientRect().top > 260; open = !open" { (label) }
+            form.menu method="post" action=(action) x-show="open" x-cloak ":class"="up ? 'up' : 'down'" {
                 (back(here))
                 (options)
             }
@@ -371,54 +364,53 @@ fn menu(label: Markup, action: String, here: &str, options: Markup) -> Markup {
     }
 }
 
+fn check(on: bool) -> Markup {
+    html! { span.check { @if on { "✓" } } }
+}
+
 fn values_controls(p: &Page<'_>, id: u32, values: &Values, read_only: bool) -> Markup {
-    let state_label = html! {
-        span.sq style=(format!("background:{}", state_mark(values.state))) {}
-        (values.state.name().to_uppercase())
-    };
     let states = html! {
         @for state in State::ALL {
-            button.opt.cur[state == values.state] type="submit" name="state" value=(state.slug()) {
-                span.box style=(format!("background:{}", state_mark(state))) {}
-                (state.name())
+            @let on = state == values.state;
+            button.opt.cur[on] type="submit" name="state" value=(state.slug()) {
+                (badge(state)) (check(on))
             }
         }
     };
-    let folder_label = html! {
-        span.sq {}
-        (values.folder.as_deref().map_or("—".to_owned(), str::to_uppercase))
-    };
+    let folder_label = values.folder.as_deref().unwrap_or("—");
     let folders = html! {
         button.opt.cur[values.folder.is_none()] type="submit" name="folder" value="" {
-            span.box.on[values.folder.is_none()] {} "No folder"
+            span { "No folder" } (check(values.folder.is_none()))
         }
         @for folder in &p.store.folders {
             @let on = values.folder.as_ref() == Some(folder);
             button.opt.cur[on] type="submit" name="folder" value=(folder) {
-                span.box.on[on] {} (folder)
+                span { (folder) } (check(on))
             }
         }
     };
-    let assigned_label = html! {
-        span.sq {}
-        (assignee_label(p.store, values).unwrap_or_else(|| "ASSIGN".to_owned()))
-    };
+    let assigned = assignee_label(p.store, values);
     let people = html! {
         @for user in &p.store.users {
             @let on = values.assignees.contains(&user.slug);
             button.opt.cur[on] type="submit" name="user" value=(user.slug) {
-                span.box.on[on] {} (user.name)
+                span { (user.name) } (check(on))
             }
         }
     };
     html! {
-        (menu(state_label, format!("/messages/{id}/state"), p.here, states))
+        (menu(badge(values.state), format!("/messages/{id}/state"), p.here, states))
         @if read_only {
-            span.ctrl-static { (folder_label) }
+            span.type-label.value.static { (folder_label) }
         } @else {
-            (menu(folder_label, format!("/messages/{id}/folder"), p.here, folders))
+            (menu(html! { span.type-label.value { (folder_label) } }, format!("/messages/{id}/folder"), p.here, folders))
         }
-        (menu(assigned_label, format!("/messages/{id}/assignees"), p.here, people))
+        (menu(html! {
+            @match &assigned {
+                Some(label) => span.type-label.value { (label) },
+                None => span.type-label.value.unset { "Assign" },
+            }
+        }, format!("/messages/{id}/assignees"), p.here, people))
     }
 }
 
@@ -445,12 +437,18 @@ mod tests {
     fn paths() {
         assert_eq!(view_path(&View::ForMe), "/");
         assert_eq!(view_path(&View::Lane(State::Wait)), "/wait");
-        assert_eq!(
-            view_path(&View::Folder("Kid stuff".into())),
-            "/folders/Kid%20stuff"
-        );
         assert_eq!(view_path(&View::Search("a&b".into())), "/search?q=a%26b");
         assert_eq!(select_path(&View::ForMe, 4), "/?m=4");
         assert_eq!(select_path(&View::Search("x".into()), 4), "/search?q=x&m=4");
+    }
+
+    #[test]
+    fn fastmail_links_search_by_message_id() {
+        let store = crate::fixtures::store();
+        let m = store.message(4).unwrap();
+        assert_eq!(
+            fastmail_url(m),
+            "https://app.fastmail.com/mail/search:msgid%3A%3C4%40fixtures.docket.invalid%3E"
+        );
     }
 }

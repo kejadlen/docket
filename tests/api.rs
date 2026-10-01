@@ -84,19 +84,19 @@ async fn for_me_lists_messages_grouped_by_state_and_thread() {
     assert!(body.contains("Gutter repair estimate"));
     assert!(body.contains("2 OF 4"));
     assert!(body.contains("No thread open."));
-    // Sam's Do group carries the folder, not the assignee the section names.
-    assert!(body.contains(r#"<span class="meta">SCHOOL</span>"#));
+    // Rows carry sender, age and snippet; values live in the thread.
+    assert!(body.contains(r#"<span class="from">Northwind Roofing</span>"#));
+    assert!(!body.contains("FOLDERS"));
 }
 
 #[tokio::test]
-async fn lanes_folders_and_search() {
+async fn lanes_and_search() {
     let addr = spawn().await;
     for (path, needle) in [
         ("/inbox", "→ ALEX"),
         ("/do", "Exemption renewal"),
         ("/wait", "Claim 4471"),
         ("/watch", "Shipped: furnace filters"),
-        ("/folders/Medical", "Your annual checkup"),
         ("/search?q=downspout", "Sam → Northwind Roofing"),
     ] {
         let (status, body) = get(addr, SAM, path).await;
@@ -110,9 +110,8 @@ async fn lanes_folders_and_search() {
     // A search result row links back into the search.
     let (_, body) = get(addr, SAM, "/search?q=checkup").await;
     assert!(body.contains("/search?q=checkup&amp;m=15"));
-    assert!(body.contains("DONE · MEDICAL"));
 
-    for path in ["/done", "/nope", "/folders/Nope", "/?m=999"] {
+    for path in ["/done", "/nope", "/folders/Medical", "/?m=999"] {
         let (status, _) = get(addr, SAM, path).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
@@ -123,7 +122,18 @@ async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
     let addr = spawn().await;
     let (status, body) = get(addr, SAM, "/?m=4").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("HOUSEHOLD · 4 MESSAGES"));
+    assert!(body.contains("<h2>Gutter repair estimate</h2>"));
+    // Only the selected email floats.
+    assert!(body.contains(r#"class="item card sel" id="m4""#));
+    assert!(body.contains(r#"class="item card" id="m3""#));
+    assert!(body.contains(r#"<span class="type-label">Internal</span>"#));
+    assert!(body.contains(r#"<span class="type-label sent">Sent</span>"#));
+    assert!(body.contains(r#"<span class="badge accent"><span class="mark"></span>Do</span>"#));
+    assert!(body.contains(r#"<span class="badge success"><span class="mark"></span>Done</span>"#));
+    assert!(body.contains(
+        "https://app.fastmail.com/mail/search:msgid%3A%3C4%40fixtures.docket.invalid%3E"
+    ));
+    assert!(body.contains(r#"<button class="btn primary" type="submit">Comment</button>"#));
     assert!(body.contains("cc Alex · bcc Pat Lee"));
     assert!(body.contains("cc Sam, Alex"));
     assert!(body.contains("→ Northwind Roofing"));
@@ -131,18 +141,24 @@ async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
     assert!(body.contains(r#"action="/messages/4/state""#));
     assert!(body.contains(r#"action="/messages/4/folder""#));
     assert!(body.contains(r#"action="/messages/4/assignees""#));
-    assert!(body.contains("ASSIGN"));
+    assert!(body.contains(r#"<span class="type-label value unset">Assign</span>"#));
+    assert!(body.contains(r#"<span class="type-label value">House</span>"#));
     assert!(body.contains(r#"value="/?m=4""#));
 
+    let (_, body) = get(addr, ALEX, "/?m=6").await;
+    assert!(body.contains(r#"<span class="type-label value">→ ALEX</span>"#));
+    assert!(!body.contains(r#"<span class="type-label value">—</span>"#));
     let (_, body) = get(addr, SAM, "/inbox?m=8").await;
-    assert!(body.contains("HOUSEHOLD · 1 MESSAGE"));
+    assert!(body.contains(r#"<span class="type-label value">—</span>"#));
+    assert!(!body.contains("Read-only"));
 }
 
 #[tokio::test]
 async fn read_only_accounts_show_folder_as_plain_text() {
     let addr = spawn().await;
     let (_, body) = get(addr, SAM, "/watch?m=20").await;
-    assert!(body.contains("ELI · READ-ONLY · 1 MESSAGE"));
+    assert!(body.contains(r#"<span class="type-label">Read-only</span>"#));
+    assert!(body.contains(r#"<span class="type-label value static">—</span>"#));
     assert!(!body.contains(r#"action="/messages/20/folder""#));
     assert!(body.contains(r#"action="/messages/20/state""#));
     let res = post(

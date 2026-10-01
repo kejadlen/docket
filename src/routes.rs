@@ -42,7 +42,6 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/", get(for_me))
         .route("/{lane}", get(lane))
-        .route("/folders/{folder}", get(folder))
         .route("/search", get(search))
         .route("/messages/{id}/state", post(set_state))
         .route("/messages/{id}/folder", post(set_folder))
@@ -140,19 +139,6 @@ async fn lane(
         .filter(|s| State::LANES.contains(s))
         .ok_or(Error::NotFound("lane"))?;
     render(&state, &me, &View::Lane(lane), sel.m, &uri.to_string()).await
-}
-
-async fn folder(
-    Extract(state): Extract<AppState>,
-    Me(me): Me,
-    OriginalUri(uri): OriginalUri,
-    Path(folder): Path<String>,
-    Query(sel): Query<Selection>,
-) -> Result<Markup, Error> {
-    if !state.store.read().await.folders.contains(&folder) {
-        return Err(Error::NotFound("folder"));
-    }
-    render(&state, &me, &View::Folder(folder), sel.m, &uri.to_string()).await
 }
 
 async fn search(
