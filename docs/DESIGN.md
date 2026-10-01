@@ -5,7 +5,7 @@ A small self-hosted webapp for two people to jointly manage household email acco
 ## Goals
 
 - Make it obvious what needs doing, who's on it, what we're waiting on, and what the other person should see.
-- Prevent double-replies and dropped threads without imposing strict ownership.
+- Prevent double-replies and dropped messages without imposing strict ownership.
 - Coexist with normal mail clients: the mail server stays the source of truth for mail and folders; Docket is where work gets tracked.
 - Support multiple accounts, including a read-only account we monitor on our son's behalf.
 
@@ -14,6 +14,7 @@ A small self-hosted webapp for two people to jointly manage household email acco
 - Replacing a full mail client (rich composing, filters, contacts).
 - Multi-tenant or public deployment.
 - Strict assignment or workflow enforcement.
+- Automatic movement. Every change of state, folder, or assignee is made by a person, in Docket or in another client.
 
 ## Users and access
 
@@ -40,61 +41,74 @@ Chosen setup: **one credential per login, no JMAP sharing.** The household login
 
 ## Model
 
-Three independent concepts per thread: **state** (what's happening), **assignment** (who it's on), and **folder** (where it's filed).
+The primitive is the **message**. Each received message has four independent values:
+
+- **State**: what's happening with it.
+- **Folder**: where it's filed.
+- **Assignees**: who it's on.
+- **Comments**: internal discussion attached to it.
+
+None of these changes another. A **thread** is a grouping the UI draws from JMAP `threadId` (and headers); it has no values of its own. Sent messages have no state, folder, or assignees.
 
 ### State
 
-State lives in Docket's database and, on writable accounts, is mirrored as **labels**: mailboxes under a `Docket/` parent (`Docket/Read`, `Docket/Do`, `Docket/Wait`, `Docket/Watch`). Inbox and Done have no label. Labels sit alongside folders — a message can be in `Receipts` and labeled `Docket/Watch` — so state is visible (and editable) in Mail.app and Fastmail web. On read-only accounts, state is database-only.
+Every received message has exactly one state:
 
-Every thread has exactly one state:
+| State | Meaning |
+|---|---|
+| **Inbox** | Needs someone to look at it. Unassigned means anyone; assigned means those people. |
+| **Do** | A real task is on us. |
+| **Wait** | Expecting a reply from a third party. |
+| **Watch** | Informational, still live (packages, reservations, claims). |
+| **Done** | Finished. |
 
-| State | Meaning | Leaves when | New mail arrives |
-|---|---|---|---|
-| **Inbox** | Not triaged | Triaged | Stays |
-| **Read** | Someone needs to read it | All assigned readers have read it → destination chosen at triage (Done by default, or Do / Watch) | Stays, marked updated |
-| **Do** | A real task is on us | Acted on → Wait / Done | Stays, marked updated |
-| **Wait** | Expecting a reply from a third party | Reply arrives | Moves to **Do** |
-| **Watch** | Informational, still live (packages, reservations, claims) | Marked done, or prompted after going stale | Stays, marked updated |
-| **Done** | Finished | New mail arrives | Moves to **Inbox** |
+New messages arrive in Inbox. Other messages in the same thread are unaffected — a thread can hold a Done estimate, a Do follow-up, and a new Inbox reply at once.
 
-Dates: *follow-up* on Wait (resurfaces as "no reply in N days"), *hidden until* on Do. Watch items with no updates for N days prompt "still watching?"
+There is no Read state. "Alex should read this" is Inbox, assigned to Alex. Alex reads it, then moves it on or unassigns himself.
 
-Read state is per person and tracked in the database — `$seen` is shared across clients and can't say who read something. Opening a thread in Docket marks it read for that user.
+State lives in Docket's database and, on writable accounts, is mirrored as **labels**: mailboxes under a `Docket/` parent (`Docket/Do`, `Docket/Wait`, `Docket/Watch`). Inbox and Done have no label. JMAP mailbox membership is per message, so labels map directly. Labels sit alongside folders — a message can be in `Receipts` and labeled `Docket/Watch` — so state is visible (and editable) in Mail.app and Fastmail web. On read-only accounts, state is database-only.
 
-### Assignment
+Per-person read tracking lives in the database — `$seen` is shared across clients and can't say who read something. Opening a message in Docket marks it read for that user. Read tracking drives unread marks only; it never changes state or assignees.
 
-Each thread has zero or more assignees (me, them, or both). It's a soft signal, never a lock, and its meaning follows the state:
+### Assignees
 
-- **Read**: who still needs to read it. Readers drop off as they read; when none remain, the thread moves on.
-- **Do**: who's handling it. Unassigned is fine.
-- **Wait**: who's following up — defaults to whoever moved it to Wait. When a reply moves it back to Do, it stays assigned to them.
-- **Watch / Done**: none.
+Each message has zero or more assignees (me, them, or both). It's a soft signal, never a lock, and its meaning is the same in every state: these people should deal with this message.
 
-Assigning to yourself replaces the earlier "claim". Assigning to the other person is a handoff and can carry a note ("can you call them?"). Anything newly assigned or shared with you is pinned at the top of your Inbox until you open it.
+- Unassigned is normal. An unassigned Inbox message is everyone's.
+- Assigning someone else is a handoff; add a comment to say why.
+- Assignees come off by unassigning themselves. Opening a message doesn't unassign.
+- New messages arrive unassigned.
 
 ### Folders and filing
 
-Folders are for filing and are managed by Fastmail (including server-side rules); Docket doesn't derive state from them. Any mailbox outside `Docket/` is a folder. Filing is a Docket action alongside state changes, on writable accounts only:
+Folders are for filing and are managed by Fastmail (including server-side rules); Docket doesn't derive state from them. Any mailbox outside `Docket/` is a folder. Filing is a Docket action on writable accounts only, separate from state:
 
-- The triage sheet has an optional **File to…** picker next to the state choice (e.g. `Done → Receipts`, `Watch → Shipping`).
-- **Done** without a folder archives (removes from Inbox). Docket never touches filing folders except when you file.
-- Filing moves the whole thread: every non-Sent message leaves its current folder (usually Inbox) and is added to the chosen one. `Docket/` labels are left untouched.
-- Threads remember their last folder; when new mail brings a filed thread back, the picker preselects it.
+- Each message is in one folder (or Inbox/Archive). Filing moves the message out of its current folder into the chosen one; `Docket/` labels are untouched.
 - Folders are also a filter in Docket views ("Do, in School").
+
+### Comments
+
+Internal comments are attached to a message and appear right after it in the thread. They never go to the sender and are Docket-only. They replace notes.
+
+### Acting on threads
+
+Values are per message, but most work is per thread, so the UI makes the thread the default scope:
+
+- Changing state, folder, or assignees applies by default to every message in the thread that is still in Inbox, with an option to narrow it to the selected message.
+- Selecting individual messages in the thread view scopes the change to them.
 
 ## Core flows
 
-- **Landing**: the Inbox, with a pinned "For you" section (assigned or shared to you, not yet opened) and a strip of counts — `Read 2 · Do 4 (2 mine) · Wait 1 overdue · Watch 3 updated`. If Inbox is empty, land on Do.
-- **Triage**: from the list without opening the thread (swipe/tap to a sheet) or from the thread view. Pick state, optionally assignee and folder. No modals; an undo toast offers quick follow-ups ("+ follow-up 3d", "assign to me").
-- **Thread view**: header with account, state, assignees, folder. A single timeline interleaves messages, notes, and events ("moved to Wait by A", "archived via another client"). Older messages collapse.
-- **Lane views**: one list component with per-lane grouping and sort:
-  - Read: "you need to read" vs. "waiting on them to read".
-  - Do: grouped Mine / Unassigned / Theirs, oldest first; hidden-until under "Later".
-  - Wait: by follow-up date, overdue pinned.
-  - Watch: compact, by latest update; stale items get a "still watching?" row.
+- **Landing — For me**: messages assigned to me (any state) plus unassigned Inbox messages, grouped by state, then by thread. A thread row headlines the message that matches the group and shows "+N in thread".
+- **Triage**: from the list or the thread view. One control each for state, folder, and assignees. No modals; an undo toast after each change.
+- **Thread view**: messages in order, each with its own state, folder, and assignees inline; comments under the message they belong to; events ("Sam moved to Do", "filed via another client"). Older messages collapse. The toolbar acts on the selected messages.
+- **Lane views**: one list component, grouped by thread:
+  - Inbox: assigned to me / to them / no one.
+  - Do: Mine / Unassigned / Theirs, oldest first.
+  - Wait: oldest first.
+  - Watch: compact, by latest update.
   - Done: no list — search only.
-- **Notes and handoff**: private thread notes that never go to the sender; reassigning with a note.
-- **Reply**: via a normal client for v1; an in-app composer is a fast follow. Docket links out to the thread and, on seeing a sent reply, suggests moving to Wait.
+- **Reply**: via a normal client for v1; an in-app composer is a fast follow. Docket links out to the thread. A sent reply has no state; moving the message it answers to Wait is a manual step.
 
 ## Interop with normal clients
 
@@ -102,21 +116,18 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 
 - Normal clients can read, file, and reply. In Mail.app, an IMAP move only affects the mailbox being moved out of, so filing Inbox → Receipts keeps the `Docket/` label.
 - Triage works from Mail.app by dragging: Inbox → `Docket/Watch` sets the state and removes it from Inbox; option-drag keeps it in both.
-- Adding or removing a `Docket/` label elsewhere changes state: Docket adopts it rather than reverting it. A state label removed with no replacement → **Done**. A message moved to Trash → **Done**. Assignees, dates, and notes are Docket-only.
+- Label changes made elsewhere are user actions, and Docket adopts them rather than reverting: a `Docket/` label added sets that state; a state label removed with no replacement → **Done**; a message moved to Trash → **Done**; an Inbox message removed from Inbox → **Done**. Assignees and comments are Docket-only.
 - Accepted cost: filed messages with a state appear in two folders in Mail.app (and likely twice in its search). Collapsing the `Docket` parent in the sidebar hides most of it.
-- Docket applies state labels to every non-Sent message in a thread, including new arrivals.
-- A reply sent elsewhere on a Do/Inbox thread triggers a "move to Wait?" suggestion rather than a silent change.
-- A thread that is still untriaged and gets removed from Inbox elsewhere is treated as Done. Threads in any other state keep their state.
-- Changes made elsewhere appear in the thread timeline as "via another client".
+- Changes made elsewhere appear in the thread as "via another client".
 
 ## Data and sync
 
 - **Mail server (JMAP)**: messages, folders, and `Docket/` state labels — source of truth for mail and filing.
-- **App database**: users, credentials (token references), accounts (credential + `accountId`), thread state, assignees, dates, destination-after-read, last folder, per-user read, notes, history, sync state.
-- Records are keyed by account + root Message-ID; JMAP ids are cached alongside, since they can change on reimport.
+- **App database**: users, credentials (token references), accounts (credential + `accountId`), per-message state and assignees, per-user read, comments, history, sync state.
+- Records are keyed by account + Message-ID; JMAP ids and `threadId` are cached alongside, since they can change on reimport.
 - One JMAP session and push connection (EventSource) per credential; `Email/changes` / `Mailbox/changes` per account, with periodic polling as a fallback.
 - Rights are re-read on session refresh.
-- Date-driven transitions (follow-ups, hidden-until, stale Watch items) run on a scheduler in the app.
+- No scheduler: nothing changes on a timer.
 
 ## Fast follow
 
@@ -124,6 +135,9 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 
 ## Out of scope for v1
 
+- Automatic movement: reply on Wait → Do, "move to Wait?" suggestions, stale-Watch prompts.
+- Dates: follow-up, hidden-until.
+- Merging, linking, or splitting threads (a view-level grouping change, since threads hold no values).
 - Presence / live "viewing" indicators.
 - Push notifications and digests.
 - Folder → initial-state automation and filing suggestions.
@@ -132,6 +146,8 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 
 ## Open questions
 
+- Should a new message inherit the folder or assignees of the message it replies to? It would be the one exception to "nothing moves automatically".
+- Is there a need to mark an Inbox handoff as FYI (no action), or does a comment cover it?
 - Whether Fastmail web URLs are stable enough to deep-link to a thread.
 - Mail.app behavior test (throwaway message): label it `Docket/Do`, then file, archive, and delete it from Mail.app, checking `mailboxIds` via JMAP after each step. Confirms that moves keep other mailbox memberships and shows what Trash/Archive do to the `Docket/` label.
 - Confirm Fastmail offers a read-only mail scope for API tokens, and how it shows up in the session.
