@@ -14,6 +14,7 @@ use miette::SourceSpan;
 use thiserror::Error;
 
 const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000);
+const DEFAULT_DATABASE: &str = "docket.db";
 
 #[derive(Debug)]
 pub struct Config {
@@ -24,6 +25,10 @@ pub struct Config {
     /// Serve without Tailscale: requests with no identity header act as a
     /// user picked from the sidebar. For local work against fixtures only.
     pub dev: bool,
+
+    /// SQLite database file, created if missing. A relative path is
+    /// relative to the working directory.
+    pub database: Utf8PathBuf,
 }
 
 impl Config {
@@ -52,6 +57,7 @@ fn parse(source: &str) -> Result<Config, Error> {
     let document = KdlDocument::parse(source)?;
     let mut bind = None;
     let mut dev = None;
+    let mut database = None;
 
     for node in document.nodes() {
         match node.name().value() {
@@ -73,6 +79,15 @@ fn parse(source: &str) -> Result<Config, Error> {
                 }
                 dev = Some(parse_dev(node)?);
             }
+            "database" => {
+                if database.is_some() {
+                    return Err(Error::Duplicate {
+                        name: "database".to_owned(),
+                        span: node.name().span(),
+                    });
+                }
+                database = Some(parse_database(node)?);
+            }
             name => {
                 return Err(Error::Unknown {
                     name: name.to_owned(),
@@ -85,6 +100,7 @@ fn parse(source: &str) -> Result<Config, Error> {
     Ok(Config {
         bind: bind.unwrap_or(DEFAULT_BIND),
         dev: dev.unwrap_or(false),
+        database: database.unwrap_or_else(|| Utf8PathBuf::from(DEFAULT_DATABASE)),
     })
 }
 
@@ -96,6 +112,14 @@ fn parse_bind(node: &KdlNode) -> Result<SocketAddr, Error> {
         value: raw.to_owned(),
         span: node.span(),
     })
+}
+
+fn parse_database(node: &KdlNode) -> Result<Utf8PathBuf, Error> {
+    single_value(node, "database")?
+        .and_then(KdlValue::as_string)
+        .filter(|path| !path.is_empty())
+        .map(Utf8PathBuf::from)
+        .ok_or(Error::DatabaseValue { span: node.span() })
 }
 
 fn parse_dev(node: &KdlNode) -> Result<bool, Error> {
@@ -131,7 +155,10 @@ enum Error {
     Kdl(#[from] KdlError),
 
     #[error("unknown setting `{name}`")]
-    #[diagnostic(code(docket::config::unknown), help("known settings: `bind`, `dev`"))]
+    #[diagnostic(
+        code(docket::config::unknown),
+        help("known settings: `bind`, `database`, `dev`")
+    )]
     Unknown {
         name: String,
         #[label]
@@ -171,6 +198,13 @@ enum Error {
         span: SourceSpan,
     },
 
+    #[error(r#"database takes a quoted path, like database "docket.db""#)]
+    #[diagnostic(code(docket::config::database_value))]
+    DatabaseValue {
+        #[label]
+        span: SourceSpan,
+    },
+
     #[error("dev takes #true or #false, or nothing at all (which means true)")]
     #[diagnostic(code(docket::config::dev_value))]
     DevValue {
@@ -189,6 +223,7 @@ mod tests {
         let config = parse("").unwrap();
         assert_eq!(config.bind.to_string(), "127.0.0.1:3000");
         assert!(!config.dev);
+        assert_eq!(config.database, "docket.db");
     }
 
     #[test]
@@ -221,6 +256,26 @@ mod tests {
     fn bind_without_a_string_is_rejected() {
         assert!(matches!(parse("bind 3000"), Err(Error::BindValue { .. })));
         assert!(matches!(parse("bind"), Err(Error::BindValue { .. })));
+    }
+
+    #[test]
+    fn database_takes_a_path() {
+        assert_eq!(
+            parse(r#"database "/var/lib/docket/docket.db""#)
+                .unwrap()
+                .database,
+            "/var/lib/docket/docket.db"
+        );
+        for source in ["database", "database 1", r#"database """#] {
+            assert!(
+                matches!(parse(source), Err(Error::DatabaseValue { .. })),
+                "{source}"
+            );
+        }
+        assert!(matches!(
+            parse("database \"a.db\"\ndatabase \"b.db\""),
+            Err(Error::Duplicate { .. })
+        ));
     }
 
     #[test]

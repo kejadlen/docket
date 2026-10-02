@@ -16,7 +16,9 @@ jiff = "*"
 kdl = "*"
 maud = { version = "*", features = ["axum"] }
 miette = { version = "*", features = ["fancy"] }
+rusqlite = { version = "*", features = ["bundled", "jiff"] }
 serde = { version = "*", features = ["derive"] }
+serde_json = "*"
 thiserror = "*"
 tokio = { version = "*", features = ["full"] }
 tower = "*"

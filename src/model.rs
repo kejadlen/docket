@@ -127,18 +127,6 @@ impl Message {
             Kind::Sent { .. } => None,
         }
     }
-
-    pub fn state(&self) -> Option<State> {
-        self.values().map(|v| v.state)
-    }
-
-    pub fn is_assigned_to(&self, user: &str) -> bool {
-        self.values().is_some_and(|v| v.assignees.contains(user))
-    }
-
-    pub fn is_unassigned(&self) -> bool {
-        self.values().is_some_and(|v| v.assignees.is_empty())
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +134,15 @@ pub struct Comment {
     pub id: CommentId,
     pub thread: ThreadId,
     pub author: String,
+    pub at: DateTime,
+    pub text: String,
+}
+
+/// A change someone made to a message's values, as its toast put it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub message: MessageId,
+    pub user: String,
     pub at: DateTime,
     pub text: String,
 }

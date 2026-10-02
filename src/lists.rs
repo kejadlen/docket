@@ -2,8 +2,9 @@
 //! individual messages, grouped by thread; a group holds only the thread's
 //! messages that belong in that section.
 
-use crate::model::{Kind, Message, State, Thread, User};
-use crate::store::Store;
+use crate::Error;
+use crate::model::{Message, State, Thread, User};
+use crate::store::{Filter, Store};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
@@ -29,38 +30,30 @@ enum Order {
 }
 
 #[derive(Debug)]
-pub struct Section<'a> {
+pub struct Section {
     pub head: String,
     /// Compact rows drop the snippet (Watch).
     pub compact: bool,
-    pub groups: Vec<Group<'a>>,
+    pub groups: Vec<Group>,
 }
 
 #[derive(Debug)]
-pub struct Group<'a> {
-    pub thread: &'a Thread,
-    pub rows: Vec<&'a Message>,
+pub struct Group {
+    pub thread: Thread,
+    pub rows: Vec<Message>,
 }
 
-pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>> {
-    let received = || store.messages.iter().filter(|m| m.values().is_some());
-    let in_state = move |state| received().filter(move |m| m.state() == Some(state));
-
+pub fn sections(store: &Store, me: &User, view: &View) -> Result<Vec<Section>, Error> {
     let mut out = Vec::new();
     match view {
         View::ForMe => {
             for state in State::LANES {
-                let msgs = in_state(state)
-                    .filter(|m| {
-                        m.is_assigned_to(&me.slug) || (state == State::Inbox && m.is_unassigned())
-                    })
-                    .collect();
-                out.push(section(
-                    store,
-                    state.name().to_uppercase(),
-                    msgs,
-                    Order::NewestFirst,
-                ));
+                let msgs = store.messages(Filter::ForMe {
+                    user: &me.slug,
+                    state,
+                })?;
+                let head = state.name().to_uppercase();
+                out.push(section(store, head, msgs, Order::NewestFirst)?);
             }
         }
         View::Lane(state) => {
@@ -69,63 +62,46 @@ pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>
             } else {
                 Order::OldestFirst
             };
-            let mut s = section(store, String::new(), in_state(*state).collect(), order);
+            let msgs = store.messages(Filter::State(*state))?;
+            let mut s = section(store, String::new(), msgs, order)?;
             s.compact = *state == State::Watch;
             out.push(s);
         }
         View::Search(query) => {
-            let query = query.trim().to_lowercase();
+            let query = query.trim();
             if !query.is_empty() {
-                let hits = store
-                    .messages
-                    .iter()
-                    .filter(|m| matches(store, m, &query))
-                    .collect();
-                out.push(section(
-                    store,
-                    "RESULTS".to_owned(),
-                    hits,
-                    Order::NewestFirst,
-                ));
+                let hits = store.messages(Filter::Search(query))?;
+                let head = "RESULTS".to_owned();
+                out.push(section(store, head, hits, Order::NewestFirst)?);
             }
         }
     }
     out.retain(|s| !s.groups.is_empty());
-    out
+    Ok(out)
 }
 
 /// How many messages a view lists, for the sidebar.
-pub fn count(store: &Store, me: &User, view: &View) -> usize {
-    sections(store, me, view)
+pub fn count(store: &Store, me: &User, view: &View) -> Result<usize, Error> {
+    let n = sections(store, me, view)?
         .iter()
         .flat_map(|s| &s.groups)
         .map(|g| g.rows.len())
-        .sum()
+        .sum();
+    Ok(n)
 }
 
-fn matches(store: &Store, m: &Message, query: &str) -> bool {
-    let subject = store.thread(m.thread).map_or("", |t| t.subject.as_str());
-    let from = match &m.kind {
-        Kind::Received { from, .. } => from.as_str(),
-        Kind::Sent { by, .. } => store.user_name(by),
-    };
-    [subject, from, m.body.as_str()]
-        .iter()
-        .any(|s| s.to_lowercase().contains(query))
-}
-
-fn section<'a>(
-    store: &'a Store,
+/// Takes messages oldest first, as the store returns them.
+fn section(
+    store: &Store,
     head: String,
-    mut msgs: Vec<&'a Message>,
+    msgs: Vec<Message>,
     order: Order,
-) -> Section<'a> {
-    msgs.sort_by_key(|m| (m.at, m.id));
-    let mut groups: Vec<Group<'a>> = Vec::new();
+) -> Result<Section, Error> {
+    let mut groups: Vec<Group> = Vec::new();
     for m in msgs {
         if let Some(g) = groups.iter_mut().find(|g| g.thread.id == m.thread) {
             g.rows.push(m);
-        } else if let Some(thread) = store.thread(m.thread) {
+        } else if let Some(thread) = store.thread(m.thread)? {
             groups.push(Group {
                 thread,
                 rows: vec![m],
@@ -138,11 +114,11 @@ fn section<'a>(
             groups.sort_by_key(|g| std::cmp::Reverse(g.rows.last().map(|m| m.at)));
         }
     }
-    Section {
+    Ok(Section {
         head,
         compact: false,
         groups,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -151,8 +127,9 @@ mod tests {
     use crate::fixtures;
 
     fn summary(store: &Store, user: &str, view: &View) -> Vec<(String, Vec<Vec<u32>>)> {
-        let me = store.user(user).unwrap();
-        sections(store, me, view)
+        let me = store.user(user).unwrap().unwrap();
+        sections(store, &me, view)
+            .unwrap()
             .into_iter()
             .map(|s| {
                 (
@@ -175,7 +152,7 @@ mod tests {
 
     #[test]
     fn for_me_groups_by_state_then_thread() {
-        let store = fixtures::store();
+        let store = fixtures::store().unwrap();
         let sam = summary(&store, "sam", &View::ForMe);
         assert_eq!(heads(&store, "sam", &View::ForMe), ["INBOX", "DO", "WATCH"]);
         let (_, groups) = &sam[0];
@@ -194,14 +171,14 @@ mod tests {
 
     #[test]
     fn sidebar_count() {
-        let store = fixtures::store();
-        let sam = store.user("sam").unwrap();
-        assert_eq!(count(&store, sam, &View::ForMe), 7);
+        let store = fixtures::store().unwrap();
+        let sam = store.user("sam").unwrap().unwrap();
+        assert_eq!(count(&store, &sam, &View::ForMe).unwrap(), 7);
     }
 
     #[test]
     fn lanes() {
-        let store = fixtures::store();
+        let store = fixtures::store().unwrap();
         // Every assignee shares one unheaded section: Inbox newest first, Do
         // oldest first.
         let inbox = summary(&store, "sam", &View::Lane(State::Inbox));
@@ -213,16 +190,21 @@ mod tests {
         let wait = summary(&store, "sam", &View::Lane(State::Wait));
         assert_eq!(wait[0].1, vec![vec![11]]);
 
-        let me = store.user("sam").unwrap();
-        let watch = sections(&store, me, &View::Lane(State::Watch));
+        let me = store.user("sam").unwrap().unwrap();
+        let watch = sections(&store, &me, &View::Lane(State::Watch)).unwrap();
         assert!(watch[0].compact);
         assert_eq!(watch[0].groups[0].rows[0].id, 14);
-        assert!(sections(&store, me, &View::Lane(State::Done)).len() == 1);
+        assert!(
+            sections(&store, &me, &View::Lane(State::Done))
+                .unwrap()
+                .len()
+                == 1
+        );
     }
 
     #[test]
     fn search_covers_every_message() {
-        let store = fixtures::store();
+        let store = fixtures::store().unwrap();
         let hits = summary(&store, "sam", &View::Search("downspout".into()));
         assert_eq!(hits[0].1, vec![vec![2, 4]]);
         let by_sender = summary(&store, "sam", &View::Search("ALEX".into()));

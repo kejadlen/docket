@@ -119,7 +119,7 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 ## Data and sync
 
 - **Mail server (JMAP)**: messages, folders, and `Docket/` state labels — source of truth for mail and filing.
-- **App database**: users, credentials (names matching `docket.kdl`; tokens stay in their files), accounts (credential + `accountId`), per-message state and assignees, per-user read, per-thread comments, history, sync state.
+- **App database**: a cache of threads and messages (filled by JMAP import; fixtures seed it in dev), users, credentials (names matching `docket.kdl`; tokens stay in their files), accounts (credential + `accountId`), per-message state and assignees, per-user read, per-thread comments, history, sync state.
 - Records are keyed by account + Message-ID; JMAP ids and `threadId` are cached alongside, since they can change on reimport.
 - One JMAP session and push connection (EventSource) per credential; `Email/changes` / `Mailbox/changes` per account, with periodic polling as a fallback.
 - Rights are re-read on session refresh.

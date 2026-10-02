@@ -1,11 +1,12 @@
-//! Sample household mail, standing in for JMAP until sync exists. Names and
-//! messages follow the wireframes: Alex and Sam share the household account,
-//! and Eli's account is monitored read-only.
+//! Sample household mail that seeds a dev database, standing in for JMAP
+//! until import exists. Names and messages follow the wireframes: Alex and
+//! Sam share the household account, and Eli's account is monitored read-only.
 
 use std::collections::BTreeSet;
 
 use jiff::civil::{DateTime, date};
 
+use crate::Error;
 use crate::model::{Account, Comment, Kind, Message, MessageId, State, Thread, User, Values};
 use crate::store::Store;
 
@@ -29,13 +30,16 @@ fn strings(xs: &[&str]) -> Vec<String> {
     xs.iter().map(|&x| x.to_owned()).collect()
 }
 
+#[derive(Default)]
 struct Builder {
-    store: Store,
+    threads: Vec<Thread>,
+    messages: Vec<Message>,
+    comments: Vec<Comment>,
 }
 
 impl Builder {
     fn thread(&mut self, id: u32, account: &str, subject: &str) {
-        self.store.threads.push(Thread {
+        self.threads.push(Thread {
             id,
             account: account.to_owned(),
             subject: subject.to_owned(),
@@ -53,7 +57,7 @@ impl Builder {
         (state, folder, assignees): (State, Option<&str>, &[&str]),
         cc: &[&str],
     ) {
-        self.store.messages.push(Message {
+        self.messages.push(Message {
             id,
             message_id: message_id(id),
             thread,
@@ -85,7 +89,7 @@ impl Builder {
         body: &str,
         (cc, bcc): (&[&str], &[&str]),
     ) {
-        self.store.messages.push(Message {
+        self.messages.push(Message {
             id,
             message_id: message_id(id),
             thread,
@@ -101,10 +105,10 @@ impl Builder {
     }
 
     fn comment(&mut self, thread: u32, author: &str, at: DateTime, text: &str) {
-        let id = u32::try_from(self.store.comments.len())
+        let id = u32::try_from(self.comments.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
-        self.store.comments.push(Comment {
+        self.comments.push(Comment {
             id,
             thread,
             author: author.to_owned(),
@@ -114,12 +118,16 @@ impl Builder {
     }
 }
 
-pub fn store() -> Store {
-    let mut b = Builder {
-        store: Store::default(),
-    };
-    b.store.now = now();
-    b.store.users = vec![
+/// A fresh in-memory store holding the fixtures.
+pub fn store() -> Result<Store, Error> {
+    let store = Store::open_in_memory(now())?;
+    seed(&store)?;
+    Ok(store)
+}
+
+/// Writes the fixtures into an empty database.
+pub fn seed(store: &Store) -> Result<(), Error> {
+    let users = [
         User {
             slug: "alex".into(),
             name: "Alex".into(),
@@ -131,7 +139,7 @@ pub fn store() -> Store {
             login: "sam@example.com".into(),
         },
     ];
-    b.store.accounts = vec![
+    let accounts = [
         Account {
             slug: "household".into(),
             name: "Household".into(),
@@ -145,7 +153,8 @@ pub fn store() -> Store {
             read_only: true,
         },
     ];
-    b.store.folders = strings(&["Medical", "School", "House", "Finance"]);
+    let folders = ["Medical", "School", "House", "Finance"];
+    let mut b = Builder::default();
 
     use State::{Do, Done, Inbox, Wait, Watch};
     let roofer = ("Northwind Roofing", "office@northwind.co");
@@ -325,19 +334,36 @@ pub fn store() -> Store {
 
     // Everything before yesterday has been read by both of us.
     let cutoff = at(9, 30, 0, 0);
-    let read: Vec<_> = b
-        .store
+    let mut reads: Vec<_> = b
         .messages
         .iter()
         .filter(|m| m.at < cutoff)
-        .map(|m| m.id)
+        .flat_map(|m| [("alex", m.id), ("sam", m.id)])
         .collect();
-    for id in read {
-        for user in ["alex", "sam"] {
-            b.store.mark_read(user, id);
-        }
-    }
-    b.store.mark_read("sam", 5);
+    reads.push(("sam", 5));
 
-    b.store
+    store.import(|tx| {
+        for user in &users {
+            tx.user(user)?;
+        }
+        for account in &accounts {
+            tx.account(account)?;
+        }
+        for folder in folders {
+            tx.folder(folder)?;
+        }
+        for thread in &b.threads {
+            tx.thread(thread)?;
+        }
+        for message in &b.messages {
+            tx.message(message)?;
+        }
+        for comment in &b.comments {
+            tx.comment(comment)?;
+        }
+        for (user, id) in reads {
+            tx.read(user, id)?;
+        }
+        Ok(())
+    })
 }

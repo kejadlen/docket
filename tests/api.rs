@@ -8,7 +8,7 @@ const SAM: &str = "sam@example.com";
 const ALEX: &str = "alex@example.com";
 
 async fn spawn_with(dev: bool) -> SocketAddr {
-    let app = router(AppState::new(docket::fixtures::store(), dev));
+    let app = router(AppState::new(docket::fixtures::store().unwrap(), dev));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -368,7 +368,7 @@ async fn dev_mode_picks_a_user_from_a_cookie() {
 
 #[tokio::test]
 async fn dev_mode_with_no_users_is_unauthenticated() {
-    let store = docket::store::Store::default();
+    let store = docket::store::Store::open_in_memory(docket::fixtures::now()).unwrap();
     let app = router(AppState::new(store, true));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

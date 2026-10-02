@@ -9,21 +9,20 @@ use axum::routing::{get, post};
 use axum::{Form, Router};
 use maud::Markup;
 use serde::Deserialize;
-use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 
 use crate::Error;
-use crate::lists::View;
+use crate::lists::{self, View};
 use crate::model::{MessageId, State, ThreadId, User};
 use crate::store::{Change, Store};
-use crate::views::{self, Page};
+use crate::views::{self, Page, ThreadView};
 
 const IDENTITY_HEADER: &str = "Tailscale-User-Login";
 const DEV_COOKIE: &str = "docket_dev_user";
 
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Arc<RwLock<Store>>,
+    pub store: Arc<Store>,
     /// Without Tailscale in front, fall back to a cookie-chosen user.
     pub dev: bool,
 }
@@ -31,7 +30,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(store: Store, dev: bool) -> Self {
         Self {
-            store: Arc::new(RwLock::new(store)),
+            store: Arc::new(store),
             dev,
         }
     }
@@ -73,23 +72,25 @@ impl FromRequestParts<AppState> for Me {
         if parts.method == Method::POST && !same_origin(&parts.headers) {
             return Err(Error::Forbidden("cross-site request"));
         }
-        let store = state.store.read().await;
+        let store = &state.store;
         if let Some(login) = header(&parts.headers, IDENTITY_HEADER) {
             return store
-                .user_by_login(login)
-                .cloned()
+                .user_by_login(login)?
                 .map(Me)
                 .ok_or(Error::Unauthenticated);
         }
         if !state.dev {
             return Err(Error::Unauthenticated);
         }
-        let chosen = cookie(&parts.headers, DEV_COOKIE).and_then(|slug| store.user(slug));
-        chosen
-            .or_else(|| store.users.first())
-            .cloned()
-            .map(Me)
-            .ok_or(Error::Unauthenticated)
+        let chosen = match cookie(&parts.headers, DEV_COOKIE) {
+            Some(slug) => store.user(slug)?,
+            None => None,
+        };
+        let user = match chosen {
+            Some(user) => Some(user),
+            None => store.users()?.into_iter().next(),
+        };
+        user.map(Me).ok_or(Error::Unauthenticated)
     }
 }
 
@@ -125,7 +126,7 @@ async fn for_me(
     OriginalUri(uri): OriginalUri,
     Query(sel): Query<Selection>,
 ) -> Result<Markup, Error> {
-    render(&state, &me, &View::ForMe, sel.m, &uri.to_string()).await
+    render(&state, &me, &View::ForMe, sel.m, &uri.to_string())
 }
 
 async fn lane(
@@ -138,7 +139,7 @@ async fn lane(
     let lane = State::from_slug(&lane)
         .filter(|s| State::LANES.contains(s))
         .ok_or(Error::NotFound("lane"))?;
-    render(&state, &me, &View::Lane(lane), sel.m, &uri.to_string()).await
+    render(&state, &me, &View::Lane(lane), sel.m, &uri.to_string())
 }
 
 async fn search(
@@ -148,38 +149,57 @@ async fn search(
     Query(sel): Query<Selection>,
 ) -> Result<Markup, Error> {
     let view = View::Search(sel.q.unwrap_or_default());
-    render(&state, &me, &view, sel.m, &uri.to_string()).await
+    render(&state, &me, &view, sel.m, &uri.to_string())
 }
 
-async fn render(
+fn render(
     state: &AppState,
     me: &User,
     view: &View,
     selected: Option<MessageId>,
     here: &str,
 ) -> Result<Markup, Error> {
-    let mut store = state.store.write().await;
-    if let Some(id) = selected {
-        let msg = store.message(id).ok_or(Error::NotFound("message"))?;
-        // Opening a thread reads the selected message and the latest one,
-        // the two that open expanded.
-        let latest = store.thread_messages(msg.thread).last().map(|m| m.id);
-        store.mark_read(&me.slug, id);
-        if let Some(latest) = latest {
-            store.mark_read(&me.slug, latest);
-        }
-    }
-    let flash = store.take_flash(&me.slug);
-    let store = &*store;
+    let store = &state.store;
+    let thread = selected.map(|id| open_thread(store, me, id)).transpose()?;
+    let nav = std::iter::once(View::ForMe)
+        .chain(State::LANES.map(View::Lane))
+        .map(|v| lists::count(store, me, &v).map(|n| (v, n)))
+        .collect::<Result<_, _>>()?;
     Ok(views::page(&Page {
-        store,
         me,
         view,
-        selected: selected.and_then(|id| store.message(id)),
-        flash,
+        now: store.now,
+        users: store.users()?,
+        folders: store.folders()?,
+        nav,
+        sections: lists::sections(store, me, view)?,
+        unread: store.unread(&me.slug)?,
+        selected,
+        thread,
+        flash: store.take_flash(&me.slug),
         here,
         dev: state.dev,
     }))
+}
+
+/// Opening a thread reads the selected message and the latest one, the two
+/// that open expanded.
+fn open_thread(store: &Store, me: &User, id: MessageId) -> Result<ThreadView, Error> {
+    let msg = store.message(id)?.ok_or(Error::NotFound("message"))?;
+    let latest = store
+        .thread_messages(msg.thread)?
+        .last()
+        .map_or(id, |m| m.id);
+    store.mark_read(&me.slug, id)?;
+    store.mark_read(&me.slug, latest)?;
+    Ok(ThreadView {
+        thread: store.thread(msg.thread)?.ok_or(Error::NotFound("thread"))?,
+        read_only: store
+            .thread_account(msg.thread)?
+            .is_some_and(|a| a.read_only),
+        timeline: store.timeline(msg.thread)?,
+        latest,
+    })
 }
 
 /// Only same-site paths, so a form can't bounce the browser elsewhere.
@@ -252,7 +272,7 @@ async fn edit(
     change: Change,
     back: &str,
 ) -> Result<Redirect, Error> {
-    state.store.write().await.edit(&me.slug, id, change)?;
+    state.store.edit(&me.slug, id, change)?;
     Ok(Redirect::to(safe_back(back)))
 }
 
@@ -268,11 +288,7 @@ async fn add_comment(
     Path(thread): Path<ThreadId>,
     Form(form): Form<CommentForm>,
 ) -> Result<Redirect, Error> {
-    state
-        .store
-        .write()
-        .await
-        .add_comment(&me.slug, thread, &form.text)?;
+    state.store.add_comment(&me.slug, thread, &form.text)?;
     Ok(Redirect::to(safe_back(&form.back)))
 }
 
@@ -286,7 +302,7 @@ async fn undo(
     Me(me): Me,
     Form(form): Form<BackForm>,
 ) -> Result<Redirect, Error> {
-    state.store.write().await.undo(&me.slug)?;
+    state.store.undo(&me.slug)?;
     Ok(Redirect::to(safe_back(&form.back)))
 }
 
@@ -298,7 +314,7 @@ async fn dev_user(
     if !same_origin(&headers) {
         return Err(Error::Forbidden("cross-site request"));
     }
-    if state.store.read().await.user(&form.user).is_none() {
+    if state.store.user(&form.user)?.is_none() {
         return Err(Error::NotFound("user"));
     }
     let cookie = format!("{DEV_COOKIE}={}; Path=/; SameSite=Lax", form.user);

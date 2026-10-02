@@ -2,23 +2,44 @@
 //! thread. Alpine handles the menus and collapsing; every change is a plain
 //! form post.
 
+use std::collections::BTreeSet;
+
+use jiff::civil::DateTime;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::dates;
-use crate::lists::{self, Group, Section, View};
-use crate::model::{Comment, Kind, Message, State, User, Values};
-use crate::store::{Flash, Item, Store};
+use crate::lists::{Group, Section, View};
+use crate::model::{Comment, Kind, Message, MessageId, State, Thread, User, Values};
+use crate::store::{Flash, Item};
 
+/// Everything one page shows, loaded before rendering starts.
 pub struct Page<'a> {
-    pub store: &'a Store,
     pub me: &'a User,
     pub view: &'a View,
-    pub selected: Option<&'a Message>,
+    pub now: DateTime,
+    pub users: Vec<User>,
+    pub folders: Vec<String>,
+    /// The sidebar's views, each with how many messages it lists.
+    pub nav: Vec<(View, usize)>,
+    pub sections: Vec<Section>,
+    /// Received messages `me` hasn't opened.
+    pub unread: BTreeSet<MessageId>,
+    pub selected: Option<MessageId>,
+    /// The selected message's thread.
+    pub thread: Option<ThreadView>,
     pub flash: Option<Flash>,
     /// This page's URL, for forms to return to.
     pub here: &'a str,
     /// Lets the viewer switch users without Tailscale, for fixtures.
     pub dev: bool,
+}
+
+pub struct ThreadView {
+    pub thread: Thread,
+    pub read_only: bool,
+    pub timeline: Vec<Item>,
+    /// Opens expanded, along with the selected message.
+    pub latest: MessageId,
 }
 
 pub fn view_path(view: &View) -> String {
@@ -71,12 +92,20 @@ fn badge(state: State) -> Markup {
     html! { span.badge.(tone(state)) { span.mark {} (state.name()) } }
 }
 
-fn assignee_label(store: &Store, values: &Values) -> Option<String> {
+/// The user's display name, or the slug when nobody has it.
+fn user_name<'a>(users: &'a [User], slug: &'a str) -> &'a str {
+    users
+        .iter()
+        .find(|u| u.slug == slug)
+        .map_or(slug, |u| u.name.as_str())
+}
+
+fn assignee_label(users: &[User], values: &Values) -> Option<String> {
     (!values.assignees.is_empty()).then(|| {
         let names: Vec<_> = values
             .assignees
             .iter()
-            .map(|a| store.user_name(a).to_uppercase())
+            .map(|a| user_name(users, a).to_uppercase())
             .collect();
         format!("→ {}", names.join(", "))
     })
@@ -119,7 +148,6 @@ fn back(here: &str) -> Markup {
 }
 
 fn sidebar(p: &Page<'_>) -> Markup {
-    let views = std::iter::once(View::ForMe).chain(State::LANES.map(View::Lane));
     html! {
         nav.side {
             div.brand-row {
@@ -127,10 +155,10 @@ fn sidebar(p: &Page<'_>) -> Markup {
                 button.search-btn type="button" aria-label="Search mail" { (PreEscaped(SEARCH_ICON)) }
             }
             div.nav {
-                @for view in views {
-                    a.nav-item.on[&view == p.view] href=(view_path(&view)) {
+                @for (view, count) in &p.nav {
+                    a.nav-item.on[view == p.view] href=(view_path(view)) {
                         span { (view.title()) }
-                        span.type-figure.count { (lists::count(p.store, p.me, &view)) }
+                        span.type-figure.count { (count) }
                     }
                 }
             }
@@ -151,7 +179,7 @@ fn whoami(p: &Page<'_>) -> Markup {
                 button.who-btn type="button" "@click"="open = !open" { (who) }
                 form.menu.up method="post" action="/dev/user" x-show="open" x-cloak {
                     (back(p.here))
-                    @for user in &p.store.users {
+                    @for user in &p.users {
                         @let on = user.slug == p.me.slug;
                         button.opt.cur[on] type="submit" name="user" value=(user.slug) {
                             span { (user.name) }
@@ -167,23 +195,22 @@ fn whoami(p: &Page<'_>) -> Markup {
 }
 
 fn list(p: &Page<'_>) -> Markup {
-    let sections = lists::sections(p.store, p.me, p.view);
     html! {
         section.list aria-label="Messages" {
             header.list-head {
                 h1 { (p.view.title()) }
             }
-            @if sections.is_empty() {
+            @if p.sections.is_empty() {
                 p.empty { "Nothing here." }
             }
-            @for section in &sections {
+            @for section in &p.sections {
                 (list_section(p, section))
             }
         }
     }
 }
 
-fn list_section(p: &Page<'_>, section: &Section<'_>) -> Markup {
+fn list_section(p: &Page<'_>, section: &Section) -> Markup {
     html! {
         div {
             @if !section.head.is_empty() {
@@ -202,8 +229,8 @@ fn list_section(p: &Page<'_>, section: &Section<'_>) -> Markup {
 }
 
 /// A thread with several messages listed: the subject heads a row per message.
-fn thread_group(p: &Page<'_>, group: &Group<'_>, rows: &[&Message], compact: bool) -> Markup {
-    let unread = rows.iter().any(|m| p.store.is_unread(&p.me.slug, m));
+fn thread_group(p: &Page<'_>, group: &Group, rows: &[Message], compact: bool) -> Markup {
+    let unread = rows.iter().any(|m| p.unread.contains(&m.id));
     html! {
         div.group.unread[unread] {
             span.subj { (group.thread.subject) }
@@ -218,15 +245,15 @@ fn thread_group(p: &Page<'_>, group: &Group<'_>, rows: &[&Message], compact: boo
 
 /// A thread with one message listed collapses into a single row: subject and
 /// time, then sender and snippet.
-fn solo(p: &Page<'_>, group: &Group<'_>, m: &Message, compact: bool) -> Markup {
-    let selected = p.selected.is_some_and(|s| s.id == m.id);
-    let unread = p.store.is_unread(&p.me.slug, m);
+fn solo(p: &Page<'_>, group: &Group, m: &Message, compact: bool) -> Markup {
+    let selected = p.selected == Some(m.id);
+    let unread = p.unread.contains(&m.id);
     html! {
         a.row.solo.sel[selected].unread[unread] href=(select_path(p.view, m.id)) {
             span.subj { (group.thread.subject) }
-            span.type-figure.age { (dates::short(p.store.now, m.at)) }
+            span.type-figure.age { (dates::short(p.now, m.at)) }
             span.line {
-                span.from { (sender(p.store, m)) }
+                span.from { (sender(&p.users, m)) }
                 @if !compact {
                     span.snip { " — " (m.body) }
                 }
@@ -235,20 +262,20 @@ fn solo(p: &Page<'_>, group: &Group<'_>, m: &Message, compact: bool) -> Markup {
     }
 }
 
-fn sender(store: &Store, m: &Message) -> String {
+fn sender(users: &[User], m: &Message) -> String {
     match &m.kind {
         Kind::Received { from, .. } => from.clone(),
-        Kind::Sent { by, to } => format!("{} → {}", store.user_name(by), to.join(", ")),
+        Kind::Sent { by, to } => format!("{} → {}", user_name(users, by), to.join(", ")),
     }
 }
 
 fn row(p: &Page<'_>, m: &Message, compact: bool) -> Markup {
-    let selected = p.selected.is_some_and(|s| s.id == m.id);
-    let unread = p.store.is_unread(&p.me.slug, m);
+    let selected = p.selected == Some(m.id);
+    let unread = p.unread.contains(&m.id);
     html! {
         a.row.sel[selected].unread[unread] href=(select_path(p.view, m.id)) {
-            span.from { (sender(p.store, m)) }
-            span.type-figure.age { (dates::short(p.store.now, m.at)) }
+            span.from { (sender(&p.users, m)) }
+            span.type-figure.age { (dates::short(p.now, m.at)) }
             @if !compact {
                 span.snip { (m.body) }
             }
@@ -259,8 +286,8 @@ fn row(p: &Page<'_>, m: &Message, compact: bool) -> Markup {
 fn reader(p: &Page<'_>) -> Markup {
     html! {
         main.reader {
-            @if let Some(selected) = p.selected {
-                (thread(p, selected))
+            @if let (Some(selected), Some(t)) = (p.selected, &p.thread) {
+                (thread(p, t, selected))
             } @else {
                 p.empty { "No thread open." }
             }
@@ -268,35 +295,27 @@ fn reader(p: &Page<'_>) -> Markup {
     }
 }
 
-fn thread(p: &Page<'_>, selected: &Message) -> Markup {
-    let store = p.store;
-    let subject = store
-        .thread(selected.thread)
-        .map_or("", |t| t.subject.as_str());
-    let read_only = store
-        .thread_account(selected.thread)
-        .is_some_and(|a| a.read_only);
-    let latest = store.thread_messages(selected.thread).last().map(|m| m.id);
+fn thread(p: &Page<'_>, t: &ThreadView, selected: MessageId) -> Markup {
     html! {
         article.thread {
             header.thread-head {
-                h2 { (subject) }
-                @if read_only {
+                h2 { (t.thread.subject) }
+                @if t.read_only {
                     span.type-label { "Read-only" }
                 }
             }
             div.chain {
-                @for item in store.timeline(selected.thread) {
+                @for item in &t.timeline {
                     @match item {
-                        Item::Comment(c) => (comment(store, c)),
+                        Item::Comment(c) => (comment(p, c)),
                         Item::Message(m) => {
-                            @let open = m.id == selected.id || Some(m.id) == latest;
-                            (message(p, m, open, m.id == selected.id, read_only))
+                            @let open = m.id == selected || m.id == t.latest;
+                            (message(p, m, open, m.id == selected, t.read_only))
                         }
                     }
                 }
             }
-            form.comment-box method="post" action=(format!("/threads/{}/comments", selected.thread)) {
+            form.comment-box method="post" action=(format!("/threads/{}/comments", t.thread.id)) {
                 (back(p.here))
                 input.field type="text" name="text" required placeholder="Add an internal comment to this thread"
                     aria-label="Internal comment" autocomplete="off";
@@ -306,24 +325,23 @@ fn thread(p: &Page<'_>, selected: &Message) -> Markup {
     }
 }
 
-fn comment(store: &Store, c: &Comment) -> Markup {
+fn comment(p: &Page<'_>, c: &Comment) -> Markup {
     html! {
         div.item.comment {
             div.body {
-                span.author { b { (store.user_name(&c.author)) } }
+                span.author { b { (user_name(&p.users, &c.author)) } }
                 span.text { (c.text) }
             }
-            div.gutter { span.type-figure.date { (dates::short(store.now, c.at)) } }
+            div.gutter { span.type-figure.date { (dates::short(p.now, c.at)) } }
         }
     }
 }
 
 fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, read_only: bool) -> Markup {
-    let store = p.store;
     let (who, addr) = match &m.kind {
         Kind::Received { from, addr, .. } => (from.clone(), format!("<{addr}>")),
         Kind::Sent { by, to } => (
-            store.user_name(by).to_owned(),
+            user_name(&p.users, by).to_owned(),
             format!("→ {}", to.join(", ")),
         ),
     };
@@ -353,7 +371,7 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, read_only: boo
             }
             div.gutter {
                 span.when {
-                    span.type-figure.date { (dates::short(store.now, m.at)) }
+                    span.type-figure.date { (dates::short(p.now, m.at)) }
                     a.icon-btn href=(fastmail_url(m)) target="_blank" rel="noopener"
                         title="Open in Fastmail" aria-label="Open in Fastmail" { (PreEscaped(EXTERNAL_ICON)) }
                 }
@@ -399,16 +417,16 @@ fn values_controls(p: &Page<'_>, id: u32, values: &Values, read_only: bool) -> M
         button.opt.cur[values.folder.is_none()] type="submit" name="folder" value="" {
             span { "No folder" } (check(values.folder.is_none()))
         }
-        @for folder in &p.store.folders {
+        @for folder in &p.folders {
             @let on = values.folder.as_ref() == Some(folder);
             button.opt.cur[on] type="submit" name="folder" value=(folder) {
                 span { (folder) } (check(on))
             }
         }
     };
-    let assigned = assignee_label(p.store, values);
+    let assigned = assignee_label(&p.users, values);
     let people = html! {
-        @for user in &p.store.users {
+        @for user in &p.users {
             @let on = values.assignees.contains(&user.slug);
             button.opt.cur[on] type="submit" name="user" value=(user.slug) {
                 span { (user.name) } (check(on))
@@ -461,10 +479,10 @@ mod tests {
 
     #[test]
     fn fastmail_links_search_by_message_id() {
-        let store = crate::fixtures::store();
-        let m = store.message(4).unwrap();
+        let store = crate::fixtures::store().unwrap();
+        let m = store.message(4).unwrap().unwrap();
         assert_eq!(
-            fastmail_url(m),
+            fastmail_url(&m),
             "https://app.fastmail.com/mail/search:msgid%3A%3C4%40fixtures.docket.invalid%3E"
         );
     }
