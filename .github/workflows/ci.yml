@@ -97,7 +97,7 @@ jobs:
       contents: read # checkout, for fly.toml
     environment:
       name: demo
-      url: https://docket-kejadlen.fly.dev
+      url: https://docket.demo.kejadlen.dev
     # One deploy at a time, and a newer main is the one worth having.
     concurrency:
       group: fly-deploy
