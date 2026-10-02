@@ -9,9 +9,11 @@ path = "src/bin/docket/main.rs"
 
 [dependencies]
 axum = "*"
+camino = "*"
 clap = { version = "*", features = ["derive", "env"] }
 fs-err = "*"
 jiff = "*"
+kdl = "*"
 maud = { version = "*", features = ["axum"] }
 miette = { version = "*", features = ["fancy"] }
 serde = { version = "*", features = ["derive"] }

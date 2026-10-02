@@ -1,0 +1,8 @@
+// Config for the two Fly demo apps, baked into the image at
+// /etc/docket.kdl (fly.toml points DOCKET_CONFIG at it). Binds wide
+// because Fly's edge routes to the machine, not to localhost. `dev` is
+// the whole of what makes them demos: fixture data instead of JMAP, and
+// a stand-in identity in place of the Tailscale-User-Login header that
+// tailscale serve supplies in front of the real deployment.
+bind "0.0.0.0:3000"
+dev

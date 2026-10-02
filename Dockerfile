@@ -36,6 +36,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/docket /usr/local/bin/docket
+COPY fly.kdl /etc/docket.kdl
 
 EXPOSE 3000
 ENTRYPOINT ["docket"]

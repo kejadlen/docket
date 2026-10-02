@@ -28,7 +28,7 @@ all: fmt clippy coverage
 # Serve the fixture-backed UI without Tailscale on http://127.0.0.1:3000,
 # restarting on changes.
 dev:
-    { fd -t f . src assets; echo Cargo.toml; } | entr -r cargo run -- --dev
+    { fd -t f . src assets; echo Cargo.toml docket.kdl; } | entr -r cargo run
 
 install:
     cargo install --locked --path .

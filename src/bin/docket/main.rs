@@ -16,7 +16,8 @@ async fn main() -> miette::Result<()> {
         .with(EnvFilter::from_default_env())
         .init();
 
-    let config = config::Config::parse();
+    let args = config::Args::parse();
+    let config = config::Config::load(&args.config)?;
     // Fixtures stand in for the database and JMAP sync until they exist.
     let state = docket::routes::AppState::new(docket::fixtures::store(), config.dev);
     let app = docket::routes::router(state);

@@ -1,0 +1,5 @@
+// Docket's settings, read from this file (see `--help` for pointing
+// DOCKET_CONFIG elsewhere). This copy is the local-dev one: `dev` serves
+// fixture data without Tailscale, picking a user from the sidebar.
+bind "127.0.0.1:3000"
+dev
