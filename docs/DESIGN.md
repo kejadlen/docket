@@ -99,8 +99,8 @@ There is no toolbar and no thread-level action. Each message's state, folder, an
 - **Triage**: from the list or the thread view. Click the value to change it. No modals; an undo toast after each change.
 - **Thread view**: received messages, sent messages, and comments in time order, as ruled rows of equal weight. Each row has the sender (and cc/bcc when present) and body on the left; a right gutter holds the date and, for received messages, state, folder, and assignees in fixed positions so they line up down the thread. Sent messages show the recipient after the sender and no values. Comments sit on a filled row. Events ("Sam moved to Do", "filed via another client"). Older messages collapse; their values stay clickable.
 - **Lane views**: one list component showing individual messages, grouped by thread (only messages in that lane):
-  - Inbox: assigned to me / to them / no one.
-  - Do: Mine / Unassigned / Theirs, oldest first.
+  - Inbox: newest first.
+  - Do: oldest first.
   - Wait: oldest first.
   - Watch: compact, by latest update.
   - Done: no list — search only.

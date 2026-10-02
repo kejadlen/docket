@@ -80,7 +80,6 @@ async fn for_me_lists_messages_grouped_by_state_and_thread() {
     let (status, body) = get(addr, SAM, "/").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("<title>For me · Docket</title>"));
-    assert!(body.contains("NO ONE’S"));
     assert!(body.contains("Gutter repair estimate"));
     assert!(body.contains("2 OF 4"));
     assert!(body.contains("No thread open."));
@@ -93,7 +92,7 @@ async fn for_me_lists_messages_grouped_by_state_and_thread() {
 async fn lanes_and_search() {
     let addr = spawn().await;
     for (path, needle) in [
-        ("/inbox", "→ ALEX"),
+        ("/inbox", "Service interruption Oct 4"),
         ("/do", "Exemption renewal"),
         ("/wait", "Claim 4471"),
         ("/watch", "Shipped: furnace filters"),

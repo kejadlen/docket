@@ -55,66 +55,26 @@ impl Group<'_> {
 pub fn sections<'a>(store: &'a Store, me: &User, view: &View) -> Vec<Section<'a>> {
     let received = || store.messages.iter().filter(|m| m.values().is_some());
     let in_state = move |state| received().filter(move |m| m.state() == Some(state));
-    let to_me = format!("→ {}", me.name.to_uppercase());
-    let them: Vec<_> = store
-        .users
-        .iter()
-        .filter(|u| u.slug != me.slug)
-        .map(|u| u.name.to_uppercase())
-        .collect();
-    let to_them = format!("→ {}", them.join(", "));
 
     let mut out = Vec::new();
     match view {
         View::ForMe => {
             for state in State::LANES {
-                let mine = in_state(state).filter(|m| m.is_assigned_to(&me.slug));
+                let msgs = in_state(state)
+                    .filter(|m| {
+                        m.is_assigned_to(&me.slug) || (state == State::Inbox && m.is_unassigned())
+                    })
+                    .collect();
                 out.push(section(
                     store,
-                    (state.name().to_uppercase(), to_me.clone()),
-                    mine.collect(),
+                    (state.name().to_uppercase(), String::new()),
+                    msgs,
                     Order::NewestFirst,
                 ));
-                if state == State::Inbox {
-                    out.push(section(
-                        store,
-                        (state.name().to_uppercase(), "NO ONE’S".to_owned()),
-                        in_state(state).filter(|m| m.is_unassigned()).collect(),
-                        Order::NewestFirst,
-                    ));
-                }
-            }
-        }
-        View::Lane(state @ (State::Inbox | State::Do)) => {
-            let order = if *state == State::Do {
-                Order::OldestFirst
-            } else {
-                Order::NewestFirst
-            };
-            let mine_msgs = in_state(*state)
-                .filter(|m| m.is_assigned_to(&me.slug))
-                .collect();
-            let nobody_msgs = in_state(*state).filter(|m| m.is_unassigned()).collect();
-            let theirs_msgs = in_state(*state)
-                .filter(|m| !m.is_unassigned() && !m.is_assigned_to(&me.slug))
-                .collect();
-            let mine = section(store, (to_me, String::new()), mine_msgs, order);
-            let nobody = section(
-                store,
-                ("NO ONE’S".to_owned(), String::new()),
-                nobody_msgs,
-                order,
-            );
-            let theirs = section(store, (to_them, String::new()), theirs_msgs, order);
-            // Inbox reads me / them / no one; Do reads mine / unassigned / theirs.
-            if *state == State::Do {
-                out.extend([mine, nobody, theirs]);
-            } else {
-                out.extend([mine, theirs, nobody]);
             }
         }
         View::Lane(state) => {
-            let order = if *state == State::Watch {
+            let order = if matches!(state, State::Inbox | State::Watch) {
                 Order::NewestFirst
             } else {
                 Order::OldestFirst
@@ -237,16 +197,19 @@ mod tests {
         let sam = summary(&store, "sam", &View::ForMe);
         assert_eq!(
             heads(&store, "sam", &View::ForMe),
-            ["INBOX|NO ONE’S", "DO|→ SAM", "WATCH|→ SAM"]
+            ["INBOX|", "DO|", "WATCH|"]
         );
         let (_, _, groups) = &sam[0];
         // Newest thread first; the roofing thread shows only its two Inbox emails.
         assert_eq!(groups[0], vec![fixtures::WATER]);
         assert!(groups.contains(&vec![3, 4]));
 
+        // Alex's own Inbox messages share the section with unassigned ones.
+        let alex = summary(&store, "alex", &View::ForMe);
+        assert_eq!(heads(&store, "alex", &View::ForMe), ["INBOX|", "WAIT|"]);
         assert_eq!(
-            heads(&store, "alex", &View::ForMe),
-            ["INBOX|→ ALEX", "INBOX|NO ONE’S", "WAIT|→ ALEX"]
+            alex[0].2,
+            [vec![7], vec![6], vec![10], vec![8], vec![9], vec![3, 4]]
         );
     }
 
@@ -269,22 +232,14 @@ mod tests {
     #[test]
     fn lanes() {
         let store = fixtures::store();
-        assert_eq!(
-            heads(&store, "sam", &View::Lane(State::Inbox)),
-            ["→ ALEX|", "NO ONE’S|"]
-        );
-        assert_eq!(
-            heads(&store, "alex", &View::Lane(State::Inbox)),
-            ["→ ALEX|", "NO ONE’S|"]
-        );
-        assert_eq!(
-            heads(&store, "alex", &View::Lane(State::Do)),
-            ["NO ONE’S|", "→ SAM|"]
-        );
-        assert_eq!(
-            heads(&store, "sam", &View::Lane(State::Do)),
-            ["→ SAM|", "NO ONE’S|"]
-        );
+        // Every assignee shares one unheaded section: Inbox newest first, Do
+        // oldest first.
+        let inbox = summary(&store, "sam", &View::Lane(State::Inbox));
+        assert_eq!(heads(&store, "sam", &View::Lane(State::Inbox)), ["|"]);
+        assert_eq!(inbox[0].2[0], vec![fixtures::WATER]);
+        let todo = summary(&store, "alex", &View::Lane(State::Do));
+        assert_eq!(heads(&store, "alex", &View::Lane(State::Do)), ["|"]);
+        assert_eq!(todo[0].2, [vec![13], vec![5]]);
         let wait = summary(&store, "sam", &View::Lane(State::Wait));
         assert_eq!(wait[0].2, vec![vec![11]]);
 
@@ -293,37 +248,6 @@ mod tests {
         assert!(watch[0].compact);
         assert_eq!(watch[0].groups[0].rows[0].id, 14);
         assert!(sections(&store, me, &View::Lane(State::Done)).len() == 1);
-    }
-
-    #[test]
-    fn do_lane_orders_mine_unassigned_theirs() {
-        let mut store = fixtures::store();
-        store
-            .edit("alex", 3, crate::store::Change::State(State::Do))
-            .unwrap();
-        store
-            .edit(
-                "alex",
-                3,
-                crate::store::Change::ToggleAssignee("alex".into()),
-            )
-            .unwrap();
-        assert_eq!(
-            heads(&store, "alex", &View::Lane(State::Do)),
-            ["→ ALEX|", "NO ONE’S|", "→ SAM|"]
-        );
-        // Inbox reads me / them / no one.
-        store
-            .edit(
-                "alex",
-                4,
-                crate::store::Change::ToggleAssignee("sam".into()),
-            )
-            .unwrap();
-        assert_eq!(
-            heads(&store, "alex", &View::Lane(State::Inbox)),
-            ["→ ALEX|", "→ SAM|", "NO ONE’S|"]
-        );
     }
 
     #[test]
