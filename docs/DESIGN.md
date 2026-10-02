@@ -119,11 +119,16 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 ## Data and sync
 
 - **Mail server (JMAP)**: messages, folders, and `Docket/` state labels — source of truth for mail and filing.
-- **App database**: users, credentials (token references), accounts (credential + `accountId`), per-message state and assignees, per-user read, per-thread comments, history, sync state.
+- **App database**: users, credentials (names matching `docket.kdl`; tokens stay in their files), accounts (credential + `accountId`), per-message state and assignees, per-user read, per-thread comments, history, sync state.
 - Records are keyed by account + Message-ID; JMAP ids and `threadId` are cached alongside, since they can change on reimport.
 - One JMAP session and push connection (EventSource) per credential; `Email/changes` / `Mailbox/changes` per account, with periodic polling as a fallback.
 - Rights are re-read on session refresh.
 - No scheduler: nothing changes on a timer.
+
+### Storage
+
+- The app database is **SQLite**: one file beside the app. It fits two users, one process, and one host behind Tailscale, with no database server to run. Back it up by copying the file (or with litestream).
+- **Each Fastmail token lives in its own file.** `docket.kdl` names each credential and points at its file (e.g. `credential "household" token-file="/run/credentials/docket/household"`). The config stays free of secrets, so it can be committed and baked into images, and tokens stay out of the environment, where `/proc` and crash dumps can expose them. The file can come from systemd `LoadCredential`, a Docker secret, or sops. The database stores only the credential name, never the token.
 
 ## Fast follow
 
@@ -147,8 +152,6 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 - Whether Fastmail web URLs are stable enough to deep-link to a thread.
 - Mail.app behavior test (throwaway message): label it `Docket/Do`, then file, archive, and delete it from Mail.app, checking `mailboxIds` via JMAP after each step. Confirms that moves keep other mailbox memberships and shows what Trash/Archive do to the `Docket/` label.
 - Confirm Fastmail offers a read-only mail scope for API tokens, and how it shows up in the session.
-- Token storage on the host (env, file, secret store).
-- Stack and database choice.
 
 ## When development starts
 
