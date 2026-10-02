@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: rustup component add clippy rustfmt llvm-tools
+      - run: |
+          curl -sL https://github.com/casey/just/releases/download/1.50.0/just-1.50.0-x86_64-unknown-linux-musl.tar.gz |
+            tar xz -C /usr/local/bin
+          curl -sL https://github.com/marco-c/grcov/releases/download/v0.10.7/grcov-x86_64-unknown-linux-gnu.tar.bz2 |
+            tar xj -C /usr/local/bin
+      - run: cargo fmt --check
+      - run: just clippy coverage
+
+  zizmor:
+    name: Audit workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+      security-events: write # upload SARIF to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+
+  build:
+    name: Build
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create GitHub release
+      packages: write # push container image to GHCR
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      image: ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: short-sha
+        run: echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: latest=true
+          tags: |
+            type=raw,value={{date 'YYYYMMDD-HHmm'}}-${{ steps.short-sha.outputs.sha }}
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STEPS_META_OUTPUTS_VERSION: ${{ steps.meta.outputs.version }}
+        # --target names the commit explicitly: persist-credentials is
+        # false, so the tag cannot ride the leftover git credentials.
+        run: gh release create "v${STEPS_META_OUTPUTS_VERSION}" --target "$GITHUB_SHA" --generate-notes
+
+  deploy:
+    name: Deploy demo
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout, for fly.toml
+    environment:
+      name: demo
+      url: https://docket.fly.dev
+    # One deploy at a time, and a newer main is the one worth having.
+    concurrency:
+      group: fly-deploy
+      cancel-in-progress: true
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: docket
+      FLY_ORG: personal
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
+
+      # Created here rather than by hand, so the app is something this
+      # repository can lose and get back. `status` is how the review-app
+      # action asks the same question.
+      - name: Create the app if it is not there yet
+        run: flyctl status --app "$FLY_APP" >/dev/null 2>&1 || flyctl apps create "$FLY_APP" --org "$FLY_ORG"
+
+      # The image the build job just pushed, rather than a second build
+      # of the same commit: what the demo runs is then the release.
+      - name: Deploy the released image
+        env:
+          NEEDS_BUILD_OUTPUTS_IMAGE: ${{ needs.build.outputs.image }}
+        run: flyctl deploy --app "$FLY_APP" --config fly.toml --image "$NEEDS_BUILD_OUTPUTS_IMAGE"
