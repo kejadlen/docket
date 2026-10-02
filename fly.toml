@@ -11,7 +11,7 @@
 # of Fly and a taken one fails the deploy. ci.yml spells it twice more,
 # as FLY_APP to create it on the first deploy and in the environment's
 # URL, so a rename here is a rename in three places.
-app = 'docket'
+app = 'docket-demo'
 primary_region = 'sjc'
 
 [build]

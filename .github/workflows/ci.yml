@@ -97,14 +97,14 @@ jobs:
       contents: read # checkout, for fly.toml
     environment:
       name: demo
-      url: https://docket.fly.dev
+      url: https://docket-demo.fly.dev
     # One deploy at a time, and a newer main is the one worth having.
     concurrency:
       group: fly-deploy
       cancel-in-progress: true
     env:
       FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      FLY_APP: docket
+      FLY_APP: docket-demo
       FLY_ORG: personal
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
