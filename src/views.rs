@@ -5,7 +5,7 @@
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::dates;
-use crate::lists::{self, Section, View};
+use crate::lists::{self, Group, Section, View};
 use crate::model::{Comment, Kind, Message, State, User, Values};
 use crate::store::{Flash, Item, Store};
 
@@ -168,16 +168,10 @@ fn whoami(p: &Page<'_>) -> Markup {
 
 fn list(p: &Page<'_>) -> Markup {
     let sections = lists::sections(p.store, p.me, p.view);
-    let total: usize = sections
-        .iter()
-        .flat_map(|s| &s.groups)
-        .map(|g| g.rows.len())
-        .sum();
     html! {
         section.list aria-label="Messages" {
             header.list-head {
                 h1 { (p.view.title()) }
-                span.type-figure.count { (total) }
             }
             @if sections.is_empty() {
                 p.empty { "Nothing here." }
@@ -193,26 +187,48 @@ fn list_section(p: &Page<'_>, section: &Section<'_>) -> Markup {
     html! {
         div {
             @if !section.head.is_empty() {
-                div.type-section.section-head {
-                    span { (section.head) }
-                    span.sub { (section.sub) }
-                }
+                span.type-label.section-head { (section.head) }
             }
             div.groups {
                 @for group in &section.groups {
-                    div.group {
-                        div.group-head {
-                            span.subj { (group.thread.subject) }
-                            @if let Some(more) = group.more() {
-                                span.type-label.more { (more) }
-                            }
-                        }
-                        div.rail {
-                            @for m in &group.rows {
-                                (row(p, m, section.compact))
-                            }
-                        }
+                    @match group.rows.as_slice() {
+                        [m] => (solo(p, group, m, section.compact)),
+                        rows => (thread_group(p, group, rows, section.compact)),
                     }
+                }
+            }
+        }
+    }
+}
+
+/// A thread with several messages listed: the subject heads a row per message.
+fn thread_group(p: &Page<'_>, group: &Group<'_>, rows: &[&Message], compact: bool) -> Markup {
+    let unread = rows.iter().any(|m| p.store.is_unread(&p.me.slug, m));
+    html! {
+        div.group.unread[unread] {
+            span.subj { (group.thread.subject) }
+            div.rail {
+                @for m in rows {
+                    (row(p, m, compact))
+                }
+            }
+        }
+    }
+}
+
+/// A thread with one message listed collapses into a single row: subject and
+/// time, then sender and snippet.
+fn solo(p: &Page<'_>, group: &Group<'_>, m: &Message, compact: bool) -> Markup {
+    let selected = p.selected.is_some_and(|s| s.id == m.id);
+    let unread = p.store.is_unread(&p.me.slug, m);
+    html! {
+        a.row.solo.sel[selected].unread[unread] href=(select_path(p.view, m.id)) {
+            span.subj { (group.thread.subject) }
+            span.type-figure.age { (dates::short(p.store.now, m.at)) }
+            span.line {
+                span.from { (sender(p.store, m)) }
+                @if !compact {
+                    span.snip { " — " (m.body) }
                 }
             }
         }

@@ -81,7 +81,6 @@ async fn for_me_lists_messages_grouped_by_state_and_thread() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("<title>For me · Docket</title>"));
     assert!(body.contains("Gutter repair estimate"));
-    assert!(body.contains("2 OF 4"));
     assert!(body.contains("No thread open."));
     // Rows carry sender, age and snippet; values live in the thread.
     assert!(body.contains(r#"<span class="from">Northwind Roofing</span>"#));
@@ -174,13 +173,13 @@ async fn read_only_accounts_show_folder_as_plain_text() {
 async fn opening_a_message_marks_it_read() {
     let addr = spawn().await;
     let (_, body) = get(addr, ALEX, "/").await;
-    assert!(body.contains(r#"class="row unread" href="/?m=7""#));
+    assert!(body.contains(r#"class="row solo unread" href="/?m=7""#));
     get(addr, ALEX, "/?m=7").await;
     let (_, body) = get(addr, ALEX, "/").await;
-    assert!(body.contains(r#"class="row" href="/?m=7""#));
+    assert!(body.contains(r#"class="row solo" href="/?m=7""#));
     // Read tracking is per person.
     let (_, body) = get(addr, SAM, "/").await;
-    assert!(body.contains(r#"class="row unread" href="/?m=7""#));
+    assert!(body.contains(r#"class="row solo unread" href="/?m=7""#));
 }
 
 #[tokio::test]

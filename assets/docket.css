@@ -47,25 +47,28 @@ button { font: inherit; color: inherit; }
 .who-name { font-weight: 600; }
 .who-login { text-transform: none; letter-spacing: 0; color: var(--gl-color-text-tertiary); }
 
-/* ── the list: one card; each thread hangs its messages off a rail ── */
+/* ── the list: one card. A one-message thread is a single row; a longer one
+   heads a row per message. Unread rows carry full ink; read ones
+   step back. ── */
 .list { background: var(--gl-color-surface-card); border-radius: 6px; padding: var(--gl-space-m) var(--gl-space-m) 0; display: flex; flex-direction: column; gap: var(--gl-space-m); min-height: 0; overflow-y: auto; }
 .list-head { display: flex; justify-content: space-between; align-items: baseline; }
 .list-head h1, .thread-head h2 { font: 600 var(--gl-step-0)/1.2 var(--gl-font-text); letter-spacing: -.01em; }
-.section-head { display: flex; justify-content: space-between; }
-.section-head .sub { color: var(--gl-color-text-tertiary); }
-.groups { display: flex; flex-direction: column; gap: var(--gl-space-m); padding: var(--gl-space-s) 0 var(--gl-space-m); }
+.section-head { color: var(--gl-color-text-tertiary); }
+.groups { display: flex; flex-direction: column; gap: var(--gl-space-s); padding: var(--gl-space-2xs) 0 var(--gl-space-m); }
 .group { display: flex; flex-direction: column; gap: var(--gl-space-3xs); }
-.group-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-.subj { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.more { color: var(--gl-color-text-tertiary); white-space: nowrap; }
+.subj { min-width: 0; font-weight: 600; color: var(--gl-color-text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.group:not(.unread) > .subj, .row.solo:not(.unread) .subj { font-weight: 500; color: var(--gl-color-text-secondary); }
+.age { font-size: var(--gl-step--2); color: var(--gl-color-text-tertiary); white-space: nowrap; text-align: right; }
 .rail { display: flex; flex-direction: column; gap: 2px; padding-left: 6px; }
-.row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; padding: 6px 8px 8px 10px; margin-right: -8px; border-radius: var(--gl-radius); color: var(--gl-color-text-secondary); text-decoration: none; transition: background var(--gl-dur-fast) var(--gl-ease); }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 2px 10px; padding: 6px 8px 8px 10px; margin-right: -8px; border-radius: var(--gl-radius); color: var(--gl-color-text-secondary); text-decoration: none; transition: background var(--gl-dur-fast) var(--gl-ease); }
+.row.solo { margin-left: -10px; }
 .row:hover { background: var(--gl-color-surface-fill); color: var(--gl-color-text-secondary); }
 .row.sel { background: var(--gl-color-surface-fill); }
-.row .from { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .from, .row .line { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row.unread .from { font-weight: 500; color: var(--gl-color-text-primary); }
-.row .age { flex: none; width: 76px; text-align: right; font-size: var(--gl-step--2); white-space: nowrap; }
-.row .snip { flex: 0 0 100%; font-size: var(--gl-step--2); line-height: 1.5; color: var(--gl-color-text-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .line { font-size: var(--gl-step--2); }
+.row .snip { font-size: var(--gl-step--2); color: var(--gl-color-text-tertiary); }
+.rail .row .snip { grid-column: 1 / -1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* ── the thread: each email its own card, comments bare between them ── */
 .reader { min-height: 0; overflow-y: auto; }
