@@ -310,7 +310,7 @@ fn comment(store: &Store, c: &Comment) -> Markup {
     html! {
         div.item.comment {
             div.body {
-                span.author { b { (store.user_name(&c.author)) } span.type-label { "Internal" } }
+                span.author { b { (store.user_name(&c.author)) } }
                 span.text { (c.text) }
             }
             div.gutter { span.type-figure.date { (dates::short(store.now, c.at)) } }

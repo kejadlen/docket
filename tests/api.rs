@@ -124,7 +124,6 @@ async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
     // Only the selected email floats.
     assert!(body.contains(r#"class="item card sel" id="m4""#));
     assert!(body.contains(r#"class="item card" id="m3""#));
-    assert!(body.contains(r#"<span class="type-label">Internal</span>"#));
     assert!(body.contains(r#"<span class="type-label sent">Sent</span>"#));
     assert!(body.contains(r#"<span class="badge accent"><span class="mark"></span>Do</span>"#));
     assert!(body.contains(r#"<span class="badge success"><span class="mark"></span>Done</span>"#));
