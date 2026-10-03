@@ -4,10 +4,10 @@ fmt:
     cargo fmt --all
 
 check:
-    cargo check --workspace
+    cargo check --workspace --all-features
 
 clippy:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-features -- -D warnings
 
 coverage:
     ./bin/coverage
@@ -28,7 +28,7 @@ all: fmt clippy coverage
 # Serve the fixture-backed UI without Tailscale on http://127.0.0.1:3000,
 # restarting on changes.
 dev:
-    { fd -t f . src assets; echo Cargo.toml docket.kdl; } | entr -r cargo run
+    { fd -t f . src assets; echo Cargo.toml docket.kdl; } | entr -r cargo run --features dev
 
 install:
     cargo install --locked --path .

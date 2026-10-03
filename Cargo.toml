@@ -7,6 +7,12 @@ edition = "2024"
 name = "docket"
 path = "src/bin/docket/main.rs"
 
+[features]
+# Stands in for caddy-tailscale so the app runs locally against fixtures:
+# seeds an empty database and signs requests in as a user picked from the
+# menu. Never enable it in a deployed build.
+dev = []
+
 [dependencies]
 axum = "*"
 camino = "*"

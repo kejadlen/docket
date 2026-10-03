@@ -130,7 +130,7 @@ pub fn store() -> Result<Store, Error> {
 
 /// Writes the fixtures into an empty database.
 pub fn seed(store: &Store) -> Result<(), Error> {
-    let users = [User::new(ALEX, Some("Alex")), User::new(SAM, Some("Sam"))];
+    let users = [User::new(ALEX, "Alex"), User::new(SAM, "Sam")];
     let accounts = [
         Account {
             slug: "household".into(),

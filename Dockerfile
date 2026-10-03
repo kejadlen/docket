@@ -19,12 +19,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo chef cook --release --recipe-path recipe.json
 COPY . .
+# Cargo features to build with. Empty for the release image; the Fly demos
+# set `dev` (see fly.toml).
+ARG FEATURES=""
 # Copy the binary out of the cache mount so it survives into the runtime
 # stage.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git/db \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin docket && \
+    cargo build --release --bin docket --features "$FEATURES" && \
     cp target/release/docket /build/docket
 
 # Runtime stage.

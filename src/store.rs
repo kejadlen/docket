@@ -135,7 +135,7 @@ impl Store {
 
     /// The user behind a request Tailscale identified, added on their first
     /// request. Their slug follows whatever the proxy sends.
-    pub fn sign_in(&self, login: &str, slug: Option<&str>) -> Result<User, Error> {
+    pub fn sign_in(&self, login: &str, slug: &str) -> Result<User, Error> {
         let user = User::new(login, slug);
         self.lock().conn.execute(
             "INSERT INTO users (login, slug) VALUES (?1, ?2)
@@ -910,16 +910,16 @@ mod tests {
     fn signing_in_adds_users_and_follows_their_slug() {
         let store = Store::open_in_memory(fixtures::now()).unwrap();
         assert!(store.is_empty().unwrap());
-        let pat = store.sign_in("pat@example.com", None).unwrap();
-        assert_eq!(pat, User::new("pat@example.com", None));
+        let pat = store.sign_in("pat@example.com", "pat").unwrap();
+        assert_eq!(pat, User::new("pat@example.com", "pat"));
         assert!(!store.is_empty().unwrap());
         assert_eq!(store.user("pat@example.com").unwrap(), Some(pat));
 
-        store.sign_in("pat@example.com", Some("Pat")).unwrap();
-        store.sign_in("pat@example.com", Some("Pat")).unwrap();
+        store.sign_in("pat@example.com", "Pat").unwrap();
+        store.sign_in("pat@example.com", "Pat").unwrap();
         assert_eq!(store.user("pat@example.com").unwrap().unwrap().slug, "Pat");
         // Slugs are only for show, so two logins may share one.
-        store.sign_in("pat@work.example", Some("Pat")).unwrap();
+        store.sign_in("pat@work.example", "Pat").unwrap();
         assert_eq!(store.users().unwrap().len(), 2);
     }
 
@@ -1042,7 +1042,7 @@ mod tests {
         let db_err = |r: Result<(), Error>| assert!(matches!(r, Err(Error::Db(_))), "{r:?}");
         db_err(store.edit(SAM, 4, Change::State(State::Do)));
         db_err(store.mark_read(SAM, 4));
-        db_err(store.sign_in("pat@example.com", None).map(|_| ()));
+        db_err(store.sign_in("pat@example.com", "pat").map(|_| ()));
         db_err(store.add_comment(SAM, 1, "hi"));
         db_err(store.import(|tx| tx.folder("Travel")));
         db_err(store.import(|tx| tx.message(&msg)));

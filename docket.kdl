@@ -1,7 +1,6 @@
 // Docket's settings, read from this file (see `--help` for pointing
-// DOCKET_CONFIG elsewhere). This copy is the local-dev one: `dev` serves
-// fixture data without Tailscale, picking a user from the sidebar, and
-// seeds the database with it the first time. Delete the file to start over.
+// DOCKET_CONFIG elsewhere). This copy is the local-dev one; `just dev`
+// builds with the `dev` feature, which seeds the database with fixtures the
+// first time and stands in for Tailscale. Delete docket.db to start over.
 bind "127.0.0.1:3000"
 database "docket.db"
-dev

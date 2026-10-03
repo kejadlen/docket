@@ -1,11 +1,12 @@
 # The one Fly config, for the two demo apps: the app main deploys (the
 # deploy job in .github/workflows/ci.yml) and the per-PR previews (the
 # review-app action in .github/workflows/preview.yml, which overrides
-# the app name with the PR's). Both read the config baked into the image
-# from fly.kdl: fixture data instead of JMAP, and a stand-in identity in
-# place of the identity headers that Caddy (caddy-tailscale) supplies in
-# front of the real deployment. No volume, so every deploy starts
-# from the fixtures again.
+# the app name with the PR's). Both build the image here with the `dev`
+# feature: fixture data instead of JMAP, and a stand-in identity in place
+# of the identity headers that Caddy (caddy-tailscale) supplies in front
+# of the real deployment. The release image leaves the feature out, so
+# the demos can't run it. No volume, so every deploy starts from the
+# fixtures again.
 #
 # The app name is Fly's, not GitHub's, so it has to be unique across all
 # of Fly and a taken one fails the deploy. ci.yml spells it twice more,
@@ -14,7 +15,8 @@
 app = 'docket-kejadlen'
 primary_region = 'sjc'
 
-[build]
+[build.args]
+FEATURES = 'dev'
 
 [env]
 DOCKET_CONFIG = '/etc/docket.kdl'

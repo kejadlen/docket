@@ -20,8 +20,9 @@ A small self-hosted webapp for two people to jointly manage household email acco
 
 - Two app users.
 - Access is via Tailscale, which is the whole of authentication: anyone the tailnet lets reach Docket is a user, added on their first request. Docket keeps no list of people.
-- The app binds to localhost behind Caddy with [caddy-tailscale](https://github.com/tailscale/caddy-tailscale), which sets two headers from the tailnet identity: `Remote-User` (the full login, `{http.auth.user.id}`) identifies the user, and `X-User-Slug` carries a short name the Caddyfile maps from the login. Requests without a login are rejected.
-- A user's slug is what Docket shows for them. It follows the latest `X-User-Slug`, falls back to the part of the login before the `@`, and need not be unique.
+- The app binds to localhost behind Caddy with [caddy-tailscale](https://github.com/tailscale/caddy-tailscale), which sets two headers from the tailnet identity: `Remote-User` (the full login, `{http.auth.user.id}`) identifies the user, and `X-User-Slug` carries a short name the Caddyfile maps from the login. Requests missing either header are rejected.
+- A user's slug is what Docket shows for them. It follows the latest `X-User-Slug` and need not be unique.
+- For local work, the `dev` cargo feature stands in for the proxy: a middleware sets both headers for a user picked from a menu. Release builds leave it out, so no setting can turn it on in production.
 
 ## Credentials and accounts
 

@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use axum::extract::{FromRequestParts, OriginalUri, Path, Query, State as Extract};
-use axum::http::header::{CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE};
+use axum::http::header::{CONTENT_TYPE, HOST, ORIGIN};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use maud::Markup;
@@ -19,28 +19,24 @@ use crate::views::{self, Page, ThreadView};
 
 // caddy-tailscale sets both from the tailnet identity, overwriting whatever
 // the client sent.
-const IDENTITY_HEADER: &str = "Remote-User";
-const SLUG_HEADER: &str = "X-User-Slug";
-const DEV_COOKIE: &str = "docket_dev_user";
+pub(crate) const IDENTITY_HEADER: &str = "Remote-User";
+pub(crate) const SLUG_HEADER: &str = "X-User-Slug";
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
-    /// Without Tailscale in front, fall back to a cookie-chosen user.
-    pub dev: bool,
 }
 
 impl AppState {
-    pub fn new(store: Store, dev: bool) -> Self {
+    pub fn new(store: Store) -> Self {
         Self {
             store: Arc::new(store),
-            dev,
         }
     }
 }
 
 pub fn router(state: AppState) -> Router {
-    let mut router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/", get(for_me))
         .route("/{lane}", get(lane))
@@ -52,11 +48,9 @@ pub fn router(state: AppState) -> Router {
         .route("/undo", post(undo))
         .route("/assets/gloss.css", get(gloss_css))
         .route("/assets/docket.css", get(docket_css))
-        .route("/assets/alpine.js", get(alpine_js));
-    if state.dev {
-        router = router.route("/dev/user", post(dev_user));
-    }
-    router.layer(TraceLayer::new_for_http()).with_state(state)
+        .route("/assets/alpine.js", get(alpine_js))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 async fn health() -> &'static str {
@@ -64,7 +58,8 @@ async fn health() -> &'static str {
 }
 
 /// The requesting user, from the identity headers caddy-tailscale adds. Anyone
-/// Tailscale lets through is a user; the first request adds them.
+/// Tailscale lets through is a user; the first request adds them. Missing
+/// either header means the proxy isn't doing its job, so nobody gets in.
 struct Me(User);
 
 impl FromRequestParts<AppState> for Me {
@@ -76,44 +71,24 @@ impl FromRequestParts<AppState> for Me {
         if parts.method == Method::POST && !same_origin(&parts.headers) {
             return Err(Error::Forbidden("cross-site request"));
         }
-        let store = &state.store;
-        if let Some(login) = header(&parts.headers, IDENTITY_HEADER).filter(|l| !l.is_empty()) {
-            let slug = header(&parts.headers, SLUG_HEADER);
-            return Ok(Me(store.sign_in(login, slug)?));
-        }
-        if !state.dev {
+        let present = |name| header(&parts.headers, name).filter(|v| !v.trim().is_empty());
+        let (Some(login), Some(slug)) = (present(IDENTITY_HEADER), present(SLUG_HEADER)) else {
             return Err(Error::Unauthenticated);
-        }
-        let chosen = match cookie(&parts.headers, DEV_COOKIE) {
-            Some(login) => store.user(login)?,
-            None => None,
         };
-        let user = match chosen {
-            Some(user) => Some(user),
-            None => store.users()?.into_iter().next(),
-        };
-        user.map(Me).ok_or(Error::Unauthenticated)
+        Ok(Me(state.store.sign_in(login, slug)?))
     }
 }
 
-fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn same_origin(headers: &HeaderMap) -> bool {
+pub(crate) fn same_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = header(headers, ORIGIN.as_str()) else {
         return true;
     };
     let origin_host = origin.split_once("://").map(|(_, host)| host);
     origin_host.is_some() && origin_host == header(headers, HOST.as_str())
-}
-
-fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    header(headers, COOKIE.as_str())?
-        .split(';')
-        .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v)
 }
 
 #[derive(Deserialize)]
@@ -180,7 +155,6 @@ fn render(
         thread,
         flash: store.take_flash(&me.login),
         here,
-        dev: state.dev,
     }))
 }
 
@@ -205,7 +179,7 @@ fn open_thread(store: &Store, me: &User, id: MessageId) -> Result<ThreadView, Er
 }
 
 /// Only same-site paths, so a form can't bounce the browser elsewhere.
-fn safe_back(back: &str) -> &str {
+pub(crate) fn safe_back(back: &str) -> &str {
     if back.starts_with('/') && !back.starts_with("//") && !back.contains('\\') {
         back
     } else {
@@ -246,9 +220,9 @@ async fn set_folder(
 }
 
 #[derive(Deserialize)]
-struct UserForm {
-    user: String,
-    back: String,
+pub(crate) struct UserForm {
+    pub(crate) user: String,
+    pub(crate) back: String,
 }
 
 async fn toggle_assignee(
@@ -306,21 +280,6 @@ async fn undo(
 ) -> Result<Redirect, Error> {
     state.store.undo(&me.login)?;
     Ok(Redirect::to(safe_back(&form.back)))
-}
-
-async fn dev_user(
-    Extract(state): Extract<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<UserForm>,
-) -> Result<Response, Error> {
-    if !same_origin(&headers) {
-        return Err(Error::Forbidden("cross-site request"));
-    }
-    if state.store.user(&form.user)?.is_none() {
-        return Err(Error::NotFound("user"));
-    }
-    let cookie = format!("{DEV_COOKIE}={}; Path=/; SameSite=Lax", form.user);
-    Ok(([(SET_COOKIE, cookie)], Redirect::to(safe_back(&form.back))).into_response())
 }
 
 async fn gloss_css() -> impl IntoResponse {

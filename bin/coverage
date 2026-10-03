@@ -22,7 +22,7 @@ main() {
     export LLVM_PROFILE_FILE="$TARGET_DIR/profraw/%p-%m.profraw"
 
     rm -rf "$TARGET_DIR"
-    cargo test --workspace --quiet
+    cargo test --workspace --all-features --quiet
 
     local report
     report=$(grcov "$TARGET_DIR/profraw" \

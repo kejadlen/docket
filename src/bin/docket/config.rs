@@ -22,10 +22,6 @@ pub struct Config {
     /// fronts it and supplies the user identity headers.
     pub bind: SocketAddr,
 
-    /// Serve without Tailscale: requests with no identity header act as a
-    /// user picked from the sidebar. For local work against fixtures only.
-    pub dev: bool,
-
     /// SQLite database file, created if missing. A relative path is
     /// relative to the working directory.
     pub database: Utf8PathBuf,
@@ -56,7 +52,6 @@ pub struct Args {
 fn parse(source: &str) -> Result<Config, Error> {
     let document = KdlDocument::parse(source)?;
     let mut bind = None;
-    let mut dev = None;
     let mut database = None;
 
     for node in document.nodes() {
@@ -69,15 +64,6 @@ fn parse(source: &str) -> Result<Config, Error> {
                     });
                 }
                 bind = Some(parse_bind(node)?);
-            }
-            "dev" => {
-                if dev.is_some() {
-                    return Err(Error::Duplicate {
-                        name: "dev".to_owned(),
-                        span: node.name().span(),
-                    });
-                }
-                dev = Some(parse_dev(node)?);
             }
             "database" => {
                 if database.is_some() {
@@ -99,7 +85,6 @@ fn parse(source: &str) -> Result<Config, Error> {
 
     Ok(Config {
         bind: bind.unwrap_or(DEFAULT_BIND),
-        dev: dev.unwrap_or(false),
         database: database.unwrap_or_else(|| Utf8PathBuf::from(DEFAULT_DATABASE)),
     })
 }
@@ -120,13 +105,6 @@ fn parse_database(node: &KdlNode) -> Result<Utf8PathBuf, Error> {
         .filter(|path| !path.is_empty())
         .map(Utf8PathBuf::from)
         .ok_or(Error::DatabaseValue { span: node.span() })
-}
-
-fn parse_dev(node: &KdlNode) -> Result<bool, Error> {
-    match single_value(node, "dev")? {
-        None => Ok(true),
-        Some(value) => value.as_bool().ok_or(Error::DevValue { span: node.span() }),
-    }
 }
 
 /// Returns the node's single positional value, or `None` when the node
@@ -157,7 +135,7 @@ enum Error {
     #[error("unknown setting `{name}`")]
     #[diagnostic(
         code(docket::config::unknown),
-        help("known settings: `bind`, `database`, `dev`")
+        help("known settings: `bind`, `database`")
     )]
     Unknown {
         name: String,
@@ -204,13 +182,6 @@ enum Error {
         #[label]
         span: SourceSpan,
     },
-
-    #[error("dev takes #true or #false, or nothing at all (which means true)")]
-    #[diagnostic(code(docket::config::dev_value))]
-    DevValue {
-        #[label]
-        span: SourceSpan,
-    },
 }
 
 #[cfg(test)]
@@ -222,7 +193,6 @@ mod tests {
     fn empty_document_uses_defaults() {
         let config = parse("").unwrap();
         assert_eq!(config.bind.to_string(), "127.0.0.1:3000");
-        assert!(!config.dev);
         assert_eq!(config.database, "docket.db");
     }
 
@@ -230,7 +200,6 @@ mod tests {
     fn comments_only_uses_defaults() {
         let config = parse("// nothing configured\n").unwrap();
         assert_eq!(config.bind.to_string(), "127.0.0.1:3000");
-        assert!(!config.dev);
     }
 
     #[test]
@@ -279,44 +248,21 @@ mod tests {
     }
 
     #[test]
-    fn bare_dev_means_true() {
-        let config = parse("dev").unwrap();
-        assert!(config.dev);
-    }
-
-    #[test]
-    fn dev_accepts_explicit_booleans() {
-        assert!(parse("dev #true").unwrap().dev);
-        assert!(!parse("dev #false").unwrap().dev);
-    }
-
-    #[test]
-    fn dev_rejects_non_boolean_values() {
-        assert!(matches!(parse(r#"dev "yes""#), Err(Error::DevValue { .. })));
-        assert!(matches!(parse("dev 1"), Err(Error::DevValue { .. })));
-        assert!(matches!(parse("dev #null"), Err(Error::DevValue { .. })));
-        // Bare `true` never reaches us: KDL v2 rejects it at parse time.
-        assert!(matches!(parse("dev true"), Err(Error::Kdl(_))));
-    }
-
-    #[test]
     fn settings_combine() {
-        let config = parse("bind \"0.0.0.0:3000\"\ndev\n").unwrap();
+        let config = parse("bind \"0.0.0.0:3000\"\ndatabase \"d.db\"\n").unwrap();
         assert_eq!(config.bind.to_string(), "0.0.0.0:3000");
-        assert!(config.dev);
+        assert_eq!(config.database, "d.db");
     }
 
     #[test]
     fn unknown_setting_is_rejected() {
         assert!(matches!(parse("bnd \"x\""), Err(Error::Unknown { .. })));
+        // Dev mode is a build feature now, not a setting.
+        assert!(matches!(parse("dev"), Err(Error::Unknown { .. })));
     }
 
     #[test]
     fn duplicate_setting_is_rejected() {
-        assert!(matches!(
-            parse("dev\ndev #false"),
-            Err(Error::Duplicate { .. })
-        ));
         let source = "bind \"127.0.0.1:1\"\nbind \"127.0.0.1:2\"";
         assert!(matches!(parse(source), Err(Error::Duplicate { .. })));
     }
@@ -324,11 +270,17 @@ mod tests {
     #[test]
     fn extra_syntax_is_rejected() {
         assert!(matches!(
-            parse("dev #true #false"),
+            parse(r#"database "a.db" "b.db""#),
             Err(Error::Shape { .. })
         ));
-        assert!(matches!(parse("dev on=#false"), Err(Error::Shape { .. })));
-        assert!(matches!(parse("dev { inner }"), Err(Error::Shape { .. })));
+        assert!(matches!(
+            parse(r#"database path="a.db""#),
+            Err(Error::Shape { .. })
+        ));
+        assert!(matches!(
+            parse(r#"database "a.db" { inner }"#),
+            Err(Error::Shape { .. })
+        ));
         assert!(matches!(
             parse(r#"bind address="127.0.0.1:3000""#),
             Err(Error::Shape { .. })

@@ -1,14 +1,15 @@
 use std::net::SocketAddr;
 
+use axum::Router;
 use docket::routes::{AppState, router};
 use reqwest::{Client, StatusCode, redirect};
 use tokio::net::TcpListener;
 
 const SAM: &str = "sam@example.com";
 const ALEX: &str = "alex@example.com";
+const EVE: &str = "eve@example.com";
 
-async fn spawn_with(dev: bool) -> SocketAddr {
-    let app = router(AppState::new(docket::fixtures::store().unwrap(), dev));
+async fn serve(app: Router) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -18,7 +19,7 @@ async fn spawn_with(dev: bool) -> SocketAddr {
 }
 
 async fn spawn() -> SocketAddr {
-    spawn_with(false).await
+    serve(router(AppState::new(docket::fixtures::store().unwrap()))).await
 }
 
 fn client() -> Client {
@@ -28,10 +29,21 @@ fn client() -> Client {
         .unwrap()
 }
 
+/// What the proxy would send as `X-User-Slug`: "sam@example.com" is "Sam".
+fn slug(login: &str) -> String {
+    let name = login.split('@').next().unwrap_or(login);
+    let mut chars = name.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
 async fn get(addr: SocketAddr, login: &str, path: &str) -> (StatusCode, String) {
     let res = client()
         .get(format!("http://{addr}{path}"))
         .header("Remote-User", login)
+        .header("X-User-Slug", slug(login))
         .send()
         .await
         .unwrap();
@@ -47,6 +59,7 @@ async fn post(
     client()
         .post(format!("http://{addr}{path}"))
         .header("Remote-User", login)
+        .header("X-User-Slug", slug(login))
         .form(form)
         .send()
         .await
@@ -66,12 +79,29 @@ async fn health_returns_ok() {
 }
 
 #[tokio::test]
-async fn requires_an_identity() {
+async fn requires_both_identity_headers() {
     let addr = spawn().await;
     let res = reqwest::get(format!("http://{addr}/")).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    let (status, _) = get(addr, "", "/").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for (login, slug) in [
+        (Some(EVE), None),
+        (None, Some("Eve")),
+        (Some(""), Some("Eve")),
+        (Some(EVE), Some(" ")),
+    ] {
+        let mut req = client().get(format!("http://{addr}/"));
+        if let Some(login) = login {
+            req = req.header("Remote-User", login);
+        }
+        if let Some(slug) = slug {
+            req = req.header("X-User-Slug", slug);
+        }
+        let res = req.send().await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{login:?} {slug:?}");
+    }
+    // Nobody got added along the way.
+    let (_, body) = get(addr, ALEX, "/?m=4").await;
+    assert!(!body.contains(EVE));
 }
 
 #[tokio::test]
@@ -79,9 +109,9 @@ async fn anyone_tailscale_lets_in_is_a_user() {
     let addr = spawn().await;
     let (status, body) = get(addr, "eve@example.com", "/").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains(r#"<span class="who-name">eve</span>"#));
+    assert!(body.contains(r#"<span class="who-name">Eve</span>"#));
 
-    // The proxy names them with X-User-Slug, and the name follows it.
+    // The name follows the latest X-User-Slug.
     let body = client()
         .get(format!("http://{addr}/?m=4"))
         .header("Remote-User", "eve@example.com")
@@ -118,7 +148,7 @@ async fn lanes_and_search() {
         ("/do", "Exemption renewal"),
         ("/wait", "Claim 4471"),
         ("/watch", "Shipped: furnace filters"),
-        ("/search?q=downspout", "sam → Northwind Roofing"),
+        ("/search?q=downspout", "Sam → Northwind Roofing"),
     ] {
         let (status, body) = get(addr, SAM, path).await;
         assert_eq!(status, StatusCode::OK, "{path}");
@@ -316,88 +346,108 @@ async fn comments_join_the_thread() {
 
 #[tokio::test]
 async fn cross_site_posts_are_refused() {
-    let addr = spawn_with(true).await;
-    let send = |origin: &'static str, path: &'static str| {
+    let addr = spawn().await;
+    let send = |origin: &'static str| {
         client()
-            .post(format!("http://{addr}{path}"))
+            .post(format!("http://{addr}/messages/4/state"))
             .header("Remote-User", SAM)
+            .header("X-User-Slug", "Sam")
             .header("Origin", origin)
-            .form(&[("state", "do"), ("user", ALEX), ("back", "/")])
+            .form(&[("state", "do"), ("back", "/")])
             .send()
     };
-    let res = send("https://evil.example", "/messages/4/state")
-        .await
-        .unwrap();
+    let res = send("https://evil.example").await.unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
-    let res = send("null", "/messages/4/state").await.unwrap();
-    assert_eq!(res.status(), StatusCode::FORBIDDEN);
-    let res = send("https://evil.example", "/dev/user").await.unwrap();
+    let res = send("null").await.unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     let same: &'static str = Box::leak(format!("http://{addr}").into_boxed_str());
-    let res = send(same, "/messages/4/state").await.unwrap();
+    let res = send(same).await.unwrap();
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]
-async fn dev_mode_picks_a_user_from_a_cookie() {
-    let addr = spawn_with(true).await;
-    let anon = client();
-    let body = anon
-        .get(format!("http://{addr}/"))
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(body.contains(r#"<span class="who-name">Alex</span>"#));
-    assert!(body.contains(r#"action="/dev/user""#));
-
-    let res = anon
-        .post(format!("http://{addr}/dev/user"))
-        .form(&[("user", SAM), ("back", "/do")])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&res), "/do");
-    let cookie = res.headers()["set-cookie"].to_str().unwrap();
-    assert!(cookie.starts_with("docket_dev_user=sam@example.com;"));
-
-    let body = anon
-        .get(format!("http://{addr}/"))
-        .header("Cookie", "theme=dark; docket_dev_user=sam@example.com")
-        .send()
-        .await
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    assert!(body.contains(r#"<span class="who-name">Sam</span>"#));
-
-    let res = anon
-        .post(format!("http://{addr}/dev/user"))
-        .form(&[("user", "eve"), ("back", "/")])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
-
-    // Outside dev mode, the switch doesn't exist.
-    let prod = spawn().await;
-    let res = post(prod, SAM, "/dev/user", &[("user", ALEX), ("back", "/")]).await;
+async fn without_the_dev_feature_there_is_no_user_switch() {
+    let addr = spawn().await;
+    let res = post(addr, SAM, "/dev/user", &[("user", ALEX), ("back", "/")]).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
-async fn dev_mode_with_no_users_is_unauthenticated() {
-    let store = docket::store::Store::open_in_memory(docket::fixtures::now()).unwrap();
-    let app = router(AppState::new(store, true));
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let res = reqwest::get(format!("http://{addr}/")).await.unwrap();
-    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+#[cfg(feature = "dev")]
+mod dev {
+    use super::*;
+
+    async fn spawn_dev(store: docket::store::Store) -> SocketAddr {
+        serve(docket::dev::router(AppState::new(store))).await
+    }
+
+    async fn page(addr: SocketAddr, cookie: Option<&str>) -> String {
+        let mut req = client()
+            .get(format!("http://{addr}/"))
+            // Whatever the client claims, the middleware decides.
+            .header("Remote-User", "mallory@example.com")
+            .header("X-User-Slug", "Mallory");
+        if let Some(cookie) = cookie {
+            req = req.header("Cookie", cookie);
+        }
+        req.send().await.unwrap().text().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn picks_a_user_from_a_cookie() {
+        let addr = spawn_dev(docket::fixtures::store().unwrap()).await;
+        let body = page(addr, None).await;
+        assert!(body.contains(r#"<span class="who-name">Alex</span>"#));
+        assert!(body.contains(r#"action="/dev/user""#));
+        assert!(!body.contains("Mallory"));
+
+        let res = client()
+            .post(format!("http://{addr}/dev/user"))
+            .form(&[("user", SAM), ("back", "/do")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(location(&res), "/do");
+        let cookie = res.headers()["set-cookie"].to_str().unwrap();
+        assert!(cookie.starts_with("docket_dev_user=sam@example.com;"));
+
+        let body = page(addr, Some("theme=dark; docket_dev_user=sam@example.com")).await;
+        assert!(body.contains(r#"<span class="who-name">Sam</span>"#));
+        // A cookie for someone unknown falls back to the first user.
+        let body = page(addr, Some("docket_dev_user=eve@example.com")).await;
+        assert!(body.contains(r#"<span class="who-name">Alex</span>"#));
+
+        let res = client()
+            .post(format!("http://{addr}/dev/user"))
+            .form(&[("user", "eve"), ("back", "/")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let res = client()
+            .post(format!("http://{addr}/dev/user"))
+            .header("Origin", "https://evil.example")
+            .form(&[("user", SAM), ("back", "/")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn with_no_users_is_unauthenticated() {
+        let store = docket::store::Store::open_in_memory(docket::fixtures::now()).unwrap();
+        let addr = spawn_dev(store).await;
+        let res = client()
+            .get(format!("http://{addr}/"))
+            .header("Remote-User", SAM)
+            .header("X-User-Slug", "Sam")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 #[tokio::test]

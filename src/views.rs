@@ -30,8 +30,6 @@ pub struct Page<'a> {
     pub flash: Option<Flash>,
     /// This page's URL, for forms to return to.
     pub here: &'a str,
-    /// Lets the viewer switch users without Tailscale, for fixtures.
-    pub dev: bool,
 }
 
 pub struct ThreadView {
@@ -174,7 +172,7 @@ fn whoami(p: &Page<'_>) -> Markup {
         span.type-label.who-login { (p.me.login) }
     };
     html! {
-        @if p.dev {
+        @if cfg!(feature = "dev") {
             div.who.ctrl x-data="{ open: false }" "@click.outside"="open = false" "@keydown.escape"="open = false" {
                 button.who-btn type="button" "@click"="open = !open" { (who) }
                 form.menu.up method="post" action="/dev/user" x-show="open" x-cloak {

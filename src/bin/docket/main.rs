@@ -21,11 +21,15 @@ async fn main() -> miette::Result<()> {
     // The fixtures' clock keeps their ages stable until JMAP sync brings
     // real mail.
     let store = docket::store::Store::open(&config.database, docket::fixtures::now())?;
-    if config.dev && store.is_empty()? {
+    #[cfg(feature = "dev")]
+    if store.is_empty()? {
         docket::fixtures::seed(&store)?;
         tracing::info!(database = %config.database, "seeded fixtures");
     }
-    let state = docket::routes::AppState::new(store, config.dev);
+    let state = docket::routes::AppState::new(store);
+    #[cfg(feature = "dev")]
+    let app = docket::dev::router(state);
+    #[cfg(not(feature = "dev"))]
     let app = docket::routes::router(state);
 
     let listener = TcpListener::bind(config.bind).await.into_diagnostic()?;

@@ -74,16 +74,10 @@ pub struct User {
 }
 
 impl User {
-    /// The slug the proxy sent, or the part of the login before the `@`.
-    pub fn new(login: &str, slug: Option<&str>) -> Self {
-        let fallback = login.split_once('@').map_or(login, |(name, _)| name);
-        let slug = slug
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(fallback);
+    pub fn new(login: &str, slug: &str) -> Self {
         Self {
             login: login.to_owned(),
-            slug: slug.to_owned(),
+            slug: slug.trim().to_owned(),
         }
     }
 }
@@ -171,13 +165,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slugs_fall_back_to_the_login() {
-        let named = User::new("alex@example.com", Some(" Al "));
+    fn slugs_are_trimmed() {
+        let named = User::new("alex@example.com", " Al ");
         assert_eq!(named.login, "alex@example.com");
         assert_eq!(named.slug, "Al");
-        assert_eq!(User::new("alex@example.com", None).slug, "alex");
-        assert_eq!(User::new("alex@example.com", Some("  ")).slug, "alex");
-        assert_eq!(User::new("tagged-device", None).slug, "tagged-device");
     }
 
     #[test]
