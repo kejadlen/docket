@@ -31,7 +31,7 @@ Backed by Fastmail. Credentials and accounts are separate:
 - A **credential** is a Fastmail API token (JMAP type) for one Fastmail login. It opens a JMAP session.
 - An **account** is a JMAP `accountId` from that session.
 
-Chosen setup: **one credential per login, no JMAP sharing.** The household login gets a token with mail + submission scopes; our son's login gets its own token with a read-only mail scope. (Alternative considered: sharing his account into the household login so Docket never holds a credential for his login. Rejected for now in favor of simplicity and no dependency on how Fastmail exposes shares. To be recorded in an ADR — see below.)
+Chosen setup: **one credential per login, no JMAP sharing.** The household login gets a token with mail + submission scopes; our son's login gets its own token with a read-only mail scope. Sharing his account into the household login was considered and rejected for now; see [ADR 1](adr/0001-per-login-jmap-sessions.md).
 
 **Policy is derived from what the server permits, not config.** The app reads token capabilities, `isReadOnly` on the session account, and `myRights` on each mailbox and only offers actions that are allowed.
 
@@ -154,7 +154,3 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 - Whether Fastmail web URLs are stable enough to deep-link to a thread.
 - Mail.app behavior test (throwaway message): label it `Docket/Do`, then file, archive, and delete it from Mail.app, checking `mailboxIds` via JMAP after each step. Confirms that moves keep other mailbox memberships and shows what Trash/Archive do to the `Docket/` label.
 - Confirm Fastmail offers a read-only mail scope for API tokens, and how it shows up in the session.
-
-## When development starts
-
-- Write an ADR recording the choice of separate per-login sessions over JMAP sharing for our son's account, including the trade-offs: simplicity and no sharing unknowns vs. Docket holding a credential for his login.
