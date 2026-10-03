@@ -19,8 +19,9 @@ A small self-hosted webapp for two people to jointly manage household email acco
 ## Users and access
 
 - Two app users.
-- Access is via Tailscale. The app binds to localhost behind `tailscale serve` and identifies users from the `Tailscale-User-Login` header. Requests without a user identity are rejected.
-- Each user has a display name and a short slug.
+- Access is via Tailscale, which is the whole of authentication: anyone the tailnet lets reach Docket is a user, added on their first request. Docket keeps no list of people.
+- The app binds to localhost behind Caddy with [caddy-tailscale](https://github.com/tailscale/caddy-tailscale), which sets two headers from the tailnet identity: `Tailscale-User-Login` (the full login, `{http.auth.user.id}`) identifies the user, and `X-User-Slug` carries a short name the Caddyfile maps from the login. Requests without a login are rejected.
+- A user's slug is what Docket shows for them. It follows the latest `X-User-Slug`, falls back to the part of the login before the `@`, and need not be unique.
 
 ## Credentials and accounts
 

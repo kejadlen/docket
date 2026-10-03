@@ -2,8 +2,8 @@
 // /etc/docket.kdl (fly.toml points DOCKET_CONFIG at it). Binds wide
 // because Fly's edge routes to the machine, not to localhost. `dev` is
 // the whole of what makes them demos: fixture data instead of JMAP, and
-// a stand-in identity in place of the Tailscale-User-Login header that
-// tailscale serve supplies in front of the real deployment. The database
+// a stand-in identity in place of the identity headers that Caddy
+// (caddy-tailscale) supplies in front of the real deployment. The database
 // sits on the machine's own disk, which a deploy replaces, so each deploy
 // starts from the fixtures again.
 bind "0.0.0.0:3000"

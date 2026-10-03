@@ -66,12 +66,35 @@ async fn health_returns_ok() {
 }
 
 #[tokio::test]
-async fn requires_a_known_identity() {
+async fn requires_an_identity() {
     let addr = spawn().await;
     let res = reqwest::get(format!("http://{addr}/")).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-    let (status, _) = get(addr, "eve@example.com", "/").await;
+    let (status, _) = get(addr, "", "/").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn anyone_tailscale_lets_in_is_a_user() {
+    let addr = spawn().await;
+    let (status, body) = get(addr, "eve@example.com", "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"<span class="who-name">eve</span>"#));
+
+    // The proxy names them with X-User-Slug, and the name follows it.
+    let body = client()
+        .get(format!("http://{addr}/?m=4"))
+        .header("Tailscale-User-Login", "eve@example.com")
+        .header("X-User-Slug", "Evie")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains(r#"<span class="who-name">Evie</span>"#));
+    // Once in, they can be assigned like anyone else.
+    assert!(body.contains(r#"value="eve@example.com"><span>Evie</span>"#));
 }
 
 #[tokio::test]
@@ -95,7 +118,7 @@ async fn lanes_and_search() {
         ("/do", "Exemption renewal"),
         ("/wait", "Claim 4471"),
         ("/watch", "Shipped: furnace filters"),
-        ("/search?q=downspout", "Sam → Northwind Roofing"),
+        ("/search?q=downspout", "sam → Northwind Roofing"),
     ] {
         let (status, body) = get(addr, SAM, path).await;
         assert_eq!(status, StatusCode::OK, "{path}");
@@ -232,7 +255,7 @@ async fn editing_values_with_undo() {
         addr,
         SAM,
         "/messages/4/assignees",
-        &[("user", "alex"), ("back", "/")],
+        &[("user", ALEX), ("back", "/")],
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
@@ -299,7 +322,7 @@ async fn cross_site_posts_are_refused() {
             .post(format!("http://{addr}{path}"))
             .header("Tailscale-User-Login", SAM)
             .header("Origin", origin)
-            .form(&[("state", "do"), ("user", "alex"), ("back", "/")])
+            .form(&[("state", "do"), ("user", ALEX), ("back", "/")])
             .send()
     };
     let res = send("https://evil.example", "/messages/4/state")
@@ -332,18 +355,18 @@ async fn dev_mode_picks_a_user_from_a_cookie() {
 
     let res = anon
         .post(format!("http://{addr}/dev/user"))
-        .form(&[("user", "sam"), ("back", "/do")])
+        .form(&[("user", SAM), ("back", "/do")])
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     assert_eq!(location(&res), "/do");
     let cookie = res.headers()["set-cookie"].to_str().unwrap();
-    assert!(cookie.starts_with("docket_dev_user=sam;"));
+    assert!(cookie.starts_with("docket_dev_user=sam@example.com;"));
 
     let body = anon
         .get(format!("http://{addr}/"))
-        .header("Cookie", "theme=dark; docket_dev_user=sam")
+        .header("Cookie", "theme=dark; docket_dev_user=sam@example.com")
         .send()
         .await
         .unwrap()
@@ -362,7 +385,7 @@ async fn dev_mode_picks_a_user_from_a_cookie() {
 
     // Outside dev mode, the switch doesn't exist.
     let prod = spawn().await;
-    let res = post(prod, SAM, "/dev/user", &[("user", "alex"), ("back", "/")]).await;
+    let res = post(prod, SAM, "/dev/user", &[("user", ALEX), ("back", "/")]).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 

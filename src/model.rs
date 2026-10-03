@@ -63,12 +63,29 @@ impl fmt::Display for State {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Someone Tailscale let in. Tailscale is the whole of authentication, so
+/// anyone who reaches Docket is a user.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
-    pub slug: String,
-    pub name: String,
     /// The `Tailscale-User-Login` value that identifies this user.
     pub login: String,
+    /// The short name shown for them. Not unique: two logins can share one.
+    pub slug: String,
+}
+
+impl User {
+    /// The slug the proxy sent, or the part of the login before the `@`.
+    pub fn new(login: &str, slug: Option<&str>) -> Self {
+        let fallback = login.split_once('@').map_or(login, |(name, _)| name);
+        let slug = slug
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback);
+        Self {
+            login: login.to_owned(),
+            slug: slug.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +108,7 @@ pub struct Thread {
 pub struct Values {
     pub state: State,
     pub folder: Option<String>,
-    /// User slugs.
+    /// User logins.
     pub assignees: BTreeSet<String>,
 }
 
@@ -102,7 +119,7 @@ pub enum Kind {
         addr: String,
         values: Values,
     },
-    /// Sent by one of us. Sent messages carry no values.
+    /// Sent by one of us (`by` is a login). Sent messages carry no values.
     Sent { by: String, to: Vec<String> },
 }
 
@@ -133,6 +150,7 @@ impl Message {
 pub struct Comment {
     pub id: CommentId,
     pub thread: ThreadId,
+    /// A login.
     pub author: String,
     pub at: DateTime,
     pub text: String,
@@ -142,6 +160,7 @@ pub struct Comment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub message: MessageId,
+    /// A login.
     pub user: String,
     pub at: DateTime,
     pub text: String,
@@ -150,6 +169,16 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slugs_fall_back_to_the_login() {
+        let named = User::new("alex@example.com", Some(" Al "));
+        assert_eq!(named.login, "alex@example.com");
+        assert_eq!(named.slug, "Al");
+        assert_eq!(User::new("alex@example.com", None).slug, "alex");
+        assert_eq!(User::new("alex@example.com", Some("  ")).slug, "alex");
+        assert_eq!(User::new("tagged-device", None).slug, "tagged-device");
+    }
 
     #[test]
     fn state_slugs_round_trip() {

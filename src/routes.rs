@@ -17,7 +17,10 @@ use crate::model::{MessageId, State, ThreadId, User};
 use crate::store::{Change, Store};
 use crate::views::{self, Page, ThreadView};
 
+// caddy-tailscale sets both from the tailnet identity, overwriting whatever
+// the client sent.
 const IDENTITY_HEADER: &str = "Tailscale-User-Login";
+const SLUG_HEADER: &str = "X-User-Slug";
 const DEV_COOKIE: &str = "docket_dev_user";
 
 #[derive(Clone)]
@@ -60,7 +63,8 @@ async fn health() -> &'static str {
     "ok"
 }
 
-/// The requesting user, from Tailscale's identity header.
+/// The requesting user, from the identity headers caddy-tailscale adds. Anyone
+/// Tailscale lets through is a user; the first request adds them.
 struct Me(User);
 
 impl FromRequestParts<AppState> for Me {
@@ -73,17 +77,15 @@ impl FromRequestParts<AppState> for Me {
             return Err(Error::Forbidden("cross-site request"));
         }
         let store = &state.store;
-        if let Some(login) = header(&parts.headers, IDENTITY_HEADER) {
-            return store
-                .user_by_login(login)?
-                .map(Me)
-                .ok_or(Error::Unauthenticated);
+        if let Some(login) = header(&parts.headers, IDENTITY_HEADER).filter(|l| !l.is_empty()) {
+            let slug = header(&parts.headers, SLUG_HEADER);
+            return Ok(Me(store.sign_in(login, slug)?));
         }
         if !state.dev {
             return Err(Error::Unauthenticated);
         }
         let chosen = match cookie(&parts.headers, DEV_COOKIE) {
-            Some(slug) => store.user(slug)?,
+            Some(login) => store.user(login)?,
             None => None,
         };
         let user = match chosen {
@@ -173,10 +175,10 @@ fn render(
         folders: store.folders()?,
         nav,
         sections: lists::sections(store, me, view)?,
-        unread: store.unread(&me.slug)?,
+        unread: store.unread(&me.login)?,
         selected,
         thread,
-        flash: store.take_flash(&me.slug),
+        flash: store.take_flash(&me.login),
         here,
         dev: state.dev,
     }))
@@ -190,8 +192,8 @@ fn open_thread(store: &Store, me: &User, id: MessageId) -> Result<ThreadView, Er
         .thread_messages(msg.thread)?
         .last()
         .map_or(id, |m| m.id);
-    store.mark_read(&me.slug, id)?;
-    store.mark_read(&me.slug, latest)?;
+    store.mark_read(&me.login, id)?;
+    store.mark_read(&me.login, latest)?;
     Ok(ThreadView {
         thread: store.thread(msg.thread)?.ok_or(Error::NotFound("thread"))?,
         read_only: store
@@ -272,7 +274,7 @@ async fn edit(
     change: Change,
     back: &str,
 ) -> Result<Redirect, Error> {
-    state.store.edit(&me.slug, id, change)?;
+    state.store.edit(&me.login, id, change)?;
     Ok(Redirect::to(safe_back(back)))
 }
 
@@ -288,7 +290,7 @@ async fn add_comment(
     Path(thread): Path<ThreadId>,
     Form(form): Form<CommentForm>,
 ) -> Result<Redirect, Error> {
-    state.store.add_comment(&me.slug, thread, &form.text)?;
+    state.store.add_comment(&me.login, thread, &form.text)?;
     Ok(Redirect::to(safe_back(&form.back)))
 }
 
@@ -302,7 +304,7 @@ async fn undo(
     Me(me): Me,
     Form(form): Form<BackForm>,
 ) -> Result<Redirect, Error> {
-    state.store.undo(&me.slug)?;
+    state.store.undo(&me.login)?;
     Ok(Redirect::to(safe_back(&form.back)))
 }
 

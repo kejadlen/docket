@@ -2,11 +2,12 @@
 -- stays the source of truth for messages and folders; JMAP import fills
 -- these tables and fixtures seed them in dev.
 
+-- Everyone Tailscale lets in, added on their first request.
 CREATE TABLE users (
-    slug TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
     -- The Tailscale-User-Login value that identifies this user.
-    login TEXT NOT NULL UNIQUE
+    login TEXT PRIMARY KEY,
+    -- The short name shown for them, from X-User-Slug; not unique.
+    slug TEXT NOT NULL
 ) STRICT;
 
 CREATE TABLE accounts (
@@ -49,7 +50,7 @@ CREATE TABLE messages (
     from_addr TEXT,
     state TEXT CHECK (state IN ('inbox', 'do', 'wait', 'watch', 'done')),
     folder TEXT REFERENCES folders (name),
-    sent_by TEXT REFERENCES users (slug),
+    sent_by TEXT REFERENCES users (login),
     sent_to TEXT,
     UNIQUE (account, message_id),
     CHECK (
@@ -67,13 +68,13 @@ CREATE INDEX messages_state ON messages (state);
 
 CREATE TABLE assignees (
     message INTEGER NOT NULL REFERENCES messages (id),
-    user TEXT NOT NULL REFERENCES users (slug),
+    user TEXT NOT NULL REFERENCES users (login),
     PRIMARY KEY (message, user)
 ) STRICT;
 
 -- Per-person read tracking; $seen is shared and can't say who read what.
 CREATE TABLE reads (
-    user TEXT NOT NULL REFERENCES users (slug),
+    user TEXT NOT NULL REFERENCES users (login),
     message INTEGER NOT NULL REFERENCES messages (id),
     PRIMARY KEY (user, message)
 ) STRICT;
@@ -81,7 +82,7 @@ CREATE TABLE reads (
 CREATE TABLE comments (
     id INTEGER PRIMARY KEY,
     thread INTEGER NOT NULL REFERENCES threads (id),
-    author TEXT NOT NULL REFERENCES users (slug),
+    author TEXT NOT NULL REFERENCES users (login),
     at TEXT NOT NULL,
     text TEXT NOT NULL
 ) STRICT;
@@ -92,7 +93,7 @@ CREATE INDEX comments_thread ON comments (thread);
 CREATE TABLE history (
     id INTEGER PRIMARY KEY,
     message INTEGER NOT NULL REFERENCES messages (id),
-    user TEXT NOT NULL REFERENCES users (slug),
+    user TEXT NOT NULL REFERENCES users (login),
     at TEXT NOT NULL,
     event TEXT NOT NULL
 ) STRICT;

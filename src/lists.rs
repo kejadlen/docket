@@ -49,7 +49,7 @@ pub fn sections(store: &Store, me: &User, view: &View) -> Result<Vec<Section>, E
         View::ForMe => {
             for state in State::LANES {
                 let msgs = store.messages(Filter::ForMe {
-                    user: &me.slug,
+                    user: &me.login,
                     state,
                 })?;
                 let head = state.name().to_uppercase();
@@ -124,7 +124,7 @@ fn section(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures;
+    use crate::fixtures::{self, ALEX, SAM};
 
     fn summary(store: &Store, user: &str, view: &View) -> Vec<(String, Vec<Vec<u32>>)> {
         let me = store.user(user).unwrap().unwrap();
@@ -153,16 +153,16 @@ mod tests {
     #[test]
     fn for_me_groups_by_state_then_thread() {
         let store = fixtures::store().unwrap();
-        let sam = summary(&store, "sam", &View::ForMe);
-        assert_eq!(heads(&store, "sam", &View::ForMe), ["INBOX", "DO", "WATCH"]);
+        let sam = summary(&store, SAM, &View::ForMe);
+        assert_eq!(heads(&store, SAM, &View::ForMe), ["INBOX", "DO", "WATCH"]);
         let (_, groups) = &sam[0];
         // Newest thread first; the roofing thread shows only its two Inbox emails.
         assert_eq!(groups[0], vec![fixtures::WATER]);
         assert!(groups.contains(&vec![3, 4]));
 
         // Alex's own Inbox messages share the section with unassigned ones.
-        let alex = summary(&store, "alex", &View::ForMe);
-        assert_eq!(heads(&store, "alex", &View::ForMe), ["INBOX", "WAIT"]);
+        let alex = summary(&store, ALEX, &View::ForMe);
+        assert_eq!(heads(&store, ALEX, &View::ForMe), ["INBOX", "WAIT"]);
         assert_eq!(
             alex[0].1,
             [vec![7], vec![6], vec![10], vec![8], vec![9], vec![3, 4]]
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn sidebar_count() {
         let store = fixtures::store().unwrap();
-        let sam = store.user("sam").unwrap().unwrap();
+        let sam = store.user(SAM).unwrap().unwrap();
         assert_eq!(count(&store, &sam, &View::ForMe).unwrap(), 7);
     }
 
@@ -181,16 +181,16 @@ mod tests {
         let store = fixtures::store().unwrap();
         // Every assignee shares one unheaded section: Inbox newest first, Do
         // oldest first.
-        let inbox = summary(&store, "sam", &View::Lane(State::Inbox));
-        assert_eq!(heads(&store, "sam", &View::Lane(State::Inbox)), [""]);
+        let inbox = summary(&store, SAM, &View::Lane(State::Inbox));
+        assert_eq!(heads(&store, SAM, &View::Lane(State::Inbox)), [""]);
         assert_eq!(inbox[0].1[0], vec![fixtures::WATER]);
-        let todo = summary(&store, "alex", &View::Lane(State::Do));
-        assert_eq!(heads(&store, "alex", &View::Lane(State::Do)), [""]);
+        let todo = summary(&store, ALEX, &View::Lane(State::Do));
+        assert_eq!(heads(&store, ALEX, &View::Lane(State::Do)), [""]);
         assert_eq!(todo[0].1, [vec![13], vec![5]]);
-        let wait = summary(&store, "sam", &View::Lane(State::Wait));
+        let wait = summary(&store, SAM, &View::Lane(State::Wait));
         assert_eq!(wait[0].1, vec![vec![11]]);
 
-        let me = store.user("sam").unwrap().unwrap();
+        let me = store.user(SAM).unwrap().unwrap();
         let watch = sections(&store, &me, &View::Lane(State::Watch)).unwrap();
         assert!(watch[0].compact);
         assert_eq!(watch[0].groups[0].rows[0].id, 14);
@@ -205,14 +205,14 @@ mod tests {
     #[test]
     fn search_covers_every_message() {
         let store = fixtures::store().unwrap();
-        let hits = summary(&store, "sam", &View::Search("downspout".into()));
+        let hits = summary(&store, SAM, &View::Search("downspout".into()));
         assert_eq!(hits[0].1, vec![vec![2, 4]]);
-        let by_sender = summary(&store, "sam", &View::Search("ALEX".into()));
+        let by_sender = summary(&store, SAM, &View::Search("ALEX".into()));
         assert_eq!(by_sender[0].1, vec![vec![12]]);
-        let by_subject = summary(&store, "sam", &View::Search("checkup".into()));
+        let by_subject = summary(&store, SAM, &View::Search("checkup".into()));
         assert_eq!(by_subject[0].1, vec![vec![15]]);
-        assert!(summary(&store, "sam", &View::Search("  ".into())).is_empty());
-        assert!(summary(&store, "sam", &View::Search("zzz".into())).is_empty());
+        assert!(summary(&store, SAM, &View::Search("  ".into())).is_empty());
+        assert!(summary(&store, SAM, &View::Search("zzz".into())).is_empty());
     }
 
     #[test]

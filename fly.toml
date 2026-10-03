@@ -3,8 +3,8 @@
 # review-app action in .github/workflows/preview.yml, which overrides
 # the app name with the PR's). Both read the config baked into the image
 # from fly.kdl: fixture data instead of JMAP, and a stand-in identity in
-# place of the Tailscale-User-Login header that tailscale serve supplies
-# in front of the real deployment. No volume, so every deploy starts
+# place of the identity headers that Caddy (caddy-tailscale) supplies in
+# front of the real deployment. No volume, so every deploy starts
 # from the fixtures again.
 #
 # The app name is Fly's, not GitHub's, so it has to be unique across all

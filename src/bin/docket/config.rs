@@ -18,8 +18,8 @@ const DEFAULT_DATABASE: &str = "docket.db";
 
 #[derive(Debug)]
 pub struct Config {
-    /// Address to listen on. Keep it on localhost; `tailscale serve`
-    /// fronts it and supplies the user identity header.
+    /// Address to listen on. Keep it on localhost; Caddy (caddy-tailscale)
+    /// fronts it and supplies the user identity headers.
     pub bind: SocketAddr,
 
     /// Serve without Tailscale: requests with no identity header act as a

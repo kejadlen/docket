@@ -13,6 +13,9 @@ use crate::store::Store;
 pub const WATER: MessageId = 7;
 pub const ELI_PRACTICE: MessageId = 20;
 
+pub const ALEX: &str = "alex@example.com";
+pub const SAM: &str = "sam@example.com";
+
 /// Thursday, 1 October 2026, at noon.
 pub fn now() -> DateTime {
     at(10, 1, 12, 0)
@@ -127,18 +130,7 @@ pub fn store() -> Result<Store, Error> {
 
 /// Writes the fixtures into an empty database.
 pub fn seed(store: &Store) -> Result<(), Error> {
-    let users = [
-        User {
-            slug: "alex".into(),
-            name: "Alex".into(),
-            login: "alex@example.com".into(),
-        },
-        User {
-            slug: "sam".into(),
-            name: "Sam".into(),
-            login: "sam@example.com".into(),
-        },
-    ];
+    let users = [User::new(ALEX, Some("Alex")), User::new(SAM, Some("Sam"))];
     let accounts = [
         Account {
             slug: "household".into(),
@@ -172,7 +164,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
     );
     b.comment(
         1,
-        "alex",
+        ALEX,
         at(9, 20, 19, 30),
         "The Hendersons paid about $1,600 for theirs.",
     );
@@ -180,7 +172,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         2,
         1,
         at(9, 21, 8, 40),
-        ("sam", &["Northwind Roofing"]),
+        (SAM, &["Northwind Roofing"]),
         "Does this include the downspout on the north side?",
         (&["Alex"], &["Pat Lee"]),
     );
@@ -210,7 +202,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         at(9, 30, 15, 30),
         school,
         "Please return the signed permission form by Friday.",
-        (Do, Some("School"), &["sam"]),
+        (Do, Some("School"), &[SAM]),
         &[],
     );
     b.recv(
@@ -219,10 +211,10 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         at(10, 1, 9, 12),
         school,
         "A schedule update for the museum trip: buses now return at 4:15, so pickup moves to 4:30 PM at the front entrance.",
-        (Inbox, Some("School"), &["alex"]),
+        (Inbox, Some("School"), &[ALEX]),
         &[],
     );
-    b.comment(2, "sam", at(10, 1, 9, 20), "You have pickup that day.");
+    b.comment(2, SAM, at(10, 1, 9, 20), "You have pickup that day.");
 
     b.thread(3, "household", "Service interruption Oct 4");
     b.recv(
@@ -264,10 +256,10 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         at(10, 1, 8, 15),
         ("Dr. Patel’s Office", "frontdesk@patelpeds.com"),
         "This confirms Eli’s appointment on Thursday, October 8 at 3:00 PM. Please arrive ten minutes early.",
-        (Inbox, Some("Medical"), &["alex"]),
+        (Inbox, Some("Medical"), &[ALEX]),
         &[],
     );
-    b.comment(6, "sam", at(10, 1, 9, 41), "Thursday at 3, I’ll take him.");
+    b.comment(6, SAM, at(10, 1, 9, 41), "Thursday at 3, I’ll take him.");
 
     b.thread(7, "household", "Claim 4471: adjuster visit");
     b.recv(
@@ -276,14 +268,14 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         at(9, 23, 13, 0),
         ("State Farm", "claims@statefarm.com"),
         "Claim 4471 is open. An adjuster will contact you within five business days to schedule a visit.",
-        (Wait, Some("House"), &["alex"]),
+        (Wait, Some("House"), &[ALEX]),
         &[],
     );
     b.sent(
         12,
         7,
         at(9, 24, 9, 30),
-        ("alex", &["State Farm"]),
+        (ALEX, &["State Farm"]),
         "Thanks. Mornings work best for us, any day next week.",
         (&[], &[]),
     );
@@ -328,7 +320,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         at(9, 29, 17, 0),
         ("Coach Rivera", "rivera@lincolnhigh.org"),
         "Practice moves to Thursday this week, 4 to 6 PM. Bring water.",
-        (Watch, None, &["sam"]),
+        (Watch, None, &[SAM]),
         &[],
     );
 
@@ -338,9 +330,9 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         .messages
         .iter()
         .filter(|m| m.at < cutoff)
-        .flat_map(|m| [("alex", m.id), ("sam", m.id)])
+        .flat_map(|m| [(ALEX, m.id), (SAM, m.id)])
         .collect();
-    reads.push(("sam", 5));
+    reads.push((SAM, 5));
 
     store.import(|tx| {
         for user in &users {

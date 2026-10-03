@@ -92,12 +92,12 @@ fn badge(state: State) -> Markup {
     html! { span.badge.(tone(state)) { span.mark {} (state.name()) } }
 }
 
-/// The user's display name, or the slug when nobody has it.
-fn user_name<'a>(users: &'a [User], slug: &'a str) -> &'a str {
+/// The short name shown for a login, or the login when nobody has it.
+fn user_name<'a>(users: &'a [User], login: &'a str) -> &'a str {
     users
         .iter()
-        .find(|u| u.slug == slug)
-        .map_or(slug, |u| u.name.as_str())
+        .find(|u| u.login == login)
+        .map_or(login, |u| u.slug.as_str())
 }
 
 fn assignee_label(users: &[User], values: &Values) -> Option<String> {
@@ -170,7 +170,7 @@ fn sidebar(p: &Page<'_>) -> Markup {
 
 fn whoami(p: &Page<'_>) -> Markup {
     let who = html! {
-        span.who-name { (p.me.name) }
+        span.who-name { (p.me.slug) }
         span.type-label.who-login { (p.me.login) }
     };
     html! {
@@ -180,9 +180,9 @@ fn whoami(p: &Page<'_>) -> Markup {
                 form.menu.up method="post" action="/dev/user" x-show="open" x-cloak {
                     (back(p.here))
                     @for user in &p.users {
-                        @let on = user.slug == p.me.slug;
-                        button.opt.cur[on] type="submit" name="user" value=(user.slug) {
-                            span { (user.name) }
+                        @let on = user.login == p.me.login;
+                        button.opt.cur[on] type="submit" name="user" value=(user.login) {
+                            span { (user.slug) }
                             span.check { @if on { "✓" } }
                         }
                     }
@@ -427,9 +427,9 @@ fn values_controls(p: &Page<'_>, id: u32, values: &Values, read_only: bool) -> M
     let assigned = assignee_label(&p.users, values);
     let people = html! {
         @for user in &p.users {
-            @let on = values.assignees.contains(&user.slug);
-            button.opt.cur[on] type="submit" name="user" value=(user.slug) {
-                span { (user.name) } (check(on))
+            @let on = values.assignees.contains(&user.login);
+            button.opt.cur[on] type="submit" name="user" value=(user.login) {
+                span { (user.slug) } (check(on))
             }
         }
     };

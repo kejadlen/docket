@@ -122,27 +122,26 @@ impl Store {
         let inner = self.lock();
         let mut stmt = inner
             .conn
-            .prepare_cached("SELECT slug, name, login FROM users ORDER BY rowid")?;
+            .prepare_cached("SELECT login, slug FROM users ORDER BY rowid")?;
         let users = stmt
             .query_map([], user_from_row)?
             .collect::<Result<_, _>>()?;
         Ok(users)
     }
 
-    pub fn user(&self, slug: &str) -> Result<Option<User>, Error> {
-        load_user(&self.lock().conn, slug)
+    pub fn user(&self, login: &str) -> Result<Option<User>, Error> {
+        load_user(&self.lock().conn, login)
     }
 
-    pub fn user_by_login(&self, login: &str) -> Result<Option<User>, Error> {
-        let user = self
-            .lock()
-            .conn
-            .query_row(
-                "SELECT slug, name, login FROM users WHERE login = ?1",
-                [login],
-                user_from_row,
-            )
-            .optional()?;
+    /// The user behind a request Tailscale identified, added on their first
+    /// request. Their slug follows whatever the proxy sends.
+    pub fn sign_in(&self, login: &str, slug: Option<&str>) -> Result<User, Error> {
+        let user = User::new(login, slug);
+        self.lock().conn.execute(
+            "INSERT INTO users (login, slug) VALUES (?1, ?2)
+             ON CONFLICT (login) DO UPDATE SET slug = excluded.slug WHERE slug != excluded.slug",
+            params![user.login, user.slug],
+        )?;
         Ok(user)
     }
 
@@ -210,7 +209,7 @@ impl Store {
                 load_messages(
                     conn,
                     r"t.subject LIKE ?1 ESCAPE '\' OR m.from_name LIKE ?1 ESCAPE '\'
-                        OR u.name LIKE ?1 ESCAPE '\' OR m.body LIKE ?1 ESCAPE '\'",
+                        OR u.slug LIKE ?1 ESCAPE '\' OR m.body LIKE ?1 ESCAPE '\'",
                     [pattern],
                 )
             }
@@ -319,12 +318,12 @@ impl Store {
                     }
                 }
             }
-            Change::ToggleAssignee(slug) => {
-                let name = load_user(&tx, &slug)?.ok_or(Error::NotFound("user"))?.name;
-                if next.assignees.remove(&slug) {
+            Change::ToggleAssignee(login) => {
+                let name = load_user(&tx, &login)?.ok_or(Error::NotFound("user"))?.slug;
+                if next.assignees.remove(&login) {
                     format!("Unassigned {name}")
                 } else {
-                    next.assignees.insert(slug);
+                    next.assignees.insert(login);
                     format!("Assigned {name}")
                 }
             }
@@ -403,8 +402,8 @@ pub struct Import<'a> {
 impl Import<'_> {
     pub fn user(&self, user: &User) -> Result<(), Error> {
         self.tx.execute(
-            "INSERT INTO users (slug, name, login) VALUES (?1, ?2, ?3)",
-            params![user.slug, user.name, user.login],
+            "INSERT INTO users (login, slug) VALUES (?1, ?2)",
+            params![user.login, user.slug],
         )?;
         Ok(())
     }
@@ -519,17 +518,16 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
 
 fn user_from_row(r: &Row<'_>) -> rusqlite::Result<User> {
     Ok(User {
-        slug: r.get(0)?,
-        name: r.get(1)?,
-        login: r.get(2)?,
+        login: r.get(0)?,
+        slug: r.get(1)?,
     })
 }
 
-fn load_user(conn: &Connection, slug: &str) -> Result<Option<User>, Error> {
+fn load_user(conn: &Connection, login: &str) -> Result<Option<User>, Error> {
     let user = conn
         .query_row(
-            "SELECT slug, name, login FROM users WHERE slug = ?1",
-            [slug],
+            "SELECT login, slug FROM users WHERE login = ?1",
+            [login],
             user_from_row,
         )
         .optional()?;
@@ -582,7 +580,7 @@ fn load_messages(
                 FROM (SELECT user FROM assignees WHERE message = m.id ORDER BY user))
          FROM messages m
          JOIN threads t ON t.id = m.thread
-         LEFT JOIN users u ON u.slug = m.sent_by
+         LEFT JOIN users u ON u.login = m.sent_by
          WHERE {filter}
          ORDER BY m.at, m.id"
     );
@@ -701,7 +699,7 @@ fn escape_like(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures;
+    use crate::fixtures::{self, ALEX, SAM};
 
     fn values(store: &Store, id: MessageId) -> Values {
         store
@@ -716,21 +714,21 @@ mod tests {
     #[test]
     fn edits_record_undo_flash_and_history() {
         let store = fixtures::store().unwrap();
-        store.edit("sam", 4, Change::State(State::Do)).unwrap();
+        store.edit(SAM, 4, Change::State(State::Do)).unwrap();
         assert_eq!(values(&store, 4).state, State::Do);
         assert_eq!(
-            store.take_flash("sam"),
+            store.take_flash(SAM),
             Some(Flash {
                 text: "Moved to Do".into(),
                 undoable: true
             })
         );
-        assert_eq!(store.take_flash("sam"), None);
+        assert_eq!(store.take_flash(SAM), None);
 
-        store.undo("sam").unwrap();
+        store.undo(SAM).unwrap();
         assert_eq!(values(&store, 4).state, State::Inbox);
-        assert_eq!(store.take_flash("sam").unwrap().text, "Undone");
-        assert!(matches!(store.undo("sam"), Err(Error::BadRequest(_))));
+        assert_eq!(store.take_flash(SAM).unwrap().text, "Undone");
+        assert!(matches!(store.undo(SAM), Err(Error::BadRequest(_))));
 
         let history: Vec<_> = store
             .history(4)
@@ -741,8 +739,8 @@ mod tests {
         assert_eq!(
             history,
             [
-                ("sam".into(), store.now, "Moved to Do".into()),
-                ("sam".into(), store.now, "Undone".into()),
+                (SAM.into(), store.now, "Moved to Do".into()),
+                (SAM.into(), store.now, "Undone".into()),
             ]
         );
     }
@@ -751,14 +749,14 @@ mod tests {
     fn folders() {
         let store = fixtures::store().unwrap();
         store
-            .edit("sam", 4, Change::Folder(Some("Finance".into())))
+            .edit(SAM, 4, Change::Folder(Some("Finance".into())))
             .unwrap();
         assert_eq!(values(&store, 4).folder.as_deref(), Some("Finance"));
-        store.edit("sam", 4, Change::Folder(None)).unwrap();
+        store.edit(SAM, 4, Change::Folder(None)).unwrap();
         assert_eq!(values(&store, 4).folder, None);
-        assert_eq!(store.take_flash("sam").unwrap().text, "Removed from folder");
+        assert_eq!(store.take_flash(SAM).unwrap().text, "Removed from folder");
         assert!(matches!(
-            store.edit("sam", 4, Change::Folder(Some("Nope".into()))),
+            store.edit(SAM, 4, Change::Folder(Some("Nope".into()))),
             Err(Error::NotFound("folder"))
         ));
         assert_eq!(
@@ -772,27 +770,27 @@ mod tests {
         let store = fixtures::store().unwrap();
         let eli = fixtures::ELI_PRACTICE;
         assert!(matches!(
-            store.edit("sam", eli, Change::Folder(None)),
+            store.edit(SAM, eli, Change::Folder(None)),
             Err(Error::Forbidden(_))
         ));
-        store.edit("sam", eli, Change::State(State::Done)).unwrap();
+        store.edit(SAM, eli, Change::State(State::Done)).unwrap();
     }
 
     #[test]
     fn assignees_toggle() {
         let store = fixtures::store().unwrap();
         store
-            .edit("alex", 4, Change::ToggleAssignee("alex".into()))
+            .edit(ALEX, 4, Change::ToggleAssignee(ALEX.into()))
             .unwrap();
-        assert!(values(&store, 4).assignees.contains("alex"));
-        assert_eq!(store.take_flash("alex").unwrap().text, "Assigned Alex");
+        assert!(values(&store, 4).assignees.contains(ALEX));
+        assert_eq!(store.take_flash(ALEX).unwrap().text, "Assigned Alex");
         store
-            .edit("alex", 4, Change::ToggleAssignee("alex".into()))
+            .edit(ALEX, 4, Change::ToggleAssignee(ALEX.into()))
             .unwrap();
         assert!(values(&store, 4).assignees.is_empty());
-        assert_eq!(store.take_flash("alex").unwrap().text, "Unassigned Alex");
+        assert_eq!(store.take_flash(ALEX).unwrap().text, "Unassigned Alex");
         assert!(matches!(
-            store.edit("alex", 4, Change::ToggleAssignee("eli".into())),
+            store.edit(ALEX, 4, Change::ToggleAssignee("eli".into())),
             Err(Error::NotFound("user"))
         ));
     }
@@ -801,11 +799,11 @@ mod tests {
     fn bad_edits() {
         let store = fixtures::store().unwrap();
         assert!(matches!(
-            store.edit("sam", 999, Change::State(State::Do)),
+            store.edit(SAM, 999, Change::State(State::Do)),
             Err(Error::NotFound("message"))
         ));
         assert!(matches!(
-            store.edit("sam", 2, Change::State(State::Do)),
+            store.edit(SAM, 2, Change::State(State::Do)),
             Err(Error::BadRequest(_))
         ));
     }
@@ -814,16 +812,16 @@ mod tests {
     fn comments() {
         let store = fixtures::store().unwrap();
         let before = store.timeline(1).unwrap().len();
-        store.add_comment("sam", 1, "  Called them.  ").unwrap();
+        store.add_comment(SAM, 1, "  Called them.  ").unwrap();
         let timeline = store.timeline(1).unwrap();
         assert_eq!(timeline.len(), before + 1);
         assert!(matches!(timeline.last(), Some(Item::Comment(c)) if c.text == "Called them."));
         assert!(matches!(
-            store.add_comment("sam", 1, "   "),
+            store.add_comment(SAM, 1, "   "),
             Err(Error::BadRequest(_))
         ));
         assert!(matches!(
-            store.add_comment("sam", 999, "hi"),
+            store.add_comment(SAM, 999, "hi"),
             Err(Error::NotFound("thread"))
         ));
     }
@@ -846,13 +844,13 @@ mod tests {
     #[test]
     fn read_tracking() {
         let store = fixtures::store().unwrap();
-        assert!(store.unread("alex").unwrap().contains(&fixtures::WATER));
-        store.mark_read("alex", fixtures::WATER).unwrap();
-        store.mark_read("alex", fixtures::WATER).unwrap();
-        assert!(!store.unread("alex").unwrap().contains(&fixtures::WATER));
-        assert!(store.unread("sam").unwrap().contains(&fixtures::WATER));
+        assert!(store.unread(ALEX).unwrap().contains(&fixtures::WATER));
+        store.mark_read(ALEX, fixtures::WATER).unwrap();
+        store.mark_read(ALEX, fixtures::WATER).unwrap();
+        assert!(!store.unread(ALEX).unwrap().contains(&fixtures::WATER));
+        assert!(store.unread(SAM).unwrap().contains(&fixtures::WATER));
         // Sent messages are never unread.
-        assert!(!store.unread("sam").unwrap().contains(&2));
+        assert!(!store.unread(SAM).unwrap().contains(&2));
     }
 
     #[test]
@@ -863,7 +861,7 @@ mod tests {
         assert_eq!(sent.cc, ["Alex"]);
         assert_eq!(sent.bcc, ["Pat Lee"]);
         assert!(
-            matches!(&sent.kind, Kind::Sent { by, to } if by == "sam" && to == &["Northwind Roofing"])
+            matches!(&sent.kind, Kind::Sent { by, to } if by == SAM && to == &["Northwind Roofing"])
         );
         let got = store.message(5).unwrap().unwrap();
         assert_eq!(got.at, jiff::civil::date(2026, 9, 30).at(15, 30, 0, 0));
@@ -872,7 +870,7 @@ mod tests {
             Some(&Values {
                 state: State::Do,
                 folder: Some("School".into()),
-                assignees: BTreeSet::from(["sam".to_owned()]),
+                assignees: BTreeSet::from([SAM.to_owned()]),
             })
         );
         assert!(store.message(999).unwrap().is_none());
@@ -890,19 +888,15 @@ mod tests {
     #[test]
     fn lookups() {
         let store = fixtures::store().unwrap();
-        let slugs: Vec<_> = store.users().unwrap().into_iter().map(|u| u.slug).collect();
-        assert_eq!(slugs, ["alex", "sam"]);
-        assert_eq!(store.user("sam").unwrap().unwrap().name, "Sam");
-        assert!(store.user("pat").unwrap().is_none());
-        assert_eq!(
-            store
-                .user_by_login("alex@example.com")
-                .unwrap()
-                .unwrap()
-                .slug,
-            "alex"
-        );
-        assert!(store.user_by_login("nobody").unwrap().is_none());
+        let logins: Vec<_> = store
+            .users()
+            .unwrap()
+            .into_iter()
+            .map(|u| u.login)
+            .collect();
+        assert_eq!(logins, [ALEX, SAM]);
+        assert_eq!(store.user(SAM).unwrap().unwrap().slug, "Sam");
+        assert!(store.user("pat@example.com").unwrap().is_none());
         assert_eq!(
             store.thread(1).unwrap().unwrap().subject,
             "Gutter repair estimate"
@@ -910,6 +904,23 @@ mod tests {
         assert!(store.thread(999).unwrap().is_none());
         assert!(store.thread_account(11).unwrap().unwrap().read_only);
         assert!(store.thread_account(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn signing_in_adds_users_and_follows_their_slug() {
+        let store = Store::open_in_memory(fixtures::now()).unwrap();
+        assert!(store.is_empty().unwrap());
+        let pat = store.sign_in("pat@example.com", None).unwrap();
+        assert_eq!(pat, User::new("pat@example.com", None));
+        assert!(!store.is_empty().unwrap());
+        assert_eq!(store.user("pat@example.com").unwrap(), Some(pat));
+
+        store.sign_in("pat@example.com", Some("Pat")).unwrap();
+        store.sign_in("pat@example.com", Some("Pat")).unwrap();
+        assert_eq!(store.user("pat@example.com").unwrap().unwrap().slug, "Pat");
+        // Slugs are only for show, so two logins may share one.
+        store.sign_in("pat@work.example", Some("Pat")).unwrap();
+        assert_eq!(store.users().unwrap().len(), 2);
     }
 
     #[test]
@@ -933,28 +944,28 @@ mod tests {
         assert!(store.is_empty().unwrap());
         fixtures::seed(&store).unwrap();
         assert!(!store.is_empty().unwrap());
-        store.edit("sam", 4, Change::State(State::Wait)).unwrap();
+        store.edit(SAM, 4, Change::State(State::Wait)).unwrap();
         store
-            .edit("sam", 4, Change::ToggleAssignee("alex".into()))
+            .edit(SAM, 4, Change::ToggleAssignee(ALEX.into()))
             .unwrap();
-        store.add_comment("sam", 1, "Called them.").unwrap();
-        store.mark_read("sam", fixtures::WATER).unwrap();
+        store.add_comment(SAM, 1, "Called them.").unwrap();
+        store.mark_read(SAM, fixtures::WATER).unwrap();
         drop(store);
 
         let store = Store::open(&path, fixtures::now()).unwrap();
         assert!(!store.is_empty().unwrap());
         let v = values(&store, 4);
         assert_eq!(v.state, State::Wait);
-        assert_eq!(v.assignees, BTreeSet::from(["alex".to_owned()]));
+        assert_eq!(v.assignees, BTreeSet::from([ALEX.to_owned()]));
         assert!(matches!(
             store.timeline(1).unwrap().last(),
             Some(Item::Comment(c)) if c.text == "Called them."
         ));
-        assert!(!store.unread("sam").unwrap().contains(&fixtures::WATER));
+        assert!(!store.unread(SAM).unwrap().contains(&fixtures::WATER));
         assert_eq!(store.history(4).unwrap().len(), 2);
         // Undo and toasts belong to the session that made the edit.
-        assert!(store.take_flash("sam").is_none());
-        assert!(matches!(store.undo("sam"), Err(Error::BadRequest(_))));
+        assert!(store.take_flash(SAM).is_none());
+        assert!(matches!(store.undo(SAM), Err(Error::BadRequest(_))));
     }
 
     #[test]
@@ -997,29 +1008,29 @@ mod tests {
         );
         // The state update goes in before the history row that fails.
         assert!(matches!(
-            store.edit("sam", 4, Change::State(State::Do)),
+            store.edit(SAM, 4, Change::State(State::Do)),
             Err(Error::Db(_))
         ));
         assert!(matches!(
-            store.edit("sam", 4, Change::ToggleAssignee("alex".into())),
+            store.edit(SAM, 4, Change::ToggleAssignee(ALEX.into())),
             Err(Error::Db(_))
         ));
         assert_eq!(values(&store, 4).state, State::Inbox);
         assert!(values(&store, 4).assignees.is_empty());
         assert!(store.history(4).unwrap().is_empty());
-        assert!(store.take_flash("sam").is_none());
+        assert!(store.take_flash(SAM).is_none());
 
         // A failed undo stays undoable.
         exec(&store, "DROP TRIGGER no_history;");
-        store.edit("sam", 4, Change::State(State::Do)).unwrap();
+        store.edit(SAM, 4, Change::State(State::Do)).unwrap();
         exec(
             &store,
             "CREATE TRIGGER no_history BEFORE INSERT ON history BEGIN SELECT RAISE(ABORT, 'no'); END;",
         );
-        assert!(matches!(store.undo("sam"), Err(Error::Db(_))));
+        assert!(matches!(store.undo(SAM), Err(Error::Db(_))));
         assert_eq!(values(&store, 4).state, State::Do);
         exec(&store, "DROP TRIGGER no_history;");
-        store.undo("sam").unwrap();
+        store.undo(SAM).unwrap();
         assert_eq!(values(&store, 4).state, State::Inbox);
     }
 
@@ -1029,25 +1040,26 @@ mod tests {
         let msg = store.message(4).unwrap().unwrap();
         exec(&store, "PRAGMA query_only = ON;");
         let db_err = |r: Result<(), Error>| assert!(matches!(r, Err(Error::Db(_))), "{r:?}");
-        db_err(store.edit("sam", 4, Change::State(State::Do)));
-        db_err(store.mark_read("sam", 4));
-        db_err(store.add_comment("sam", 1, "hi"));
+        db_err(store.edit(SAM, 4, Change::State(State::Do)));
+        db_err(store.mark_read(SAM, 4));
+        db_err(store.sign_in("pat@example.com", None).map(|_| ()));
+        db_err(store.add_comment(SAM, 1, "hi"));
         db_err(store.import(|tx| tx.folder("Travel")));
         db_err(store.import(|tx| tx.message(&msg)));
         exec(&store, "PRAGMA query_only = OFF;");
 
         // Each table the store reads, gone in turn.
         exec(&store, "ALTER TABLE folders RENAME TO gone_folders;");
-        db_err(store.edit("sam", 4, Change::Folder(Some("House".into()))));
+        db_err(store.edit(SAM, 4, Change::Folder(Some("House".into()))));
         assert!(store.folders().is_err());
         exec(&store, "ALTER TABLE comments RENAME TO gone_comments;");
         assert!(store.timeline(1).is_err());
         exec(&store, "ALTER TABLE reads RENAME TO gone_reads;");
-        assert!(store.unread("sam").is_err());
+        assert!(store.unread(SAM).is_err());
         exec(&store, "ALTER TABLE history RENAME TO gone_history;");
         assert!(store.history(4).is_err());
         exec(&store, "ALTER TABLE threads RENAME TO gone_threads;");
-        db_err(store.add_comment("sam", 1, "hi"));
+        db_err(store.add_comment(SAM, 1, "hi"));
         exec(&store, "ALTER TABLE users RENAME TO gone_users;");
         assert!(store.users().is_err());
         assert!(store.is_empty().is_err());
