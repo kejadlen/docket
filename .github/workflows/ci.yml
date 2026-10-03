@@ -78,6 +78,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: DOCKET_VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - env:
@@ -120,6 +121,8 @@ jobs:
 
       # A build of its own from fly.toml, with the `dev` feature the
       # release image leaves out. It still waits on the release, so the
-      # demo only runs commits that shipped.
+      # demo only runs commits that shipped, and carries its version.
       - name: Deploy a demo build
-        run: flyctl deploy --app "$FLY_APP" --config fly.toml --remote-only
+        env:
+          NEEDS_BUILD_OUTPUTS_VERSION: ${{ needs.build.outputs.version }}
+        run: flyctl deploy --app "$FLY_APP" --config fly.toml --remote-only --build-arg "DOCKET_VERSION=$NEEDS_BUILD_OUTPUTS_VERSION"

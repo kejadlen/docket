@@ -38,7 +38,7 @@ impl Config {
 
 /// Settings come from the KDL file; the CLI only says where to find it.
 #[derive(Debug, clap::Parser)]
-#[command(version, about = "Shared household email triage over JMAP")]
+#[command(version = docket::VERSION, about = "Shared household email triage over JMAP")]
 pub struct Args {
     /// KDL file to read settings from.
     #[arg(long, env = "DOCKET_CONFIG", default_value = "docket.kdl")]

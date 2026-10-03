@@ -10,3 +10,6 @@ pub mod store;
 pub mod views;
 
 pub use error::Error;
+
+/// Which build this is: the release's image tag, or a local `-dev` build.
+pub const VERSION: &str = env!("DOCKET_VERSION");

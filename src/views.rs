@@ -133,6 +133,7 @@ pub fn page(p: &Page<'_>) -> Markup {
                     (list(p))
                     (reader(p))
                 }
+                span.type-label.version { (crate::VERSION) }
                 @if let Some(flash) = &p.flash {
                     (toast(flash, p.here))
                 }

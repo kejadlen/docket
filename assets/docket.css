@@ -12,7 +12,7 @@ button { font: inherit; color: inherit; }
 
 /* Three panes on the fill: bare mailboxes, the list on a card, the thread
    as a stack of cards. */
-.app { height: 100vh; display: grid; grid-template-columns: 200px 420px minmax(0, 1fr); gap: var(--gl-space-2xs); padding: var(--gl-space-2xs); background: var(--gl-color-surface-fill); }
+.app { height: 100vh; display: grid; grid-template-columns: 200px 420px minmax(0, 1fr); gap: var(--gl-space-2xs); padding: var(--gl-space-2xs) var(--gl-space-2xs) var(--gl-space-s); background: var(--gl-color-surface-fill); }
 
 /* Gloss Input: a field on a rule. */
 .field { box-sizing: border-box; width: 100%; border: none; border-bottom: var(--gl-border-w) solid var(--gl-color-border-default); border-radius: 0; background: transparent; padding: 8px 2px; font: var(--gl-step--1) var(--gl-font-text); color: var(--gl-color-text-primary); outline: none; }
@@ -33,6 +33,8 @@ button { font: inherit; color: inherit; }
 /* ── mailboxes ── */
 .side { padding: var(--gl-space-m) var(--gl-space-s) var(--gl-space-2xs); display: flex; flex-direction: column; gap: var(--gl-space-m); min-height: 0; overflow-y: auto; }
 .brand-row { display: flex; justify-content: space-between; align-items: center; }
+/* Centered in the strip .app leaves free at the bottom right. */
+.version { position: fixed; right: var(--gl-space-2xs); bottom: calc((var(--gl-space-s) - 1em) / 2); text-transform: none; letter-spacing: 0; color: var(--gl-color-text-tertiary); }
 .search-btn { all: unset; display: flex; cursor: pointer; color: var(--gl-color-text-tertiary); transition: color var(--gl-dur-fast) var(--gl-ease); }
 .search-btn:hover { color: var(--gl-color-text-primary); }
 .search-btn:focus-visible { outline: 2px solid var(--gl-color-accent); outline-offset: 2px; border-radius: 2px; }

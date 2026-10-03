@@ -31,6 +31,14 @@ jobs:
 
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # 1.6
 
+      # Names the build after the PR and the commit it shows.
+      - name: Version
+        id: version
+        env:
+          PR: ${{ github.event.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: echo "version=pr-${PR}-${SHA::7}" >> "$GITHUB_OUTPUT"
+
       # Creates the app on open, redeploys it on each push, and destroys
       # it when the PR closes.
       - name: Deploy preview
@@ -39,3 +47,4 @@ jobs:
         with:
           config: fly.toml
           memory: 256
+          build_args: DOCKET_VERSION=${{ steps.version.outputs.version }}

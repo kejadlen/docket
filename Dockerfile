@@ -22,6 +22,8 @@ COPY . .
 # Cargo features to build with. Empty for the release image; the Fly demos
 # set `dev` (see fly.toml).
 ARG FEATURES=""
+# Shown in the UI and by --version; build.rs names local builds without it.
+ARG DOCKET_VERSION=""
 # Copy the binary out of the cache mount so it survives into the runtime
 # stage.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

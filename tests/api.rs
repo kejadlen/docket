@@ -138,6 +138,12 @@ async fn for_me_lists_messages_grouped_by_state_and_thread() {
     // Rows carry sender, age and snippet; values live in the thread.
     assert!(body.contains(r#"<span class="from">Northwind Roofing</span>"#));
     assert!(!body.contains("FOLDERS"));
+    // The page names the build.
+    let version = format!(
+        r#"<span class="type-label version">{}</span>"#,
+        docket::VERSION
+    );
+    assert!(body.contains(&version));
 }
 
 #[tokio::test]
