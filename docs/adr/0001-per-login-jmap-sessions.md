@@ -7,7 +7,7 @@ Status: Accepted
 ## Context
 
 Docket manages two Fastmail logins: the household login, which we
-read and write, and our son's login, which we monitor read-only. Docket
+read and write, and our son's login, which we manage on his behalf. Docket
 can reach his mail in either of two ways:
 
 - Separate sessions: his login gets its own API token, and Docket opens
@@ -24,8 +24,10 @@ haven't tested any of that.
 ## Decision
 
 Docket uses one credential per Fastmail login and no JMAP sharing. The
-household token has the mail and submission scopes. His token has a
-read-only mail scope.
+household token has the mail and submission scopes. His token has the
+mail scope only, so Docket can file his mail but never send as him
+(widened from a read-only scope on 2026-10-03, when we decided Docket
+should move his messages too).
 
 ## Consequences
 
@@ -37,13 +39,13 @@ read-only mail scope.
   household side. The token lives in its own file like any other
   credential (see [Storage](../DESIGN.md#storage)), and a separate file
   is one more secret to provision and rotate.
-- Docket derives what it offers from what the server permits, so the
-  read-only guarantee rests on the token's scope, not on Docket's
-  config. Fastmail does offer a read-only mail scope: the session
-  advertises mail only (no submission) and the account comes back
-  `isReadOnly: true` (confirmed live, 2026-10-03). `myRights` still
-  reports the owner's full rights under a read-only token, so Docket
-  gates on `isReadOnly` and capabilities, not `myRights`.
+- Docket derives what it offers from what the server permits, so what
+  it can do on each account rests on the credential's scopes, not on
+  Docket's config. A scope surfaces in the session as capabilities and
+  `isReadOnly` — a read-only token's session advertises mail only and
+  the account comes back `isReadOnly: true` (confirmed live,
+  2026-10-03). `myRights` is unaffected by scope (it reports mailbox
+  ACLs), so it gates per-mailbox actions, not account-wide ones.
 - Revisit sharing if separate sessions become a burden, such as more
   monitored logins or token rotation becoming a chore, and test how
   Fastmail exposes shares before switching.

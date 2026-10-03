@@ -7,7 +7,7 @@ A small self-hosted webapp for two people to jointly manage household email acco
 - Make it obvious what needs doing, who's on it, what we're waiting on, and what the other person should see.
 - Prevent double-replies and dropped messages without imposing strict ownership.
 - Coexist with normal mail clients: the mail server stays the source of truth for mail and folders; Docket is where work gets tracked.
-- Support multiple accounts, including a read-only account we monitor on our son's behalf.
+- Support multiple accounts, including one we monitor on our son's behalf.
 
 ## Non-goals
 
@@ -31,15 +31,15 @@ Backed by Fastmail. Credentials and accounts are separate:
 - A **credential** is a Fastmail API token (JMAP type) for one Fastmail login. It opens a JMAP session.
 - An **account** is a JMAP `accountId` from that session.
 
-Chosen setup: **one credential per login, no JMAP sharing.** The household login gets a token with mail + submission scopes; our son's login gets its own token with a read-only mail scope. Sharing his account into the household login was considered and rejected for now; see [ADR 1](adr/0001-per-login-jmap-sessions.md).
+Chosen setup: **one credential per login, no JMAP sharing.** The household login gets a token with mail + submission scopes; our son's login gets its own token with the mail scope. Sharing his account into the household login was considered and rejected for now; see [ADR 1](adr/0001-per-login-jmap-sessions.md).
 
-**Policy is derived from what the server permits, not config.** The app reads token capabilities, `isReadOnly` on the session account, and `myRights` on each mailbox and only offers actions that are allowed. `myRights` reflects mailbox ACLs, not the token's scope — under a read-only token, mailboxes still report full write rights — so read-only gating rests on `isReadOnly` and the session's capabilities. A read-only token's session advertises mail only (no submission) with `isReadOnly: true` on the account (confirmed live, 2026-10-03).
+**Policy is derived from what the server permits, not config.** The app reads token capabilities, `isReadOnly` on the session account, and `myRights` on each mailbox and only offers actions that are allowed. Token scope surfaces as session capabilities and `isReadOnly` (a read-only token's session advertises mail only with `isReadOnly: true` on the account; `myRights` is unaffected — it reports mailbox ACLs, so it gates per-mailbox actions, not scope).
 
-| | Shared household account | Son's account (read-only token) |
+| | Shared household account | Son's account |
 |---|---|---|
-| Send / reply | Yes | No |
-| File / archive | Yes | No |
-| Docket state | Database, mirrored as labels | Database only |
+| Send / reply | Yes | No (no submission scope) |
+| File / archive | Yes | Yes |
+| Docket state | Database, mirrored as labels | Database, mirrored as labels |
 
 ## Model
 
@@ -106,6 +106,7 @@ There is no toolbar and no thread-level action. Each message's state, folder, an
   - Wait: oldest first.
   - Watch: compact, by latest update.
   - Done: no list — search only.
+- **Accounts**: rows in lists and the thread view carry a visible account marker whenever more than one account is configured — filing choices and reply identity both depend on knowing the account.
 - **Reply**: via a normal client for v1; an in-app composer is a fast follow. Docket links out to the thread. A sent reply has no state; moving the message it answers to Wait is a manual step.
 
 ## Interop with normal clients
