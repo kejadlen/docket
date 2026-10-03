@@ -8,7 +8,7 @@ use jiff::civil::{DateTime, date};
 
 use crate::Error;
 use crate::model::{Account, Comment, Kind, Message, MessageId, State, Thread, User, Values};
-use crate::store::Store;
+use crate::store::{Clock, Store};
 
 pub const WATER: MessageId = 7;
 pub const ELI_PRACTICE: MessageId = 20;
@@ -123,7 +123,7 @@ impl Builder {
 
 /// A fresh in-memory store holding the fixtures.
 pub fn store() -> Result<Store, Error> {
-    let store = Store::open_in_memory(now())?;
+    let store = Store::open_in_memory(Clock::Fixed(now()))?;
     seed(&store)?;
     Ok(store)
 }

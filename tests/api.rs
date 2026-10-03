@@ -443,7 +443,10 @@ mod dev {
 
     #[tokio::test]
     async fn with_no_users_is_unauthenticated() {
-        let store = docket::store::Store::open_in_memory(docket::fixtures::now()).unwrap();
+        let store = docket::store::Store::open_in_memory(docket::store::Clock::Fixed(
+            docket::fixtures::now(),
+        ))
+        .unwrap();
         let addr = spawn_dev(store).await;
         let res = client()
             .get(format!("http://{addr}/"))

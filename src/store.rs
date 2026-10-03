@@ -55,12 +55,29 @@ pub enum Filter<'a> {
     Search(&'a str),
 }
 
+/// Where "now" comes from: the fixed clock fixtures are written against,
+/// or the system clock for a live server.
+#[derive(Debug, Clone, Copy)]
+pub enum Clock {
+    Fixed(DateTime),
+    System,
+}
+
+impl Clock {
+    fn now(self) -> DateTime {
+        match self {
+            Clock::Fixed(at) => at,
+            Clock::System => jiff::Zoned::now().datetime(),
+        }
+    }
+}
+
 /// One connection behind a mutex: two people's clicks never contend long
 /// enough to need a pool, and no lock is held across an await.
 #[derive(Debug)]
 pub struct Store {
-    /// The clock fixtures are written against, so ages stay stable.
-    pub now: DateTime,
+    /// The clock events and comments are stamped with.
+    clock: Clock,
     inner: Mutex<Inner>,
 }
 
@@ -74,28 +91,33 @@ struct Inner {
 impl Store {
     /// Opens (creating if needed) the database file and brings its schema
     /// up to date.
-    pub fn open(path: &Utf8Path, now: DateTime) -> Result<Self, Error> {
+    pub fn open(path: &Utf8Path, clock: Clock) -> Result<Self, Error> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        Self::init(conn, now)
+        Self::init(conn, clock)
     }
 
     /// A database that lasts as long as the store, for tests.
-    pub fn open_in_memory(now: DateTime) -> Result<Self, Error> {
-        Self::init(Connection::open_in_memory()?, now)
+    pub fn open_in_memory(clock: Clock) -> Result<Self, Error> {
+        Self::init(Connection::open_in_memory()?, clock)
     }
 
-    fn init(mut conn: Connection, now: DateTime) -> Result<Self, Error> {
+    fn init(mut conn: Connection, clock: Clock) -> Result<Self, Error> {
         conn.pragma_update(None, "foreign_keys", true)?;
         migrate(&mut conn)?;
         Ok(Self {
-            now,
+            clock,
             inner: Mutex::new(Inner {
                 conn,
                 undo: BTreeMap::new(),
                 flash: BTreeMap::new(),
             }),
         })
+    }
+
+    /// The current time per this store's clock.
+    pub fn now(&self) -> DateTime {
+        self.clock.now()
     }
 
     /// True before anyone has been added: a fresh database.
@@ -330,7 +352,7 @@ impl Store {
         };
 
         write_values(&tx, id, &next)?;
-        insert_event(&tx, id, user, self.now, &text)?;
+        insert_event(&tx, id, user, self.now(), &text)?;
         tx.commit()?;
         inner.undo.insert(user.to_owned(), (id, prev));
         inner.flash.insert(
@@ -352,7 +374,7 @@ impl Store {
             .ok_or(Error::BadRequest("nothing to undo"))?;
         let tx = inner.conn.transaction()?;
         write_values(&tx, id, &prev)?;
-        insert_event(&tx, id, user, self.now, "Undone")?;
+        insert_event(&tx, id, user, self.now(), "Undone")?;
         tx.commit()?;
         inner.undo.remove(user);
         inner.flash.insert(
@@ -383,7 +405,7 @@ impl Store {
         if !exists {
             return Err(Error::NotFound("thread"));
         }
-        insert_comment(&inner.conn, None, thread, user, self.now, text)?;
+        insert_comment(&inner.conn, None, thread, user, self.now(), text)?;
         Ok(())
     }
 
@@ -739,8 +761,8 @@ mod tests {
         assert_eq!(
             history,
             [
-                (SAM.into(), store.now, "Moved to Do".into()),
-                (SAM.into(), store.now, "Undone".into()),
+                (SAM.into(), store.now(), "Moved to Do".into()),
+                (SAM.into(), store.now(), "Undone".into()),
             ]
         );
     }
@@ -907,8 +929,17 @@ mod tests {
     }
 
     #[test]
+    fn the_system_clock_reads_real_time() {
+        let drift = (Clock::System.now() - jiff::Zoned::now().datetime())
+            .total(jiff::Unit::Second)
+            .unwrap()
+            .abs();
+        assert!(drift < 60.0, "system clock drifted {drift}s");
+    }
+
+    #[test]
     fn signing_in_adds_users_and_follows_their_slug() {
-        let store = Store::open_in_memory(fixtures::now()).unwrap();
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
         assert!(store.is_empty().unwrap());
         let pat = store.sign_in("pat@example.com", "pat").unwrap();
         assert_eq!(pat, User::new("pat@example.com", "pat"));
@@ -940,7 +971,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = camino::Utf8PathBuf::try_from(dir.path().join("docket.db")).unwrap();
 
-        let store = Store::open(&path, fixtures::now()).unwrap();
+        let store = Store::open(&path, Clock::Fixed(fixtures::now())).unwrap();
         assert!(store.is_empty().unwrap());
         fixtures::seed(&store).unwrap();
         assert!(!store.is_empty().unwrap());
@@ -952,7 +983,7 @@ mod tests {
         store.mark_read(SAM, fixtures::WATER).unwrap();
         drop(store);
 
-        let store = Store::open(&path, fixtures::now()).unwrap();
+        let store = Store::open(&path, Clock::Fixed(fixtures::now())).unwrap();
         assert!(!store.is_empty().unwrap());
         let v = values(&store, 4);
         assert_eq!(v.state, State::Wait);

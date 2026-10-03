@@ -18,9 +18,13 @@ async fn main() -> miette::Result<()> {
 
     let args = config::Args::parse();
     let config = config::Config::load(&args.config)?;
-    // The fixtures' clock keeps their ages stable until JMAP sync brings
-    // real mail.
-    let store = docket::store::Store::open(&config.database, docket::fixtures::now())?;
+    // Dev pins the fixture clock so sample ages stay stable; production
+    // runs on real time.
+    #[cfg(feature = "dev")]
+    let clock = docket::store::Clock::Fixed(docket::fixtures::now());
+    #[cfg(not(feature = "dev"))]
+    let clock = docket::store::Clock::System;
+    let store = docket::store::Store::open(&config.database, clock)?;
     #[cfg(feature = "dev")]
     if store.is_empty()? {
         docket::fixtures::seed(&store)?;

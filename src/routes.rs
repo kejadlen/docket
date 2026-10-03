@@ -145,7 +145,7 @@ fn render(
     Ok(views::page(&Page {
         me,
         view,
-        now: store.now,
+        now: store.now(),
         users: store.users()?,
         folders: store.folders()?,
         nav,
