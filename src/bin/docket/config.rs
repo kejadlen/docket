@@ -1,42 +1,38 @@
+use std::fmt;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
 
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
-use kdl::KdlDocument;
-use kdl::KdlError;
-use kdl::KdlNode;
-use kdl::KdlValue;
-use miette::Diagnostic;
 use miette::IntoDiagnostic as _;
-use miette::SourceSpan;
-use thiserror::Error;
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::de;
+use serde::de::Visitor;
 
 const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000);
 const DEFAULT_DATABASE: &str = "docket.db";
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Address to listen on. Keep it on localhost; Caddy (caddy-tailscale)
     /// fronts it and supplies the user identity headers.
+    #[serde(default = "default_bind")]
     pub bind: SocketAddr,
 
     /// SQLite database file, created if missing. A relative path is
     /// relative to the working directory.
+    #[serde(default = "default_database", deserialize_with = "non_empty_path")]
     pub database: Utf8PathBuf,
 }
 
 impl Config {
     pub fn load(path: &Utf8Path) -> miette::Result<Self> {
         let source = fs_err::read_to_string(path).into_diagnostic()?;
-        match parse(&source) {
-            Ok(config) => Ok(config),
-            // KDL syntax errors carry their own source and span labels;
-            // ours need the file attached to render theirs.
-            Err(Error::Kdl(err)) => Err(miette::Report::new(err)),
-            Err(err) => Err(miette::Report::new(err).with_source_code(source)),
-        }
+        // Errors carry the source, so they render with their labels.
+        Ok(parse(&source)?)
     }
 }
 
@@ -49,157 +45,63 @@ pub struct Args {
     pub config: Utf8PathBuf,
 }
 
-fn parse(source: &str) -> Result<Config, Error> {
-    let document = KdlDocument::parse(source)?;
-    let mut bind = None;
-    let mut database = None;
+fn parse(source: &str) -> Result<Config, kdl::de::Error> {
+    kdl::de::from_str(source)
+}
 
-    for node in document.nodes() {
-        match node.name().value() {
-            "bind" => {
-                if bind.is_some() {
-                    return Err(Error::Duplicate {
-                        name: "bind".to_owned(),
-                        span: node.name().span(),
-                    });
-                }
-                bind = Some(parse_bind(node)?);
-            }
-            "database" => {
-                if database.is_some() {
-                    return Err(Error::Duplicate {
-                        name: "database".to_owned(),
-                        span: node.name().span(),
-                    });
-                }
-                database = Some(parse_database(node)?);
-            }
-            name => {
-                return Err(Error::Unknown {
-                    name: name.to_owned(),
-                    span: node.name().span(),
-                });
-            }
+fn default_bind() -> SocketAddr {
+    DEFAULT_BIND
+}
+
+fn default_database() -> Utf8PathBuf {
+    Utf8PathBuf::from(DEFAULT_DATABASE)
+}
+
+fn non_empty_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Utf8PathBuf, D::Error> {
+    deserializer.deserialize_str(NonEmptyPath)
+}
+
+// Rejecting inside the visitor, rather than after, lets kdl label the value.
+struct NonEmptyPath;
+
+impl Visitor<'_> for NonEmptyPath {
+    type Value = Utf8PathBuf;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a non-empty path string")
+    }
+
+    fn visit_str<E: de::Error>(self, path: &str) -> Result<Utf8PathBuf, E> {
+        if path.is_empty() {
+            return Err(E::custom("database path is empty"));
         }
+        Ok(Utf8PathBuf::from(path))
     }
-
-    Ok(Config {
-        bind: bind.unwrap_or(DEFAULT_BIND),
-        database: database.unwrap_or_else(|| Utf8PathBuf::from(DEFAULT_DATABASE)),
-    })
-}
-
-fn parse_bind(node: &KdlNode) -> Result<SocketAddr, Error> {
-    let raw = single_value(node, "bind")?
-        .and_then(KdlValue::as_string)
-        .ok_or(Error::BindValue { span: node.span() })?;
-    raw.parse().map_err(|_| Error::BindParse {
-        value: raw.to_owned(),
-        span: node.span(),
-    })
-}
-
-fn parse_database(node: &KdlNode) -> Result<Utf8PathBuf, Error> {
-    single_value(node, "database")?
-        .and_then(KdlValue::as_string)
-        .filter(|path| !path.is_empty())
-        .map(Utf8PathBuf::from)
-        .ok_or(Error::DatabaseValue { span: node.span() })
-}
-
-/// Returns the node's single positional value, or `None` when the node
-/// is bare. Everything else a KDL node can carry — properties, type
-/// annotations, child blocks, extra values — is rejected rather than
-/// silently ignored.
-fn single_value<'a>(node: &'a KdlNode, setting: &str) -> Result<Option<&'a KdlValue>, Error> {
-    let shaped = node.ty().is_some()
-        || node.children().is_some()
-        || node.entries().iter().any(|entry| entry.name().is_some())
-        || node.entries().len() > 1;
-    if shaped {
-        return Err(Error::Shape {
-            setting: setting.to_owned(),
-            span: node.span(),
-        });
-    }
-
-    Ok(node.entries().first().map(|entry| entry.value()))
-}
-
-#[derive(Debug, Diagnostic, Error)]
-enum Error {
-    #[error(transparent)]
-    #[diagnostic(code(docket::config::kdl_syntax))]
-    Kdl(#[from] KdlError),
-
-    #[error("unknown setting `{name}`")]
-    #[diagnostic(
-        code(docket::config::unknown),
-        help("known settings: `bind`, `database`")
-    )]
-    Unknown {
-        name: String,
-        #[label]
-        span: SourceSpan,
-    },
-
-    #[error("duplicate setting `{name}`")]
-    #[diagnostic(code(docket::config::duplicate))]
-    Duplicate {
-        name: String,
-        #[label]
-        span: SourceSpan,
-    },
-
-    #[error(
-        "`{setting}` takes one value at most, with no properties, type annotations, or child blocks"
-    )]
-    #[diagnostic(code(docket::config::shape))]
-    Shape {
-        setting: String,
-        #[label]
-        span: SourceSpan,
-    },
-
-    #[error(r#"bind takes a quoted address, like bind "127.0.0.1:3000""#)]
-    #[diagnostic(code(docket::config::bind_value))]
-    BindValue {
-        #[label]
-        span: SourceSpan,
-    },
-
-    #[error("`{value}` is not a valid address")]
-    #[diagnostic(code(docket::config::bind_parse))]
-    BindParse {
-        value: String,
-        #[label]
-        span: SourceSpan,
-    },
-
-    #[error(r#"database takes a quoted path, like database "docket.db""#)]
-    #[diagnostic(code(docket::config::database_value))]
-    DatabaseValue {
-        #[label]
-        span: SourceSpan,
-    },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Error;
+    use miette::Diagnostic as _;
+
     use super::parse;
 
-    #[test]
-    fn empty_document_uses_defaults() {
-        let config = parse("").unwrap();
-        assert_eq!(config.bind.to_string(), "127.0.0.1:3000");
-        assert_eq!(config.database, "docket.db");
+    /// The error's message, and whether it points into the source.
+    fn error(source: &str) -> (String, bool) {
+        let err = parse(source).unwrap_err();
+        let labeled = err.labels().is_some_and(|mut l| l.next().is_some())
+            || err
+                .related()
+                .is_some_and(|mut r| r.any(|d| d.labels().is_some_and(|mut l| l.next().is_some())));
+        (err.to_string(), labeled)
     }
 
     #[test]
-    fn comments_only_uses_defaults() {
-        let config = parse("// nothing configured\n").unwrap();
-        assert_eq!(config.bind.to_string(), "127.0.0.1:3000");
+    fn empty_document_uses_defaults() {
+        for source in ["", "// nothing configured\n"] {
+            let config = parse(source).unwrap();
+            assert_eq!(config.bind.to_string(), "127.0.0.1:3000");
+            assert_eq!(config.database, "docket.db");
+        }
     }
 
     #[test]
@@ -214,17 +116,17 @@ mod tests {
     }
 
     #[test]
-    fn bind_with_port_only_is_rejected() {
-        assert!(matches!(
-            parse(r#"bind "3000""#),
-            Err(Error::BindParse { .. })
-        ));
-    }
-
-    #[test]
-    fn bind_without_a_string_is_rejected() {
-        assert!(matches!(parse("bind 3000"), Err(Error::BindValue { .. })));
-        assert!(matches!(parse("bind"), Err(Error::BindValue { .. })));
+    fn bad_values_point_at_the_value() {
+        for (source, message) in [
+            (r#"bind "3000""#, "invalid socket address syntax"),
+            ("bind 3000", "expected socket address"),
+            ("database 1", "expected a non-empty path string"),
+            (r#"database """#, "database path is empty"),
+        ] {
+            let (err, labeled) = error(source);
+            assert!(err.contains(message), "{source}: {err}");
+            assert!(labeled, "{source}");
+        }
     }
 
     #[test]
@@ -235,16 +137,6 @@ mod tests {
                 .database,
             "/var/lib/docket/docket.db"
         );
-        for source in ["database", "database 1", r#"database """#] {
-            assert!(
-                matches!(parse(source), Err(Error::DatabaseValue { .. })),
-                "{source}"
-            );
-        }
-        assert!(matches!(
-            parse("database \"a.db\"\ndatabase \"b.db\""),
-            Err(Error::Duplicate { .. })
-        ));
     }
 
     #[test]
@@ -255,41 +147,32 @@ mod tests {
     }
 
     #[test]
-    fn unknown_setting_is_rejected() {
-        assert!(matches!(parse("bnd \"x\""), Err(Error::Unknown { .. })));
-        // Dev mode is a build feature now, not a setting.
-        assert!(matches!(parse("dev"), Err(Error::Unknown { .. })));
+    fn misshapen_settings_are_rejected() {
+        for (source, message) in [
+            (r#"bnd "x""#, "unknown field `bnd`"),
+            // Dev mode is a build feature, not a setting.
+            ("dev", "unknown field `dev`"),
+            ("bind", "expected socket address"),
+            ("database", "expected a non-empty path string"),
+            ("bind \"127.0.0.1:1\"\nbind \"127.0.0.1:2\"", "sequence"),
+            (r#"database "a.db" "b.db""#, "sequence"),
+            (r#"database path="a.db""#, "map"),
+            (r#"database "a.db" { inner }"#, "map"),
+        ] {
+            let (err, _) = error(source);
+            assert!(err.contains(message), "{source}: {err}");
+        }
     }
 
     #[test]
-    fn duplicate_setting_is_rejected() {
-        let source = "bind \"127.0.0.1:1\"\nbind \"127.0.0.1:2\"";
-        assert!(matches!(parse(source), Err(Error::Duplicate { .. })));
-    }
-
-    #[test]
-    fn extra_syntax_is_rejected() {
-        assert!(matches!(
-            parse(r#"database "a.db" "b.db""#),
-            Err(Error::Shape { .. })
-        ));
-        assert!(matches!(
-            parse(r#"database path="a.db""#),
-            Err(Error::Shape { .. })
-        ));
-        assert!(matches!(
-            parse(r#"database "a.db" { inner }"#),
-            Err(Error::Shape { .. })
-        ));
-        assert!(matches!(
-            parse(r#"bind address="127.0.0.1:3000""#),
-            Err(Error::Shape { .. })
-        ));
-    }
-
-    #[test]
-    fn malformed_kdl_is_rejected() {
-        assert!(matches!(parse(r#"bind "unterminated"#), Err(Error::Kdl(_))));
-        assert!(matches!(parse("="), Err(Error::Kdl(_))));
+    fn malformed_kdl_points_at_the_problem() {
+        for source in [r#"bind "unterminated"#, "="] {
+            let (err, labeled) = error(source);
+            assert!(
+                err.contains("Failed to parse KDL document"),
+                "{source}: {err}"
+            );
+            assert!(labeled, "{source}");
+        }
     }
 }
