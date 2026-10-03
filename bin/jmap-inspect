@@ -20,7 +20,12 @@ token_from_1password() {
         op read "$ref"
     else
         op item get "$ref" --format json --reveal |
-            jq --raw-output '[.fields[] | select(.purpose == "PASSWORD")][0].value // empty'
+            jq --raw-output '
+                [.fields[]]
+                | (map(select(.purpose == "PASSWORD")) | .[0])
+                  // (map(select((.label // .id) == "credential")) | .[0])
+                  // (map(select(.type == "CONCEALED")) | .[0])
+                | .value // empty'
     fi
 }
 
@@ -74,7 +79,9 @@ main() {
                     ]]
                 }')" \
                 "$api_url" |
-                jq '.[0][1].list | map({name, role, myRights})'
+                jq 'if type == "array"
+                    then .[0][1].list | map({name, role, myRights})
+                    else . end'
         done
 }
 
