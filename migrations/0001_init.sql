@@ -4,7 +4,7 @@
 
 -- Everyone Tailscale lets in, added on their first request.
 CREATE TABLE users (
-    -- The Tailscale-User-Login value that identifies this user.
+    -- The Remote-User value that identifies this user.
     login TEXT PRIMARY KEY,
     -- The short name shown for them, from X-User-Slug; not unique.
     slug TEXT NOT NULL

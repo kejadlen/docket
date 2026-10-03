@@ -31,7 +31,7 @@ fn client() -> Client {
 async fn get(addr: SocketAddr, login: &str, path: &str) -> (StatusCode, String) {
     let res = client()
         .get(format!("http://{addr}{path}"))
-        .header("Tailscale-User-Login", login)
+        .header("Remote-User", login)
         .send()
         .await
         .unwrap();
@@ -46,7 +46,7 @@ async fn post(
 ) -> reqwest::Response {
     client()
         .post(format!("http://{addr}{path}"))
-        .header("Tailscale-User-Login", login)
+        .header("Remote-User", login)
         .form(form)
         .send()
         .await
@@ -84,7 +84,7 @@ async fn anyone_tailscale_lets_in_is_a_user() {
     // The proxy names them with X-User-Slug, and the name follows it.
     let body = client()
         .get(format!("http://{addr}/?m=4"))
-        .header("Tailscale-User-Login", "eve@example.com")
+        .header("Remote-User", "eve@example.com")
         .header("X-User-Slug", "Evie")
         .send()
         .await
@@ -320,7 +320,7 @@ async fn cross_site_posts_are_refused() {
     let send = |origin: &'static str, path: &'static str| {
         client()
             .post(format!("http://{addr}{path}"))
-            .header("Tailscale-User-Login", SAM)
+            .header("Remote-User", SAM)
             .header("Origin", origin)
             .form(&[("state", "do"), ("user", ALEX), ("back", "/")])
             .send()

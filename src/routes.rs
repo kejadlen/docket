@@ -19,7 +19,7 @@ use crate::views::{self, Page, ThreadView};
 
 // caddy-tailscale sets both from the tailnet identity, overwriting whatever
 // the client sent.
-const IDENTITY_HEADER: &str = "Tailscale-User-Login";
+const IDENTITY_HEADER: &str = "Remote-User";
 const SLUG_HEADER: &str = "X-User-Slug";
 const DEV_COOKIE: &str = "docket_dev_user";
 

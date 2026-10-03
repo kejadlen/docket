@@ -67,7 +67,7 @@ impl fmt::Display for State {
 /// anyone who reaches Docket is a user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
-    /// The `Tailscale-User-Login` value that identifies this user.
+    /// The `Remote-User` value that identifies this user.
     pub login: String,
     /// The short name shown for them. Not unique: two logins can share one.
     pub slug: String,
