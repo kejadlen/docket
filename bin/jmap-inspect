@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+
+# Inspects a Fastmail JMAP session for a bearer token: session-level
+# capabilities, each account's isReadOnly and accountCapabilities, and
+# myRights on every mailbox. Answers how a token's scopes surface in
+# the session (read-only spike).
+
+set -euo pipefail
+if [[ "${TRACE-0}" == "1" ]]; then
+    set -o xtrace
+fi
+
+readonly SESSION_URL="https://api.fastmail.com/jmap/session"
+
+fetch() {
+    curl --silent --show-error --fail-with-body \
+        --header "Authorization: Bearer ${1}" \
+        "${@:2}"
+}
+
+main() {
+    if [[ $# -ne 1 ]]; then
+        echo "usage: $0 <api-token>" >&2
+        exit 2
+    fi
+
+    local token="$1"
+    local session api_url
+    session=$(fetch "$token" "$SESSION_URL")
+    api_url=$(jq --raw-output '.apiUrl' <<<"$session")
+
+    jq '{
+        sessionCapabilities: (.capabilities | keys),
+        primaryAccounts,
+        accounts: (.accounts | to_entries | map({
+            id: .key,
+            name: .value.name,
+            isPersonal: .value.isPersonal,
+            isReadOnly: .value.isReadOnly,
+            accountCapabilities: (.value.accountCapabilities | keys)
+        }))
+    }' <<<"$session"
+
+    jq --raw-output '.accounts | keys[]' <<<"$session" |
+        while IFS= read -r account_id; do
+            echo "mailboxes for ${account_id}:"
+            fetch "$token" \
+                --header 'Content-Type: application/json' \
+                --data "$(jq --null-input --arg account_id "$account_id" '{
+                    using: ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+                    methodCalls: [[
+                        "Mailbox/get",
+                        {accountId: $account_id, ids: null,
+                         properties: ["id", "name", "role", "myRights"]},
+                        "0"
+                    ]]
+                }')" \
+                "$api_url" |
+                jq '.[0][1].list | map({name, role, myRights})'
+        done
+}
+
+main "$@"
