@@ -39,9 +39,11 @@ read-only mail scope.
   is one more secret to provision and rotate.
 - Docket derives what it offers from what the server permits, so the
   read-only guarantee rests on the token's scope, not on Docket's
-  config. This assumes Fastmail offers a read-only mail scope, which is
-  still unconfirmed. If it doesn't, his token would permit writes and
-  Docket would offer them, so revisit this decision.
+  config. Fastmail does offer a read-only mail scope: the session
+  advertises mail only (no submission) and the account comes back
+  `isReadOnly: true` (confirmed live, 2026-10-03). `myRights` still
+  reports the owner's full rights under a read-only token, so Docket
+  gates on `isReadOnly` and capabilities, not `myRights`.
 - Revisit sharing if separate sessions become a burden, such as more
   monitored logins or token rotation becoming a chore, and test how
   Fastmail exposes shares before switching.

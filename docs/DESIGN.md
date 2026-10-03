@@ -33,7 +33,7 @@ Backed by Fastmail. Credentials and accounts are separate:
 
 Chosen setup: **one credential per login, no JMAP sharing.** The household login gets a token with mail + submission scopes; our son's login gets its own token with a read-only mail scope. Sharing his account into the household login was considered and rejected for now; see [ADR 1](adr/0001-per-login-jmap-sessions.md).
 
-**Policy is derived from what the server permits, not config.** The app reads token capabilities, `isReadOnly` on the session account, and `myRights` on each mailbox and only offers actions that are allowed.
+**Policy is derived from what the server permits, not config.** The app reads token capabilities, `isReadOnly` on the session account, and `myRights` on each mailbox and only offers actions that are allowed. `myRights` reflects mailbox ACLs, not the token's scope — under a read-only token, mailboxes still report full write rights — so read-only gating rests on `isReadOnly` and the session's capabilities. A read-only token's session advertises mail only (no submission) with `isReadOnly: true` on the account (confirmed live, 2026-10-03).
 
 | | Shared household account | Son's account (read-only token) |
 |---|---|---|
@@ -153,4 +153,3 @@ The primary other client is **Mail.app over IMAP**; Fastmail web stays in folder
 - Is there a need to mark an Inbox handoff as FYI (no action), or does a comment cover it?
 - Whether Fastmail web URLs are stable enough to deep-link to a thread.
 - Mail.app behavior test (throwaway message): label it `Docket/Do`, then file, archive, and delete it from Mail.app, checking `mailboxIds` via JMAP after each step. Confirms that moves keep other mailbox memberships and shows what Trash/Archive do to the `Docket/` label.
-- Confirm Fastmail offers a read-only mail scope for API tokens, and how it shows up in the session.
