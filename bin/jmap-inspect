@@ -79,8 +79,8 @@ main() {
                     ]]
                 }')" \
                 "$api_url" |
-                jq 'if type == "array"
-                    then .[0][1].list | map({name, role, myRights})
+                jq 'if type == "object" and has("methodResponses")
+                    then .methodResponses[0][1].list | map({name, role, myRights})
                     else . end'
         done
 }
