@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 
-# Inspects a Fastmail JMAP session for a bearer token: session-level
-# capabilities, each account's isReadOnly and accountCapabilities, and
-# myRights on every mailbox. Answers how a token's scopes surface in
-# the session (read-only spike).
+# Inspects a Fastmail JMAP session: session-level capabilities, each
+# account's isReadOnly and accountCapabilities, and myRights on every
+# mailbox. Answers how a token's scopes surface in the session
+# (read-only spike). The token comes from 1Password: pass either a full
+# secret reference (op://vault/item/field) or a bare item id, whose
+# credential-purpose field is used.
 
 set -euo pipefail
 if [[ "${TRACE-0}" == "1" ]]; then
@@ -11,6 +13,16 @@ if [[ "${TRACE-0}" == "1" ]]; then
 fi
 
 readonly SESSION_URL="https://api.fastmail.com/jmap/session"
+
+token_from_1password() {
+    local ref="$1"
+    if [[ "$ref" == op://* ]]; then
+        op read "$ref"
+    else
+        op item get "$ref" --format json --reveal |
+            jq --raw-output '[.fields[] | select(.purpose == "PASSWORD")][0].value // empty'
+    fi
+}
 
 fetch() {
     curl --silent --show-error --fail-with-body \
@@ -20,11 +32,17 @@ fetch() {
 
 main() {
     if [[ $# -ne 1 ]]; then
-        echo "usage: $0 <api-token>" >&2
+        echo "usage: $0 <op-secret-reference | 1password-item-id>" >&2
         exit 2
     fi
 
-    local token="$1"
+    local token
+    token=$(token_from_1password "$1")
+    if [[ -z "$token" ]]; then
+        echo "no credential-purpose field found in 1Password item" >&2
+        exit 1
+    fi
+
     local session api_url
     session=$(fetch "$token" "$SESSION_URL")
     api_url=$(jq --raw-output '.apiUrl' <<<"$session")
