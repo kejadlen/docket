@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -5,6 +6,7 @@ use std::net::SocketAddr;
 
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
+use docket::jmap::Credentials;
 use miette::IntoDiagnostic as _;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -26,13 +28,32 @@ pub struct Config {
     /// relative to the working directory.
     #[serde(default = "default_database", deserialize_with = "non_empty_path")]
     pub database: Utf8PathBuf,
+
+    /// One node per Fastmail API token (DESIGN.md, Storage):
+    /// `credential "household" token-file="/run/credentials/docket/household"`.
+    #[serde(default, rename = "credential")]
+    pub credentials: Credentials,
 }
 
 impl Config {
     pub fn load(path: &Utf8Path) -> miette::Result<Self> {
         let source = fs_err::read_to_string(path).into_diagnostic()?;
         // Errors carry the source, so they render with their labels.
-        Ok(parse(&source)?)
+        let config = parse(&source)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Credential names become account slugs, so a duplicate would
+    /// silently merge two logins into one account.
+    fn validate(&self) -> miette::Result<()> {
+        let mut seen = BTreeSet::new();
+        for credential in self.credentials.iter() {
+            if !seen.insert(&credential.name) {
+                return Err(miette::miette!("duplicate credential {}", credential.name));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -83,7 +104,7 @@ impl Visitor<'_> for NonEmptyPath {
 mod tests {
     use miette::Diagnostic as _;
 
-    use super::parse;
+    use super::{Config, parse};
 
     /// The error's message, and whether it points into the source.
     fn error(source: &str) -> (String, bool) {
@@ -144,6 +165,34 @@ mod tests {
         let config = parse("bind \"0.0.0.0:3000\"\ndatabase \"d.db\"\n").unwrap();
         assert_eq!(config.bind.to_string(), "0.0.0.0:3000");
         assert_eq!(config.database, "d.db");
+        assert!(config.credentials.is_empty());
+    }
+
+    #[test]
+    fn a_lone_credential_parses() {
+        let config =
+            parse(r#"credential "household" token-file="/run/credentials/docket/household""#)
+                .unwrap();
+        let credential = config.credentials.first().unwrap();
+        assert_eq!(credential.name, "household");
+        assert_eq!(credential.token_file, "/run/credentials/docket/household");
+    }
+
+    #[test]
+    fn load_rejects_duplicate_credential_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("docket.kdl");
+        fs_err::write(
+            &path,
+            "credential \"household\" token-file=\"/a\"\ncredential \"household\" token-file=\"/b\"\n",
+        )
+        .unwrap();
+        let path = camino::Utf8PathBuf::try_from(path).unwrap();
+        let err = Config::load(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate credential household"),
+            "{err}"
+        );
     }
 
     #[test]

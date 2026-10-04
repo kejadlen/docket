@@ -22,6 +22,7 @@ jiff = "*"
 kdl = "*"
 maud = { version = "*", features = ["axum"] }
 miette = { version = "*", features = ["fancy"] }
+reqwest = { version = "*", features = ["json"] }
 rusqlite = { version = "*", features = ["bundled", "jiff"] }
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"

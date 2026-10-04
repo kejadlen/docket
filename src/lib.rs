@@ -3,6 +3,7 @@ pub mod dates;
 pub mod dev;
 pub mod error;
 pub mod fixtures;
+pub mod jmap;
 pub mod lists;
 pub mod model;
 pub mod routes;

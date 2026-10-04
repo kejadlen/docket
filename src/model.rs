@@ -82,12 +82,12 @@ impl User {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     pub slug: String,
     pub name: String,
     pub address: String,
-    /// Derived from the token's rights in the real app: no filing or replying.
+    /// From the session (see `jmap`): no filing or replying when true.
     pub read_only: bool,
 }
 

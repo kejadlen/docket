@@ -178,6 +178,18 @@ impl Store {
         Ok(folders)
     }
 
+    /// Every account, in the order sessions recorded them.
+    pub fn accounts(&self) -> Result<Vec<Account>, Error> {
+        let inner = self.lock();
+        let mut stmt = inner
+            .conn
+            .prepare_cached("SELECT slug, name, address, read_only FROM accounts ORDER BY rowid")?;
+        let accounts = stmt
+            .query_map([], account_from_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(accounts)
+    }
+
     pub fn thread(&self, id: ThreadId) -> Result<Option<Thread>, Error> {
         let thread = self
             .lock()
@@ -430,9 +442,16 @@ impl Import<'_> {
         Ok(())
     }
 
+    /// An account from a session. Upserted: the first import inserts, and
+    /// every session refresh re-writes the name, address, and read-only
+    /// flag as the server now reports them.
     pub fn account(&self, account: &Account) -> Result<(), Error> {
         self.tx.execute(
-            "INSERT INTO accounts (slug, name, address, read_only) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO accounts (slug, name, address, read_only) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (slug) DO UPDATE SET
+                 name = excluded.name,
+                 address = excluded.address,
+                 read_only = excluded.read_only",
             params![
                 account.slug,
                 account.name,
@@ -562,17 +581,19 @@ fn load_thread_account(conn: &Connection, thread: ThreadId) -> Result<Option<Acc
             "SELECT a.slug, a.name, a.address, a.read_only
              FROM accounts a JOIN threads t ON t.account = a.slug WHERE t.id = ?1",
             [thread],
-            |r| {
-                Ok(Account {
-                    slug: r.get(0)?,
-                    name: r.get(1)?,
-                    address: r.get(2)?,
-                    read_only: r.get(3)?,
-                })
-            },
+            account_from_row,
         )
         .optional()?;
     Ok(account)
+}
+
+fn account_from_row(r: &Row<'_>) -> rusqlite::Result<Account> {
+    Ok(Account {
+        slug: r.get(0)?,
+        name: r.get(1)?,
+        address: r.get(2)?,
+        read_only: r.get(3)?,
+    })
 }
 
 fn folder_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
@@ -926,6 +947,37 @@ mod tests {
         assert!(store.thread(999).unwrap().is_none());
         assert!(store.thread_account(11).unwrap().unwrap().read_only);
         assert!(store.thread_account(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_session_refresh_rewrites_an_account() {
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        let mut account = Account {
+            slug: "eli".into(),
+            name: "Eli".into(),
+            address: "eli@example.com".into(),
+            read_only: true,
+        };
+        store.import(|tx| tx.account(&account)).unwrap();
+
+        // A later session reports the account differently: same slug, new
+        // facts. The import upserts rather than colliding.
+        account.name = "Eli R.".into();
+        account.address = "eli@chislan.family".into();
+        account.read_only = false;
+        store.import(|tx| tx.account(&account)).unwrap();
+        store
+            .import(|tx| {
+                tx.thread(&Thread {
+                    id: 1,
+                    account: "eli".into(),
+                    subject: "Practice".into(),
+                })
+            })
+            .unwrap();
+
+        assert_eq!(store.accounts().unwrap(), [account]);
+        assert!(!store.thread_account(1).unwrap().unwrap().read_only);
     }
 
     #[test]

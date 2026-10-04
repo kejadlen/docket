@@ -2,6 +2,7 @@ mod config;
 
 use clap::Parser as _;
 use miette::IntoDiagnostic as _;
+use miette::WrapErr as _;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
@@ -29,6 +30,16 @@ async fn main() -> miette::Result<()> {
     if store.is_empty()? {
         docket::fixtures::seed(&store)?;
         tracing::info!(database = %config.database, "seeded fixtures");
+    }
+    // One session per credential, before serving: a credential that
+    // can't open one is a config or token problem to fix, not an account
+    // to quietly leave out.
+    let jmap = docket::jmap::Client::fastmail().into_diagnostic()?;
+    for credential in config.credentials.iter() {
+        jmap.sync_account(credential, &store)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("opening the JMAP session for {}", credential.name))?;
     }
     let state = docket::routes::AppState::new(store);
     #[cfg(feature = "dev")]

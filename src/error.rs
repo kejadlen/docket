@@ -12,6 +12,10 @@ pub enum Error {
     #[diagnostic(code(docket::db))]
     Db(#[from] rusqlite::Error),
 
+    #[error("jmap error: {0}")]
+    #[diagnostic(code(docket::jmap))]
+    Jmap(#[from] crate::jmap::JmapError),
+
     #[error("no user identity on the request")]
     #[diagnostic(code(docket::unauthenticated))]
     Unauthenticated,
@@ -32,7 +36,7 @@ pub enum Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let status = match self {
-            Error::Io(_) | Error::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::Io(_) | Error::Db(_) | Error::Jmap(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Unauthenticated => StatusCode::UNAUTHORIZED,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -51,6 +55,12 @@ mod tests {
         let cases = [
             (Error::Io(std::io::Error::other("disk")), 500),
             (Error::Db(rusqlite::Error::QueryReturnedNoRows), 500),
+            (
+                Error::Jmap(crate::jmap::JmapError::NoMailAccount {
+                    credential: "household".into(),
+                }),
+                500,
+            ),
             (Error::Unauthenticated, 401),
             (Error::NotFound("thread"), 404),
             (Error::Forbidden("read-only"), 403),
