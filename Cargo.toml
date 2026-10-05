@@ -18,7 +18,7 @@ axum = "*"
 camino = "*"
 clap = { version = "*", features = ["derive", "env"] }
 fs-err = "*"
-jiff = "*"
+jiff = { version = "*", features = ["serde"] }
 kdl = "*"
 maud = { version = "*", features = ["axum"] }
 miette = { version = "*", features = ["fancy"] }

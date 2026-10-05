@@ -19,7 +19,10 @@ use crate::model::{
 };
 
 /// Applied in order; `PRAGMA user_version` counts how many have run.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_jmap_import.sql"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
@@ -428,6 +431,39 @@ impl Store {
     }
 }
 
+/// Mail a JMAP session delivered, shaped for [`Import::incoming`].
+#[derive(Debug, Clone)]
+pub struct Incoming {
+    /// The JMAP Email id, cached.
+    pub jmap_id: String,
+    /// The RFC 5322 Message-ID, without angle brackets.
+    pub message_id: String,
+    /// The JMAP threadId; threads upsert by it.
+    pub jmap_thread_id: String,
+    /// Names the thread on first import.
+    pub subject: String,
+    pub at: DateTime,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub body: String,
+    pub kind: IncomingKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum IncomingKind {
+    Received {
+        from: String,
+        addr: String,
+        /// Seeded from any `Docket/` label the message already carries,
+        /// else Inbox.
+        state: State,
+        folder: Option<String>,
+    },
+    /// `by` is a login when the From address names one of us; None means
+    /// the account's shared identity.
+    Sent { by: Option<String>, to: Vec<String> },
+}
+
 /// Writes inside one transaction, from [`Store::import`].
 pub struct Import<'a> {
     tx: Transaction<'a>,
@@ -463,8 +499,10 @@ impl Import<'_> {
     }
 
     pub fn folder(&self, name: &str) -> Result<(), Error> {
-        self.tx
-            .execute("INSERT INTO folders (name) VALUES (?1)", [name])?;
+        self.tx.execute(
+            "INSERT INTO folders (name) VALUES (?1) ON CONFLICT (name) DO NOTHING",
+            [name],
+        )?;
         Ok(())
     }
 
@@ -488,7 +526,15 @@ impl Import<'_> {
                 None,
                 None,
             ),
-            Kind::Sent { by, to } => ("sent", None, None, None, None, Some(by), Some(json(to)?)),
+            Kind::Sent { by, to } => (
+                "sent",
+                None,
+                None,
+                None,
+                None,
+                by.as_deref(),
+                Some(json(to)?),
+            ),
         };
         let inserted = self.tx.execute(
             "INSERT INTO messages (id, account, message_id, thread, at, cc, bcc, body, kind,
@@ -528,6 +574,83 @@ impl Import<'_> {
     pub fn read(&self, user: &str, msg: MessageId) -> Result<(), Error> {
         insert_read(&self.tx, user, msg)
     }
+
+    /// Mail a JMAP session delivered, keyed by account + Message-ID so
+    /// re-importing is idempotent. The thread upserts by account + JMAP
+    /// threadId, named by the first message that arrives; Docket-owned
+    /// values (state, assignees, reads) are written only on first
+    /// import, while the server-owned cache (folder, timestamps, body)
+    /// refreshes.
+    pub fn incoming(&self, account: &str, mail: &Incoming) -> Result<(), Error> {
+        self.tx.execute(
+            "INSERT INTO threads (account, subject, jmap_thread_id) VALUES (?1, ?2, ?3)
+             ON CONFLICT (account, jmap_thread_id) DO NOTHING",
+            params![account, mail.subject, mail.jmap_thread_id],
+        )?;
+        let (kind, from_name, from_addr, state, folder, sent_by, sent_to) = match &mail.kind {
+            IncomingKind::Received {
+                from,
+                addr,
+                state,
+                folder,
+            } => (
+                "received",
+                Some(from),
+                Some(addr),
+                Some(state),
+                folder.as_deref(),
+                None,
+                None,
+            ),
+            IncomingKind::Sent { by, to } => (
+                "sent",
+                None,
+                None,
+                None,
+                None,
+                by.as_deref(),
+                Some(json(to)?),
+            ),
+        };
+        let cc = json(&mail.cc)?;
+        let bcc = json(&mail.bcc)?;
+        let _upserted = self.tx.execute(
+            "INSERT INTO messages (account, message_id, jmap_id, thread, at, cc, bcc, body,
+                kind, from_name, from_addr, state, folder, sent_by, sent_to)
+             SELECT ?1, ?2, ?3, t.id, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+             FROM threads t WHERE t.account = ?1 AND t.jmap_thread_id = ?4
+             ON CONFLICT (account, message_id) DO UPDATE SET
+                 jmap_id = excluded.jmap_id,
+                 thread = excluded.thread,
+                 at = excluded.at,
+                 cc = excluded.cc,
+                 bcc = excluded.bcc,
+                 body = excluded.body,
+                 from_name = excluded.from_name,
+                 from_addr = excluded.from_addr,
+                 folder = excluded.folder,
+                 sent_by = excluded.sent_by,
+                 sent_to = excluded.sent_to",
+            params![
+                account,
+                mail.message_id,
+                mail.jmap_id,
+                mail.jmap_thread_id,
+                mail.at,
+                cc,
+                bcc,
+                mail.body,
+                kind,
+                from_name,
+                from_addr,
+                state,
+                folder,
+                sent_by,
+                sent_to,
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 impl ToSql for State {
@@ -549,10 +672,15 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
         if n <= version {
             continue;
         }
+        // A migration may rebuild a table (0002 does), which drops and
+        // renames; FK enforcement would trap the drop, and the copy
+        // inside is exact.
+        conn.pragma_update(None, "foreign_keys", false)?;
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
         tx.pragma_update(None, "user_version", n)?;
         tx.commit()?;
+        conn.pragma_update(None, "foreign_keys", true)?;
     }
     Ok(())
 }
@@ -904,7 +1032,8 @@ mod tests {
         assert_eq!(sent.cc, ["Alex"]);
         assert_eq!(sent.bcc, ["Pat Lee"]);
         assert!(
-            matches!(&sent.kind, Kind::Sent { by, to } if by == SAM && to == &["Northwind Roofing"])
+            matches!(&sent.kind, Kind::Sent { by, to } if by == &Some(SAM.to_owned())
+                && to == &["Northwind Roofing".to_string()])
         );
         let got = store.message(5).unwrap().unwrap();
         assert_eq!(got.at, jiff::civil::date(2026, 9, 30).at(15, 30, 0, 0));
@@ -978,6 +1107,182 @@ mod tests {
 
         assert_eq!(store.accounts().unwrap(), [account]);
         assert!(!store.thread_account(1).unwrap().unwrap().read_only);
+    }
+
+    /// The shape of a JMAP delivery, for the incoming() tests.
+    fn incoming(state: State, folder: Option<&str>, body: &str) -> Incoming {
+        Incoming {
+            jmap_id: "E9".into(),
+            message_id: "m9@chislan.family".into(),
+            jmap_thread_id: "T9".into(),
+            subject: "Gutter repair estimate".into(),
+            at: fixtures::now(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            body: body.to_owned(),
+            kind: IncomingKind::Received {
+                from: "Northwind Roofing".into(),
+                addr: "office@northwind.co".into(),
+                state,
+                folder: folder.map(str::to_owned),
+            },
+        }
+    }
+
+    #[test]
+    fn incoming_mail_upserts_keeping_docket_owned_values() {
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        store
+            .import(|tx| {
+                tx.account(&Account {
+                    slug: "household".into(),
+                    name: "Household".into(),
+                    address: "household@example.com".into(),
+                    read_only: false,
+                })?;
+                tx.folder("House")
+            })
+            .unwrap();
+
+        store
+            .import(|tx| {
+                tx.incoming(
+                    "household",
+                    &incoming(State::Watch, Some("House"), "$1,840"),
+                )
+            })
+            .unwrap();
+        let id = store
+            .messages(Filter::Search("1,840"))
+            .unwrap()
+            .first()
+            .unwrap()
+            .id;
+        // Triaged in Docket after the import: the state moves here.
+        store.sign_in(ALEX, "Alex").unwrap();
+        store.edit(ALEX, id, Change::State(State::Do)).unwrap();
+
+        // The next session reports a new body and no folder; the state we
+        // set survives, the server's fields refresh.
+        store
+            .import(|tx| tx.incoming("household", &incoming(State::Inbox, None, "$2,120")))
+            .unwrap();
+        assert_eq!(store.messages(Filter::Search("2,120")).unwrap().len(), 1);
+        let after = store.message(id).unwrap().unwrap();
+        assert_eq!(after.body, "$2,120");
+        assert_eq!(after.values().unwrap().state, State::Do);
+        assert_eq!(after.values().unwrap().folder, None);
+    }
+
+    #[test]
+    fn thread_ids_are_scoped_to_their_account() {
+        // JMAP thread ids are opaque; two accounts may share one without
+        // their threads merging.
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        store
+            .import(|tx| {
+                tx.account(&Account {
+                    slug: "household".into(),
+                    name: "Household".into(),
+                    address: "household@example.com".into(),
+                    read_only: false,
+                })?;
+                tx.account(&Account {
+                    slug: "eli".into(),
+                    name: "Eli".into(),
+                    address: "eli@example.com".into(),
+                    read_only: true,
+                })
+            })
+            .unwrap();
+        let mut first = incoming(State::Inbox, None, "ours");
+        first.message_id = "m1@chislan.family".into();
+        let mut second = incoming(State::Inbox, None, "his");
+        second.message_id = "m2@chislan.family".into();
+        store
+            .import(|tx| {
+                tx.incoming("household", &first)?;
+                tx.incoming("eli", &second)
+            })
+            .unwrap();
+        let a = store
+            .messages(Filter::Search("ours"))
+            .unwrap()
+            .first()
+            .unwrap()
+            .thread;
+        let b = store
+            .messages(Filter::Search("his"))
+            .unwrap()
+            .first()
+            .unwrap()
+            .thread;
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn an_ancient_database_migrates_with_its_mail_intact() {
+        // A database left at migration 1, holding rows in the tables the
+        // second migration rebuilds.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(MIGRATIONS.first().copied().unwrap())
+            .unwrap();
+        tx.pragma_update(None, "user_version", 1).unwrap();
+        tx.commit().unwrap();
+        conn.execute_batch(
+            "INSERT INTO users VALUES ('alex@example.com', 'Alex');
+             INSERT INTO accounts VALUES ('household', 'Household', 'household@example.com', 0);
+             INSERT INTO threads (id, account, subject) VALUES (1, 'household', 'Estimate');
+             INSERT INTO messages (id, account, message_id, thread, at, body, kind,
+                 from_name, from_addr, state)
+                 VALUES (4, 'household', 'm4@northwind.co', 1, '2026-09-27T10:02:00',
+                     'Revised estimate.', 'received', 'Northwind', 'office@northwind.co', 'inbox');
+             INSERT INTO assignees VALUES (4, 'alex@example.com');
+             INSERT INTO reads VALUES ('alex@example.com', 4);",
+        )
+        .unwrap();
+
+        let store = Store::init(conn, Clock::Fixed(fixtures::now())).unwrap();
+        let msg = store.message(4).unwrap().unwrap();
+        assert_eq!(
+            msg.values().unwrap().assignees,
+            BTreeSet::from([ALEX.to_owned()])
+        );
+        assert!(!store.unread(ALEX).unwrap().contains(&4));
+
+        // The relaxed schema now takes shared-identity sends.
+        store
+            .import(|tx| {
+                tx.incoming(
+                    "household",
+                    &Incoming {
+                        jmap_id: "E8".into(),
+                        message_id: "m8@chislan.family".into(),
+                        jmap_thread_id: "T8".into(),
+                        subject: "Re: Estimate".into(),
+                        at: fixtures::now(),
+                        cc: Vec::new(),
+                        bcc: Vec::new(),
+                        body: "Thanks.".into(),
+                        kind: IncomingKind::Sent {
+                            by: None,
+                            to: vec!["Northwind".into()],
+                        },
+                    },
+                )
+            })
+            .unwrap();
+        assert!(matches!(
+            store
+                .messages(Filter::Search("Thanks"))
+                .unwrap()
+                .first()
+                .unwrap()
+                .kind,
+            Kind::Sent { by: None, .. }
+        ));
     }
 
     #[test]

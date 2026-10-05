@@ -170,9 +170,9 @@ fn open_thread(store: &Store, me: &User, id: MessageId) -> Result<ThreadView, Er
     store.mark_read(&me.login, latest)?;
     Ok(ThreadView {
         thread: store.thread(msg.thread)?.ok_or(Error::NotFound("thread"))?,
-        read_only: store
+        account: store
             .thread_account(msg.thread)?
-            .is_some_and(|a| a.read_only),
+            .ok_or(Error::NotFound("account"))?,
         timeline: store.timeline(msg.thread)?,
         latest,
     })

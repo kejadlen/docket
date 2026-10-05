@@ -9,7 +9,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::dates;
 use crate::lists::{Group, Section, View};
-use crate::model::{Comment, Kind, Message, MessageId, State, Thread, User, Values};
+use crate::model::{Account, Comment, Kind, Message, MessageId, State, Thread, User, Values};
 use crate::store::{Flash, Item};
 
 /// Everything one page shows, loaded before rendering starts.
@@ -34,7 +34,9 @@ pub struct Page<'a> {
 
 pub struct ThreadView {
     pub thread: Thread,
-    pub read_only: bool,
+    /// The thread's account: read-only gates the controls, its name
+    /// stands in for the sender of shared-identity mail.
+    pub account: Account,
     pub timeline: Vec<Item>,
     /// Opens expanded, along with the selected message.
     pub latest: MessageId,
@@ -264,7 +266,12 @@ fn solo(p: &Page<'_>, group: &Group, m: &Message, compact: bool) -> Markup {
 fn sender(users: &[User], m: &Message) -> String {
     match &m.kind {
         Kind::Received { from, .. } => from.clone(),
-        Kind::Sent { by, to } => format!("{} → {}", user_name(users, by), to.join(", ")),
+        // A shared-identity send has no login to name; the recipient
+        // carries the line.
+        Kind::Sent { by, to } => match by.as_deref() {
+            Some(by) => format!("{} → {}", user_name(users, by), to.join(", ")),
+            None => format!("→ {}", to.join(", ")),
+        },
     }
 }
 
@@ -299,7 +306,7 @@ fn thread(p: &Page<'_>, t: &ThreadView, selected: MessageId) -> Markup {
         article.thread {
             header.thread-head {
                 h2 { (t.thread.subject) }
-                @if t.read_only {
+                @if t.account.read_only {
                     span.type-label { "Read-only" }
                 }
             }
@@ -309,7 +316,7 @@ fn thread(p: &Page<'_>, t: &ThreadView, selected: MessageId) -> Markup {
                         Item::Comment(c) => (comment(p, c)),
                         Item::Message(m) => {
                             @let open = m.id == selected || m.id == t.latest;
-                            (message(p, m, open, m.id == selected, t.read_only))
+                            (message(p, m, open, m.id == selected, &t.account))
                         }
                     }
                 }
@@ -336,11 +343,13 @@ fn comment(p: &Page<'_>, c: &Comment) -> Markup {
     }
 }
 
-fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, read_only: bool) -> Markup {
+fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Account) -> Markup {
     let (who, addr) = match &m.kind {
         Kind::Received { from, addr, .. } => (from.clone(), format!("<{addr}>")),
         Kind::Sent { by, to } => (
-            user_name(&p.users, by).to_owned(),
+            by.as_deref()
+                .map(|by| user_name(&p.users, by).to_owned())
+                .unwrap_or_else(|| account.name.clone()),
             format!("→ {}", to.join(", ")),
         ),
     };
@@ -375,7 +384,7 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, read_only: boo
                         title="Open in Fastmail" aria-label="Open in Fastmail" { (PreEscaped(EXTERNAL_ICON)) }
                 }
                 @match m.values() {
-                    Some(values) => (values_controls(p, m.id, values, read_only)),
+                    Some(values) => (values_controls(p, m.id, values, account.read_only)),
                     None => span.type-label.sent { "Sent" },
                 }
             }
@@ -484,5 +493,29 @@ mod tests {
             fastmail_url(&m),
             "https://app.fastmail.com/mail/search:msgid%3A%3C4%40fixtures.docket.invalid%3E"
         );
+    }
+
+    #[test]
+    fn senders_without_a_login_show_the_recipient() {
+        let users = [User::new("sam@example.com", "Sam")];
+        let sent = |by: Option<&str>| Message {
+            id: 1,
+            message_id: "m@x".into(),
+            thread: 1,
+            at: crate::fixtures::now(),
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            body: "hi".into(),
+            kind: Kind::Sent {
+                by: by.map(str::to_owned),
+                to: vec!["Northwind Roofing".into()],
+            },
+        };
+        assert_eq!(
+            sender(&users, &sent(Some("sam@example.com"))),
+            "Sam → Northwind Roofing"
+        );
+        // A shared-identity send has nobody to name in a list row.
+        assert_eq!(sender(&users, &sent(None)), "→ Northwind Roofing");
     }
 }

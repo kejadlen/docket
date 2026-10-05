@@ -101,7 +101,7 @@ impl Builder {
             bcc: strings(bcc),
             body: body.to_owned(),
             kind: Kind::Sent {
-                by: by.to_owned(),
+                by: Some(by.to_owned()),
                 to: strings(to),
             },
         });

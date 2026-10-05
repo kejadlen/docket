@@ -113,8 +113,9 @@ pub enum Kind {
         addr: String,
         values: Values,
     },
-    /// Sent by one of us (`by` is a login). Sent messages carry no values.
-    Sent { by: String, to: Vec<String> },
+    /// Sent by one of us (`by` is a login, or `None` when the sender is
+    /// the account's shared identity). Sent messages carry no values.
+    Sent { by: Option<String>, to: Vec<String> },
 }
 
 #[derive(Debug, Clone)]

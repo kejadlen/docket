@@ -4,20 +4,22 @@
 //! per-mailbox `myRights` report mailbox ACLs, so they gate per-mailbox
 //! actions like filing (task rn), never account-wide scope.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::ErrorKind;
 use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde::de;
+use serde::de::DeserializeOwned;
 use serde::de::value::MapAccessDeserializer;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::Error;
-use crate::model::Account;
-use crate::store::Store;
+use crate::model::{Account, State, User};
+use crate::store::{Incoming, IncomingKind, Store};
 
 /// RFC 8620 §9. The capability URNs Docket looks for.
 pub const CORE: &str = "urn:ietf:params:jmap:core";
@@ -148,35 +150,50 @@ struct Reply {
 }
 
 #[derive(Deserialize)]
-struct MailboxGet {
-    list: Vec<Mailbox>,
-}
-
-#[derive(Deserialize)]
 struct ApiError {
     #[serde(rename = "type")]
     kind: String,
     description: Option<String>,
 }
 
-fn parse_mailboxes(json: &str) -> Result<Vec<Mailbox>, JmapError> {
-    const WHAT: &str = "Mailbox/get reply";
-    let reply: Reply =
-        serde_json::from_str(json).map_err(|source| JmapError::Malformed { what: WHAT, source })?;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
+struct Query {
+    ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadEmails {
+    emails: Vec<String>,
+}
+
+/// Pulls one page of ids out of an `Email/query` response.
+fn parse_query(args: Value) -> Result<Query, JmapError> {
+    serde_json::from_value(args).map_err(|source| JmapError::Malformed {
+        what: "Email/query",
+        source,
+    })
+}
+
+/// Pulls the one method's answer out of its `methodResponses` envelope,
+/// or names what went wrong instead.
+fn parse_reply(method: &'static str, json: &str) -> Result<Value, JmapError> {
+    let malformed = |source| JmapError::Malformed {
+        what: method,
+        source,
+    };
+    let reply: Reply = serde_json::from_str(json).map_err(malformed)?;
     let detail = |text: String| JmapError::Reply {
-        method: "Mailbox/get",
+        method,
         detail: text,
     };
     match reply.method_responses.as_slice() {
-        [(method, args, _)] => match method.as_str() {
-            "Mailbox/get" => {
-                let got: MailboxGet = serde_json::from_value(args.clone())
-                    .map_err(|source| JmapError::Malformed { what: WHAT, source })?;
-                Ok(got.list)
-            }
+        [(name, args, _)] => match name.as_str() {
+            name if name == method => Ok(args.clone()),
             "error" => {
-                let err: ApiError = serde_json::from_value(args.clone())
-                    .map_err(|source| JmapError::Malformed { what: WHAT, source })?;
+                let err: ApiError = serde_json::from_value(args.clone()).map_err(malformed)?;
                 Err(match err.description {
                     Some(description) => detail(format!("{}: {description}", err.kind)),
                     None => detail(err.kind),
@@ -188,6 +205,228 @@ fn parse_mailboxes(json: &str) -> Result<Vec<Mailbox>, JmapError> {
         _ => Err(detail("the reply had more than one methodResponse".into())),
     }
 }
+
+fn parse_list<T: DeserializeOwned>(method: &'static str, args: Value) -> Result<Vec<T>, JmapError> {
+    #[derive(Deserialize)]
+    struct Got<T> {
+        list: Vec<T>,
+    }
+    serde_json::from_value::<Got<T>>(args)
+        .map(|got| got.list)
+        .map_err(|source| JmapError::Malformed {
+            what: method,
+            source,
+        })
+}
+
+/// An RFC 5322 address as JMAP parses it (RFC 8621 §4.1.4).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailAddress {
+    pub name: Option<String>,
+    pub email: String,
+}
+
+impl EmailAddress {
+    /// The display form Docket shows: the name when there is one, else
+    /// the bare address.
+    pub fn display(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.email.clone())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyPart {
+    part_id: String,
+    #[serde(rename = "type")]
+    media_type: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyValue {
+    value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Email {
+    pub id: String,
+    thread_id: String,
+    /// The Message-ID header, without angle brackets.
+    pub message_id: String,
+    pub mailbox_ids: BTreeMap<String, bool>,
+    pub received_at: Timestamp,
+    pub sent_at: Timestamp,
+    pub subject: Option<String>,
+    pub preview: Option<String>,
+    pub from: Vec<EmailAddress>,
+    pub to: Vec<EmailAddress>,
+    pub cc: Vec<EmailAddress>,
+    pub bcc: Vec<EmailAddress>,
+    pub text_body: Option<Vec<BodyPart>>,
+    pub body_values: Option<BTreeMap<String, BodyValue>>,
+}
+
+/// The message's text: its first plain-text part, falling back to the
+/// server's preview when there isn't one.
+fn body_of(email: &Email) -> String {
+    if let (Some(parts), Some(values)) = (&email.text_body, &email.body_values) {
+        for part in parts
+            .iter()
+            .filter(|part| part.media_type.starts_with("text/plain"))
+        {
+            if let Some(value) = values.get(&part.part_id) {
+                return value.value.clone();
+            }
+        }
+    }
+    email.preview.clone().unwrap_or_default()
+}
+
+/// Shapes a fetched email for the store. `None` skips a senderless
+/// oddity (nothing to show for it).
+fn incoming(email: &Email, layout: &Layout, users: &[User]) -> Option<Incoming> {
+    let civil = |at: &Timestamp| at.to_zoned(jiff::tz::TimeZone::UTC).datetime();
+    let names = |xs: &[EmailAddress]| xs.iter().map(EmailAddress::display).collect::<Vec<_>>();
+    let sent = layout.is_sent(email);
+    let kind = if sent {
+        IncomingKind::Sent {
+            // Attribution by From address; the shared identity matches
+            // no login and stays None.
+            by: email.from.iter().find_map(|a| {
+                users
+                    .iter()
+                    .find(|u| u.login == a.email)
+                    .map(|u| u.login.clone())
+            }),
+            to: names(&email.to),
+        }
+    } else {
+        let from = email.from.first()?;
+        IncomingKind::Received {
+            from: from.display(),
+            addr: from.email.clone(),
+            state: layout.state_of(email),
+            folder: layout.folder_of(email),
+        }
+    };
+    Some(Incoming {
+        jmap_id: email.id.clone(),
+        message_id: email.message_id.clone(),
+        jmap_thread_id: email.thread_id.clone(),
+        subject: email
+            .subject
+            .clone()
+            .unwrap_or_else(|| "(no subject)".into()),
+        at: civil(if sent {
+            &email.sent_at
+        } else {
+            &email.received_at
+        }),
+        cc: names(&email.cc),
+        bcc: names(&email.bcc),
+        body: body_of(email),
+        kind,
+    })
+}
+
+/// How Docket reads a session's mailboxes (DESIGN.md): roles pick out
+/// the system boxes, the `Docket` namespace holds state labels, and the
+/// role-less rest are folders.
+#[derive(Debug, Clone, Default)]
+struct Layout {
+    /// The Inbox mailbox's id.
+    pub inbox: Option<String>,
+    /// The Sent mailbox's id.
+    pub sent: Option<String>,
+    /// Label mailbox id → the state it carries.
+    labels: BTreeMap<String, State>,
+    /// Mailbox ids in the Docket namespace: the labels and the parent.
+    docket: BTreeSet<String>,
+    /// Folder mailbox id → name.
+    folders: BTreeMap<String, String>,
+}
+
+impl Layout {
+    pub fn of(mailboxes: &[Mailbox]) -> Self {
+        let mut layout = Self::default();
+        // Labels may nest under a `Docket` parent instead of carrying
+        // the prefix in their name.
+        let parents: BTreeSet<&str> = mailboxes
+            .iter()
+            .filter(|m| m.name == "Docket")
+            .map(|m| m.id.as_str())
+            .collect();
+        for mailbox in mailboxes {
+            match mailbox.role.as_deref() {
+                Some("inbox") => layout.inbox = Some(mailbox.id.clone()),
+                Some("sent") => layout.sent = Some(mailbox.id.clone()),
+                // The other system boxes (Archive, Drafts, Junk, Trash)
+                // are neither folders nor labels.
+                Some(_) => {}
+                None => {
+                    let in_docket = mailbox.name == "Docket"
+                        || mailbox.name.starts_with("Docket/")
+                        || parents.contains(mailbox.id.as_str());
+                    if in_docket {
+                        layout.docket.insert(mailbox.id.clone());
+                        let leaf = mailbox.name.rsplit('/').next().unwrap_or_default();
+                        if let Some(state) = State::from_slug(&leaf.to_lowercase()) {
+                            layout.labels.insert(mailbox.id.clone(), state);
+                        }
+                    } else {
+                        layout
+                            .folders
+                            .insert(mailbox.id.clone(), mailbox.name.clone());
+                    }
+                }
+            }
+        }
+        layout
+    }
+
+    /// The state the message carries: its `Docket/` label, else Inbox.
+    pub fn state_of(&self, email: &Email) -> State {
+        email
+            .mailbox_ids
+            .keys()
+            .find_map(|id| self.labels.get(id).copied())
+            .unwrap_or(State::Inbox)
+    }
+
+    /// The folder the message is filed in: its role-less mailbox outside
+    /// Docket, if it has one.
+    pub fn folder_of(&self, email: &Email) -> Option<String> {
+        email
+            .mailbox_ids
+            .keys()
+            .find_map(|id| self.folders.get(id).cloned())
+    }
+
+    /// True when the message sits in the Sent mailbox.
+    pub fn is_sent(&self, email: &Email) -> bool {
+        self.sent
+            .as_deref()
+            .is_some_and(|id| email.mailbox_ids.get(id) == Some(&true))
+    }
+
+    /// Folder names in the session's order, for the folders table.
+    pub fn folder_names(&self) -> Vec<String> {
+        self.folders.values().cloned().collect()
+    }
+}
+
+/// How much mail one sync brought in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Imported {
+    received: usize,
+    sent: usize,
+}
+
+/// One page of request and response; small enough to keep bodies cheap.
+const PAGE: usize = 50;
 
 /// Opens sessions: one per credential, against Fastmail unless a test
 /// points the session URL at a stub.
@@ -231,18 +470,30 @@ impl Client {
         token: &str,
         account_id: &str,
     ) -> Result<Vec<Mailbox>, JmapError> {
-        let request = serde_json::json!({
-            "using": [CORE, MAIL],
-            "methodCalls": [[
+        let args = self
+            .call(
+                &session.api_url,
+                token,
                 "Mailbox/get",
-                {"accountId": account_id, "ids": null,
-                 "properties": ["id", "name", "role", "myRights"]},
-                "0",
-            ]],
-        });
+                json!({"accountId": account_id, "ids": null,
+                       "properties": ["id", "name", "role", "myRights"]}),
+            )
+            .await?;
+        parse_list("Mailbox/get", args)
+    }
+
+    /// Posts one method call and returns the paired response's arguments.
+    async fn call(
+        &self,
+        api_url: &str,
+        token: &str,
+        method: &'static str,
+        args: Value,
+    ) -> Result<Value, JmapError> {
+        let request = json!({"using": [CORE, MAIL], "methodCalls": [[method, args, "0"]]});
         let body = self
             .http
-            .post(&session.api_url)
+            .post(api_url)
             .bearer_auth(token)
             .json(&request)
             .send()
@@ -250,13 +501,39 @@ impl Client {
             .error_for_status()?
             .text()
             .await?;
-        parse_mailboxes(&body)
+        parse_reply(method, &body)
     }
 
-    /// Opens the credential's session and records its account in the
-    /// store, with the rights the server reports: [`Import::account`] is
-    /// the seam, and its upsert makes this the refresh path too — rights
-    /// are re-read every time a session opens.
+    /// The named emails, with bodies.
+    async fn emails(
+        &self,
+        api_url: &str,
+        token: &str,
+        account_id: &str,
+        ids: &[String],
+    ) -> Result<Vec<Email>, JmapError> {
+        let args = self
+            .call(
+                api_url,
+                token,
+                "Email/get",
+                json!({"accountId": account_id, "ids": ids,
+                    "properties": ["id", "threadId", "messageId", "mailboxIds",
+                        "receivedAt", "sentAt", "subject", "from", "to", "cc", "bcc",
+                        "preview"],
+                    "fetchData": {"bodyProperties": ["partId", "type"],
+                        "bodyValues": ["text/plain"], "textBody": true}}),
+            )
+            .await?;
+        parse_list("Email/get", args)
+    }
+
+    /// Opens the credential's session, records its account, and imports
+    /// its mail. What the server permits is the policy (ADR 1), and
+    /// [`Import::account`] is the seam; the upserts underneath make this
+    /// the refresh path too — rights and the mail cache re-read every
+    /// time a session opens, while Docket-owned values (state,
+    /// assignees, reads) keep whatever they already hold.
     ///
     /// [`Import::account`]: crate::store::Import::account
     pub async fn sync_account(&self, credential: &Credential, store: &Store) -> Result<(), Error> {
@@ -265,15 +542,10 @@ impl Client {
         let (id, account) = session.mail_account(&credential.name)?;
         let rights = account.rights();
         let mailboxes = self.mailboxes(&session, &token, id).await?;
+        let layout = Layout::of(&mailboxes);
+        let users = store.users()?;
+        let folders = layout.folder_names();
         let mailbox_count = mailboxes.len();
-        tracing::info!(
-            credential = %credential.name,
-            account = %id,
-            read_only = rights.read_only,
-            send = rights.send,
-            mailboxes = mailbox_count,
-            "session opened",
-        );
         store.import(|tx| {
             tx.account(&Account {
                 slug: credential.name.clone(),
@@ -282,8 +554,126 @@ impl Client {
                 // 2026-10-03).
                 address: id.to_owned(),
                 read_only: rights.read_only,
-            })
-        })
+            })?;
+            for folder in &folders {
+                tx.folder(folder)?;
+            }
+            Ok(())
+        })?;
+        let imported = self
+            .import_mail(
+                &session,
+                &token,
+                id,
+                &credential.name,
+                &layout,
+                &users,
+                store,
+            )
+            .await?;
+        tracing::info!(
+            credential = %credential.name,
+            account = %id,
+            read_only = rights.read_only,
+            send = rights.send,
+            mailboxes = mailbox_count,
+            received = imported.received,
+            sent = imported.sent,
+            "session opened",
+        );
+        Ok(())
+    }
+
+    /// The account's Inbox mail plus our sent replies in its threads:
+    /// received messages land in Inbox — or the state their `Docket/`
+    /// label already carries — unassigned; sent ones carry a login when
+    /// the From address names one of us, else the shared identity.
+    /// Filed and archived mail stays out until adoption (task qwt)
+    /// watches for it.
+    #[allow(clippy::too_many_arguments)]
+    async fn import_mail(
+        &self,
+        session: &Session,
+        token: &str,
+        account_id: &str,
+        slug: &str,
+        layout: &Layout,
+        users: &[User],
+        store: &Store,
+    ) -> Result<Imported, Error> {
+        let mut imported = Imported::default();
+        let Some(inbox) = layout.inbox.clone() else {
+            return Ok(imported);
+        };
+        // The Inbox pass drives everything: its threads decide which
+        // sent replies belong.
+        let mut threads = BTreeSet::new();
+        let mut known = BTreeSet::new();
+        let mut position = 0usize;
+        loop {
+            let args = self
+                .call(
+                    &session.api_url,
+                    token,
+                    "Email/query",
+                    json!({"accountId": account_id,
+                        "filter": {"inMailbox": inbox},
+                        "sort": ["receivedAt desc"],
+                        "position": position, "limit": PAGE}),
+                )
+                .await?;
+            let page = parse_query(args)?;
+            let n = page.ids.len();
+            if n == 0 {
+                break;
+            }
+            for email in self
+                .emails(&session.api_url, token, account_id, &page.ids)
+                .await?
+            {
+                known.insert(email.id.clone());
+                threads.insert(email.thread_id.clone());
+                if let Some(mail) = incoming(&email, layout, users) {
+                    store.import(|tx| tx.incoming(slug, &mail))?;
+                    imported.received = imported.received.saturating_add(1);
+                }
+            }
+            position = position.saturating_add(n);
+        }
+
+        // Threads bring their sent replies with them: Thread/get lists
+        // every email in each, and the Sent-mailbox ones import. Reply
+        // volume stays bounded by the threads the Inbox pass pulled.
+        let mut wanted = Vec::new();
+        let thread_ids: Vec<String> = threads.into_iter().collect();
+        for chunk in thread_ids.chunks(PAGE) {
+            let args = self
+                .call(
+                    &session.api_url,
+                    token,
+                    "Thread/get",
+                    json!({"accountId": account_id, "ids": chunk,
+                        "properties": ["id", "emails"]}),
+                )
+                .await?;
+            for thread in parse_list::<ThreadEmails>("Thread/get", args)? {
+                wanted.extend(thread.emails.into_iter().filter(|id| !known.contains(id)));
+            }
+        }
+        for chunk in wanted.chunks(PAGE) {
+            for email in self
+                .emails(&session.api_url, token, account_id, chunk)
+                .await?
+            {
+                if layout.is_sent(&email)
+                    && let Some(mail) = incoming(&email, layout, users)
+                {
+                    store.import(|tx| tx.incoming(slug, &mail))?;
+                    imported.sent = imported.sent.saturating_add(1);
+                }
+            }
+        }
+        Ok(imported)
     }
 }
 
@@ -530,7 +920,8 @@ mod tests {
             ]],
         })
         .to_string();
-        let mailboxes = parse_mailboxes(&reply).unwrap();
+        let args = parse_reply("Mailbox/get", &reply).unwrap();
+        let mailboxes = parse_list::<Mailbox>("Mailbox/get", args).unwrap();
         let names: Vec<_> = mailboxes.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["Inbox", "Receipts", "Scheduled"]);
         assert_eq!(mailboxes.first().unwrap().role.as_deref(), Some("inbox"));
@@ -539,6 +930,13 @@ mod tests {
         assert!(scheduled.my_rights.may_read_items);
         assert!(!scheduled.my_rights.may_add_items);
         assert!(!scheduled.my_rights.may_submit);
+    }
+
+    #[test]
+    fn a_list_that_wont_parse_fails_its_method() {
+        let args = json!({"accountId": "a", "list": [{"id": 3}]});
+        let err = parse_list::<Mailbox>("Mailbox/get", args).unwrap_err();
+        assert!(err.to_string().contains("malformed Mailbox/get"), "{err}");
     }
 
     #[test]
@@ -551,7 +949,7 @@ mod tests {
             ]],
         })
         .to_string();
-        let err = parse_mailboxes(&reply).unwrap_err();
+        let err = parse_reply("Mailbox/get", &reply).unwrap_err();
         let text = err.to_string();
         assert!(text.contains("Mailbox/get"), "{text}");
         assert!(text.contains("serverFail: boom"), "{text}");
@@ -561,7 +959,7 @@ mod tests {
         })
         .to_string();
         assert!(
-            parse_mailboxes(&undescribed)
+            parse_reply("Mailbox/get", &undescribed)
                 .unwrap_err()
                 .to_string()
                 .contains("serverFail")
@@ -572,7 +970,7 @@ mod tests {
     fn a_reply_that_is_not_the_method_asked_for_fails() {
         let wrong = json!({"methodResponses": [["Email/get", {"list": []}, "0"]]}).to_string();
         assert!(
-            parse_mailboxes(&wrong)
+            parse_reply("Mailbox/get", &wrong)
                 .unwrap_err()
                 .to_string()
                 .contains("unexpected response")
@@ -586,7 +984,7 @@ mod tests {
         })
         .to_string();
         assert!(
-            parse_mailboxes(&doubled)
+            parse_reply("Mailbox/get", &doubled)
                 .unwrap_err()
                 .to_string()
                 .contains("more than one methodResponse")
@@ -596,8 +994,177 @@ mod tests {
     #[test]
     fn malformed_replies_fail_to_parse() {
         assert!(Session::parse("{").is_err());
-        assert!(parse_mailboxes("[]").is_err());
-        assert!(parse_mailboxes(r#"{"methodResponses": []}"#).is_err());
+        assert!(parse_reply("Mailbox/get", "[]").is_err());
+        assert!(parse_reply("Mailbox/get", r#"{"methodResponses": []}"#).is_err());
+    }
+
+    /// The mailbox set a household account carries: system boxes by role,
+    /// `Docket/` labels by name, everything role-less as folders.
+    fn mailboxes() -> Vec<Mailbox> {
+        let full = rights(true, true, true, true, true, true, true, true);
+        [
+            ("M-in", "Inbox", Some("inbox")),
+            ("M-sent", "Sent", Some("sent")),
+            ("M-archive", "Archive", Some("archive")),
+            ("M-do", "Docket/Do", None),
+            ("M-watch", "Docket/Watch", None),
+            ("M-receipts", "Receipts", None),
+            ("M-school", "School", None),
+        ]
+        .into_iter()
+        .map(|(id, name, role)| {
+            serde_json::from_value::<Mailbox>(mailbox(id, name, role, full.clone())).unwrap()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn layout_sorts_mailboxes_into_roles_labels_and_folders() {
+        let layout = Layout::of(&mailboxes());
+        assert_eq!(layout.inbox.as_deref(), Some("M-in"));
+        assert_eq!(layout.sent.as_deref(), Some("M-sent"));
+        assert_eq!(
+            layout.folder_names(),
+            ["Receipts", "School"].map(String::from)
+        );
+
+        // A label nested under a `Docket` parent classifies the same as
+        // a prefixed name.
+        let nested = serde_json::from_value::<Mailbox>(mailbox(
+            "M-parent",
+            "Docket",
+            None,
+            rights(true, true, true, true, true, true, true, true),
+        ))
+        .unwrap();
+        let mut all = mailboxes();
+        all.insert(0, nested);
+        assert_eq!(
+            Layout::of(&all).folder_names(),
+            ["Receipts", "School"].map(String::from)
+        );
+    }
+
+    /// An Email with the given mailbox memberships.
+    fn email(mailboxes: &[(&str, bool)]) -> Email {
+        let json = json!({
+            "id": "E1",
+            "threadId": "T1",
+            "messageId": "msg-1@chislan.family",
+            "mailboxIds": BTreeMap::from_iter(
+                mailboxes.iter().map(|(id, member)| (id.to_string(), json!(member)))
+            ),
+            "receivedAt": "2026-10-02T04:06:46Z",
+            "sentAt": "2026-10-02T04:06:40Z",
+            "from": [{"name": "Lincoln High School", "email": "office@lincolnhigh.org"}],
+            "to": [{"email": "household@example.com"}],
+            "cc": [],
+            "bcc": [],
+            "subject": "Field trip",
+            "preview": "A schedule update…",
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn an_emails_state_comes_from_its_docket_label() {
+        let layout = Layout::of(&mailboxes());
+        let plain = email(&[("M-in", true)]);
+        assert_eq!(layout.state_of(&plain), State::Inbox);
+        assert_eq!(layout.folder_of(&plain), None);
+        assert!(!layout.is_sent(&plain));
+
+        let labeled = email(&[("M-in", true), ("M-watch", true)]);
+        assert_eq!(layout.state_of(&labeled), State::Watch);
+
+        let filed = email(&[("M-in", true), ("M-receipts", true)]);
+        assert_eq!(layout.state_of(&filed), State::Inbox);
+        assert_eq!(layout.folder_of(&filed).as_deref(), Some("Receipts"));
+
+        let mine = email(&[("M-sent", true)]);
+        assert!(layout.is_sent(&mine));
+    }
+
+    #[test]
+    fn the_body_is_the_first_plain_text_part() {
+        let mut mail = email(&[("M-in", true)]);
+        mail.text_body = Some(vec![BodyPart {
+            part_id: "p1".into(),
+            media_type: "text/plain; charset=utf-8".into(),
+        }]);
+        mail.body_values = Some(BTreeMap::from([(
+            "p1".to_string(),
+            BodyValue {
+                value: "Buses return at 4:15.".into(),
+            },
+        )]));
+        assert_eq!(body_of(&mail), "Buses return at 4:15.");
+
+        // HTML-only mail falls back to the preview.
+        mail.text_body = Some(vec![BodyPart {
+            part_id: "p1".into(),
+            media_type: "text/html".into(),
+        }]);
+        assert_eq!(body_of(&mail), "A schedule update…");
+
+        // A plain part with no fetched body value also falls through.
+        mail.text_body = Some(vec![
+            BodyPart {
+                part_id: "missing".into(),
+                media_type: "text/plain".into(),
+            },
+            BodyPart {
+                part_id: "p1".into(),
+                media_type: "text/plain".into(),
+            },
+        ]);
+        assert_eq!(body_of(&mail), "Buses return at 4:15.");
+    }
+
+    #[test]
+    fn a_query_page_that_wont_parse_fails() {
+        let err = parse_query(json!({"ids": 3})).unwrap_err();
+        assert!(err.to_string().contains("malformed Email/query"), "{err}");
+    }
+
+    #[test]
+    fn incoming_mail_carries_its_derived_values() {
+        let layout = Layout::of(&mailboxes());
+        let users = [User::new("sam@example.com", "Sam")];
+
+        let mut school = email(&[("M-in", true)]);
+        school.subject = None;
+        let mail = incoming(&school, &layout, &users).unwrap();
+        assert_eq!(mail.subject, "(no subject)");
+        assert_eq!(mail.at.to_string(), "2026-10-02T04:06:46");
+        assert!(matches!(&mail.kind,
+            IncomingKind::Received { from, addr, state, folder }
+            if from == "Lincoln High School" && addr == "office@lincolnhigh.org"
+                && *state == State::Inbox && folder.is_none()));
+
+        // A sent reply attributes by From address; the shared identity
+        // matches no login.
+        let mut mine = email(&[("M-sent", true)]);
+        mine.from = vec![EmailAddress {
+            name: Some("Sam".into()),
+            email: "sam@example.com".into(),
+        }];
+        assert!(matches!(&incoming(&mine, &layout, &users).unwrap().kind,
+            IncomingKind::Sent { by, to }
+            if by.as_deref() == Some("sam@example.com")
+                && to == &["household@example.com".to_string()]));
+
+        mine.from = vec![EmailAddress {
+            name: None,
+            email: "household@example.com".into(),
+        }];
+        assert!(matches!(&incoming(&mine, &layout, &users).unwrap().kind,
+            IncomingKind::Sent { by, .. } if by.is_none()));
+
+        // Nothing to show for a senderless oddity.
+        let mut odd = email(&[("M-in", true)]);
+        odd.from = Vec::new();
+        assert!(incoming(&odd, &layout, &users).is_none());
     }
 
     #[test]
