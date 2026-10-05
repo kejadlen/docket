@@ -757,7 +757,7 @@ impl Client {
                     "Email/query",
                     json!({"accountId": account_id,
                         "filter": {"inMailbox": inbox},
-                        "sort": ["receivedAt desc"],
+                        "sort": [{"property": "receivedAt", "isAscending": false}],
                         "position": position, "limit": PAGE}),
                 )
                 .await?;
