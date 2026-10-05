@@ -292,11 +292,11 @@ fn emails_of(account: &str) -> Vec<Value> {
 fn threads_of(account: &str) -> Vec<Value> {
     match account {
         HOUSEHOLD => vec![
-            json!({"id": "T-roofer", "emails": ["E-roofer1", "E-roofer2", "E-reply1"]}),
-            json!({"id": "T-school", "emails": ["E-school", "E-reply2", "E-draft"]}),
-            json!({"id": "T-ancient", "emails": ["E-reply3"]}),
+            json!({"id": "T-roofer", "emailIds": ["E-roofer1", "E-roofer2", "E-reply1"]}),
+            json!({"id": "T-school", "emailIds": ["E-school", "E-reply2", "E-draft"]}),
+            json!({"id": "T-ancient", "emailIds": ["E-reply3"]}),
         ],
-        ELI => vec![json!({"id": "T-practice", "emails": ["E-practice"]})],
+        ELI => vec![json!({"id": "T-practice", "emailIds": ["E-practice"]})],
         _ => Vec::new(),
     }
 }
@@ -540,6 +540,16 @@ async fn api(world: axum::extract::State<World>, headers: HeaderMap, body: Strin
                        .collect::<Vec<_>>()})
         }
         "Thread/get" => {
+            // A Thread's only properties are id and emailIds (RFC 8621
+            // §3); servers answer anything else with invalidArguments.
+            if let Some(properties) = args["properties"].as_array() {
+                for property in properties {
+                    assert!(
+                        matches!(property.as_str(), Some("id") | Some("emailIds")),
+                        "unknown Thread property {property}"
+                    );
+                }
+            }
             let wanted: Vec<&str> = args["ids"]
                 .as_array()
                 .map(|ids| ids.iter().filter_map(Value::as_str).collect())

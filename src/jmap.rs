@@ -177,7 +177,7 @@ struct Query {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadEmails {
-    emails: Vec<String>,
+    email_ids: Vec<String>,
 }
 
 /// Pulls one page of ids out of an `Email/query` response.
@@ -678,10 +678,10 @@ struct GetThreads<'a> {
 #[serde(rename_all = "camelCase")]
 enum ThreadProperty {
     Id,
-    Emails,
+    EmailIds,
 }
 
-const THREAD_PROPERTIES: &[ThreadProperty] = &[ThreadProperty::Id, ThreadProperty::Emails];
+const THREAD_PROPERTIES: &[ThreadProperty] = &[ThreadProperty::Id, ThreadProperty::EmailIds];
 
 /// `Foo/changes` arguments (RFC 8620 §5.2).
 #[derive(Debug, Serialize)]
@@ -1002,7 +1002,12 @@ impl Client {
                 )
                 .await?;
             for thread in parse_list::<ThreadEmails>("Thread/get", args)? {
-                wanted.extend(thread.emails.into_iter().filter(|id| !known.contains(id)));
+                wanted.extend(
+                    thread
+                        .email_ids
+                        .into_iter()
+                        .filter(|id| !known.contains(id)),
+                );
             }
         }
         for chunk in wanted.chunks(PAGE) {
@@ -1334,7 +1339,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             threads,
-            json!({"accountId": "a", "ids": ["t1"], "properties": ["id", "emails"]})
+            json!({"accountId": "a", "ids": ["t1"], "properties": ["id", "emailIds"]})
         );
 
         let changes = serde_json::to_value(GetChanges {
