@@ -142,7 +142,7 @@ fn email_json(
     let mut mail = json!({
         "id": id,
         "threadId": thread,
-        "messageId": format!("{id}@chislan.family"),
+        "messageId": [format!("{id}@chislan.family")],
         "mailboxIds": mailbox_ids(in_mailboxes),
         "receivedAt": "2026-10-02T12:00:00Z",
         "sentAt": "2026-10-02T11:00:00Z",
@@ -192,16 +192,24 @@ fn emails_of(account: &str) -> Vec<Value> {
                 Some("Revised estimate: $2,120."),
                 "Revised estimate",
             ),
-            email_json(
-                "E-school",
-                "T-school",
-                ("Lincoln High School", "office@lincolnhigh.org"),
-                "household",
-                &["MB-in", "MB-watch", "MB-school"],
-                "Field trip",
-                None,
-                "Buses now return at 4:15.",
-            ),
+            // Real servers answer null for absent headers (RFC 8621
+            // §4.1): this one has no Cc, Bcc, or Message-Id.
+            {
+                let mut school = email_json(
+                    "E-school",
+                    "T-school",
+                    ("Lincoln High School", "office@lincolnhigh.org"),
+                    "household",
+                    &["MB-in", "MB-watch", "MB-school"],
+                    "Field trip",
+                    None,
+                    "Buses now return at 4:15.",
+                );
+                school["cc"] = Value::Null;
+                school["bcc"] = Value::Null;
+                school["messageId"] = Value::Null;
+                school
+            },
             email_json(
                 "E-reply1",
                 "T-roofer",
@@ -212,16 +220,22 @@ fn emails_of(account: &str) -> Vec<Value> {
                 Some("Does this include the downspout?"),
                 "Does this include",
             ),
-            email_json(
-                "E-reply2",
-                "T-school",
-                ("Household", HOUSEHOLD),
-                "office@lincolnhigh.org",
-                &["MB-sent"],
-                "Re: Field trip",
-                Some("Eli has pickup that day."),
-                "Eli has pickup",
-            ),
+            // Sent mail with no Date header: sentAt comes back null
+            // and falls back to receivedAt.
+            {
+                let mut reply2 = email_json(
+                    "E-reply2",
+                    "T-school",
+                    ("Household", HOUSEHOLD),
+                    "office@lincolnhigh.org",
+                    &["MB-sent"],
+                    "Re: Field trip",
+                    Some("Eli has pickup that day."),
+                    "Eli has pickup",
+                );
+                reply2["sentAt"] = Value::Null;
+                reply2
+            },
             email_json(
                 "E-reply3",
                 "T-ancient",
@@ -244,7 +258,7 @@ fn emails_of(account: &str) -> Vec<Value> {
                     None,
                     "",
                 );
-                noise["from"] = json!([]);
+                noise["from"] = Value::Null;
                 noise
             },
             // A draft in an Inbox thread: fetched with the thread, kept
@@ -648,7 +662,11 @@ async fn each_credential_opens_a_session_and_imports_its_mail() {
     assert!(roofer1.values().unwrap().assignees.is_empty());
     assert_eq!(roofer1.body, "Estimate attached: $1,840.");
     assert_eq!(by_id("E-roofer2").values().unwrap().state, State::Do);
-    let school = by_id("E-school");
+    // Its Message-Id is null in the fixture, so find it by body.
+    let school = all
+        .iter()
+        .find(|m| m.body == "Buses now return at 4:15.")
+        .unwrap_or_else(|| panic!("missing school"));
     assert_eq!(school.values().unwrap().state, State::Watch);
     assert_eq!(school.values().unwrap().folder.as_deref(), Some("School"));
     // HTML-only mail keeps the preview as its body.
@@ -872,7 +890,8 @@ async fn destroyed_mail_stays_cached() {
     assert_eq!(counts.destroyed, 1, "{counts:?}");
     assert_eq!(counts.imported, 0, "{counts:?}");
     assert!(!counts.is_quiet());
-    assert!(the(&store, "E-school@chislan.family").is_some());
+    // School's Message-Id is null in the fixture, so it files under "".
+    assert!(the(&store, "").is_some());
 }
 
 #[tokio::test]
@@ -891,7 +910,7 @@ async fn a_reimported_message_matches_by_message_id() {
         Some("Estimate attached: $1,840."),
         "Estimate attached",
     );
-    again["messageId"] = json!("E-roofer1@chislan.family");
+    again["messageId"] = json!(["E-roofer1@chislan.family"]);
     world.lock().unwrap().add_email(HOUSEHOLD, again);
 
     let counts = client

@@ -61,6 +61,9 @@ pub enum JmapError {
 
     #[error("credential {credential:?} offers no mail account in its session")]
     NoMailAccount { credential: String },
+
+    #[error("the token was rejected (401): wrong or revoked for this account")]
+    Unauthorized,
 }
 
 /// A token's session, as the server reports it (RFC 8620 §3). Only what
@@ -312,17 +315,21 @@ struct BodyValue {
 struct Email {
     pub id: String,
     thread_id: String,
-    /// The Message-ID header, without angle brackets.
-    pub message_id: String,
+    /// The Message-ID headers, without angle brackets (RFC 8621 §4.1:
+    /// `String[]|null` — absent or repeated headers).
+    pub message_id: Option<Vec<String>>,
     pub mailbox_ids: BTreeMap<String, bool>,
     pub received_at: Timestamp,
-    pub sent_at: Timestamp,
+    /// `Date|null`: mail can carry no Date header, so it falls back to
+    /// receivedAt at the call site.
+    pub sent_at: Option<Timestamp>,
     pub subject: Option<String>,
     pub preview: Option<String>,
-    pub from: Vec<EmailAddress>,
-    pub to: Vec<EmailAddress>,
-    pub cc: Vec<EmailAddress>,
-    pub bcc: Vec<EmailAddress>,
+    /// All null when the header is absent (RFC 8621 §4.1).
+    pub from: Option<Vec<EmailAddress>>,
+    pub to: Option<Vec<EmailAddress>>,
+    pub cc: Option<Vec<EmailAddress>>,
+    pub bcc: Option<Vec<EmailAddress>>,
     pub text_body: Option<Vec<BodyPart>>,
     pub body_values: Option<BTreeMap<String, BodyValue>>,
 }
@@ -348,21 +355,24 @@ fn body_of(email: &Email) -> String {
 fn incoming(email: &Email, layout: &Layout, users: &[User]) -> Option<Incoming> {
     let civil = |at: &Timestamp| at.to_zoned(jiff::tz::TimeZone::UTC).datetime();
     let names = |xs: &[EmailAddress]| xs.iter().map(EmailAddress::display).collect::<Vec<_>>();
+    fn empty(xs: &Option<Vec<EmailAddress>>) -> &[EmailAddress] {
+        xs.as_deref().unwrap_or_default()
+    }
     let sent = layout.is_sent(email);
     let kind = if sent {
         IncomingKind::Sent {
             // Attribution by From address; the shared identity matches
             // no login and stays None.
-            by: email.from.iter().find_map(|a| {
+            by: empty(&email.from).iter().find_map(|a| {
                 users
                     .iter()
                     .find(|u| u.login == a.email)
                     .map(|u| u.login.clone())
             }),
-            to: names(&email.to),
+            to: names(empty(&email.to)),
         }
     } else {
-        let from = email.from.first()?;
+        let from = empty(&email.from).first()?;
         IncomingKind::Received {
             from: from.display(),
             addr: from.email.clone(),
@@ -372,19 +382,24 @@ fn incoming(email: &Email, layout: &Layout, users: &[User]) -> Option<Incoming> 
     };
     Some(Incoming {
         jmap_id: email.id.clone(),
-        message_id: email.message_id.clone(),
+        message_id: email
+            .message_id
+            .as_deref()
+            .and_then(|ids| ids.first())
+            .cloned()
+            .unwrap_or_default(),
         jmap_thread_id: email.thread_id.clone(),
         subject: email
             .subject
             .clone()
             .unwrap_or_else(|| "(no subject)".into()),
         at: civil(if sent {
-            &email.sent_at
+            email.sent_at.as_ref().unwrap_or(&email.received_at)
         } else {
             &email.received_at
         }),
-        cc: names(&email.cc),
-        bcc: names(&email.bcc),
+        cc: names(empty(&email.cc)),
+        bcc: names(empty(&email.bcc)),
         body: body_of(email),
         kind,
     })
@@ -703,15 +718,16 @@ impl Client {
     }
 
     async fn session(&self, token: &str) -> Result<Session, JmapError> {
-        let body = self
+        let response = self
             .http
             .get(&self.session_url)
             .bearer_auth(token)
             .send()
-            .await?
-            .error_for_status()?
-            .text()
             .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(JmapError::Unauthorized);
+        }
+        let body = response.error_for_status()?.text().await?;
         Session::parse(&body)
     }
 
@@ -1581,7 +1597,7 @@ mod tests {
         let json = json!({
             "id": "E1",
             "threadId": "T1",
-            "messageId": "msg-1@chislan.family",
+            "messageId": ["msg-1@chislan.family"],
             "mailboxIds": BTreeMap::from_iter(
                 mailboxes.iter().map(|(id, member)| (id.to_string(), json!(member)))
             ),
@@ -1739,25 +1755,25 @@ mod tests {
         // A sent reply attributes by From address; the shared identity
         // matches no login.
         let mut mine = email(&[("M-sent", true)]);
-        mine.from = vec![EmailAddress {
+        mine.from = Some(vec![EmailAddress {
             name: Some("Sam".into()),
             email: "sam@example.com".into(),
-        }];
+        }]);
         assert!(matches!(&incoming(&mine, &layout, &users).unwrap().kind,
             IncomingKind::Sent { by, to }
             if by.as_deref() == Some("sam@example.com")
                 && to == &["household@example.com".to_string()]));
 
-        mine.from = vec![EmailAddress {
+        mine.from = Some(vec![EmailAddress {
             name: None,
             email: "household@example.com".into(),
-        }];
+        }]);
         assert!(matches!(&incoming(&mine, &layout, &users).unwrap().kind,
             IncomingKind::Sent { by, .. } if by.is_none()));
 
         // Nothing to show for a senderless oddity.
         let mut odd = email(&[("M-in", true)]);
-        odd.from = Vec::new();
+        odd.from = None;
         assert!(incoming(&odd, &layout, &users).is_none());
     }
 
