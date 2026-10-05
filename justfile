@@ -16,7 +16,7 @@ coverage:
 # one poll. Read-only; the token is read from 1Password, so `op` must
 # be installed and signed in.
 smoke:
-	cargo test --test smoke -- --ignored --nocapture
+	cargo test --test smoke -- --ignored
 
 mutants:
     #!/usr/bin/env bash

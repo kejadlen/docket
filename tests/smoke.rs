@@ -62,12 +62,7 @@ fn the_session_open_chain_runs_against_fastmail() -> Result<(), Box<dyn std::err
     tokio::runtime::Runtime::new()?.block_on(async {
         let client = Client::fastmail()?;
         let mut sync = client.sync_account(&credential, &store).await?;
-        println!(
-            "session opened: email state {}, mailbox state {}",
-            sync.email_state, sync.mailbox_state
-        );
-        let counts = client.poll_once(&credential, &mut sync, &store).await?;
-        println!("poll: {counts:?}");
+        client.poll_once(&credential, &mut sync, &store).await?;
         Ok(())
     })
 }
