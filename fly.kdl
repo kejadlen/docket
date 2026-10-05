@@ -8,4 +8,4 @@
 // replaces, so each deploy starts from the fixtures again.
 bind "0.0.0.0:3000"
 database "/tmp/docket.db"
-log "info"
+log info

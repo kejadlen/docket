@@ -215,11 +215,14 @@ mod tests {
 
     #[test]
     fn log_takes_a_level_with_target_overrides() {
-        let config = parse(r#"log "debug" hyper="warn""#).unwrap();
-        let expected = Targets::new()
-            .with_default(LevelFilter::DEBUG)
-            .with_target("hyper", LevelFilter::WARN);
-        assert_eq!(config.log, expected);
+        // Levels and targets parse bare; quoting them stays legal.
+        for source in [r#"log "debug" hyper="warn""#, "log debug hyper=warn"] {
+            let config = parse(source).unwrap();
+            let expected = Targets::new()
+                .with_default(LevelFilter::DEBUG)
+                .with_target("hyper", LevelFilter::WARN);
+            assert_eq!(config.log, expected);
+        }
     }
 
     #[test]
