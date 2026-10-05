@@ -12,6 +12,12 @@ clippy:
 coverage:
     ./bin/coverage
 
+# The deploy path against real Fastmail: session open, full import,
+# one poll. Read-only; set DOCKET_SMOKE_TOKEN_FILE to a Fastmail
+# token file first.
+smoke:
+	cargo test --test smoke -- --ignored --nocapture
+
 mutants:
     #!/usr/bin/env bash
     set -uo pipefail
