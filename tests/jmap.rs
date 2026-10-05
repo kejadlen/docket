@@ -482,15 +482,48 @@ async fn api(world: axum::extract::State<World>, headers: HeaderMap, body: Strin
                    "total": ids.len()})
         }
         "Email/get" => {
+            // Servers answer arguments outside the /get and body-
+            // fetching set (RFC 8621 §4.2) with invalidArguments.
+            let known = [
+                "accountId",
+                "ids",
+                "properties",
+                "#returnState",
+                "bodyProperties",
+                "fetchTextBodyValues",
+                "fetchHTMLBodyValues",
+                "fetchAllBodyValues",
+                "maxBodyValueBytes",
+            ];
+            for key in args.as_object().unwrap().keys() {
+                assert!(
+                    known.contains(&key.as_str()),
+                    "Email/get got unknown argument {key}"
+                );
+            }
             let wanted: Vec<&str> = args["ids"]
                 .as_array()
                 .map(|ids| ids.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            // Like a real server, only requested properties come back.
+            let properties: Vec<&str> = args["properties"]
+                .as_array()
+                .map(|ps| ps.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
             json!({"accountId": account, "state": mail.email_states.last().unwrap().0,
                    "notFound": [],
                    "list": mail.emails.iter()
                        .filter(|e| wanted.contains(&e["id"].as_str().expect("an id")))
-                       .cloned().collect::<Vec<_>>()})
+                       .map(|e| {
+                           let mut filtered = json!({});
+                           for property in &properties {
+                               if let Some(value) = e.get(*property) {
+                                   filtered[*property] = value.clone();
+                               }
+                           }
+                           filtered
+                       })
+                       .collect::<Vec<_>>()})
         }
         "Thread/get" => {
             let wanted: Vec<&str> = args["ids"]

@@ -620,9 +620,9 @@ impl Client {
                 json!({"accountId": account_id, "ids": ids,
                     "properties": ["id", "threadId", "messageId", "mailboxIds",
                         "receivedAt", "sentAt", "subject", "from", "to", "cc", "bcc",
-                        "preview"],
-                    "fetchData": {"bodyProperties": ["partId", "type"],
-                        "bodyValues": ["text/plain"], "textBody": true}}),
+                        "preview", "textBody", "bodyValues"],
+                    "bodyProperties": ["partId", "type"],
+                    "fetchTextBodyValues": true}),
             )
             .await?;
         parse_stateful_list("Email/get", args)
