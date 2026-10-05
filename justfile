@@ -13,8 +13,8 @@ coverage:
     ./bin/coverage
 
 # The deploy path against real Fastmail: session open, full import,
-# one poll. Read-only; set DOCKET_SMOKE_TOKEN_FILE to a Fastmail
-# token file first.
+# one poll. Read-only; the token is read from 1Password, so `op` must
+# be installed and signed in.
 smoke:
 	cargo test --test smoke -- --ignored --nocapture
 
