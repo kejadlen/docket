@@ -6,8 +6,10 @@ Watch, or Done), a folder, and assignees, so it's clear what needs doing
 and who's on it. The mail server stays the source of truth for mail, and
 normal mail clients keep working alongside Docket.
 
-Docket is early. JMAP sync isn't built yet, so the app runs against
-sample fixture data. A demo built from `main` runs at
+Docket is early. It imports Inbox mail from Fastmail over JMAP and polls
+for changes every 30 seconds, but it doesn't write anything back to the
+mail server yet, so states, folders, and assignees live only in Docket's
+database. A demo built from `main` runs on sample fixture data at
 <https://docket.demo.kejadlen.dev>. See [docs/DESIGN.md](docs/DESIGN.md)
 for the model and the plan.
 
@@ -34,12 +36,19 @@ from the file named by `--config` or `DOCKET_CONFIG`:
 ```kdl
 bind "127.0.0.1:3000"
 database "docket.db"
+credential "household" token-file="/run/credentials/docket/household"
 ```
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `bind` | `127.0.0.1:3000` | Address to listen on. |
 | `database` | `docket.db` | SQLite database file, created if missing. |
+| `credential` | None | A Fastmail API token to sync mail with. Repeat it once per login. |
+
+Each `credential` takes a name, which becomes the account's slug, and a
+`token-file` holding the token, which keeps the token out of the config.
+Docket opens a JMAP session for every credential at startup and exits if
+any of them fails. With no credentials, it syncs no mail.
 
 ## Deploy it
 
