@@ -463,8 +463,10 @@ async fn api(world: axum::extract::State<World>, headers: HeaderMap, body: Strin
             // A sort entry is a Comparator object (RFC 8620 §5.5);
             // servers answer a string one with invalidArguments.
             if let Some(sort) = args["sort"].as_array() {
-                assert!(sort.iter().all(Value::is_object),
-                    "sort entries must be Comparator objects");
+                assert!(
+                    sort.iter().all(Value::is_object),
+                    "sort entries must be Comparator objects"
+                );
             }
             let inbox = args["filter"]["inMailbox"].as_str().expect("an inMailbox");
             let position = args["position"].as_u64().unwrap_or_default() as usize;
