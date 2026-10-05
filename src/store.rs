@@ -5,7 +5,7 @@
 //! memory.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use camino::Utf8Path;
 use jiff::civil::DateTime;
@@ -77,11 +77,11 @@ impl Clock {
 
 /// One connection behind a mutex: two people's clicks never contend long
 /// enough to need a pool, and no lock is held across an await.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Store {
     /// The clock events and comments are stamped with.
     clock: Clock,
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 #[derive(Debug)]
@@ -110,11 +110,11 @@ impl Store {
         migrate(&mut conn)?;
         Ok(Self {
             clock,
-            inner: Mutex::new(Inner {
+            inner: Arc::new(Mutex::new(Inner {
                 conn,
                 undo: BTreeMap::new(),
                 flash: BTreeMap::new(),
-            }),
+            })),
         })
     }
 
@@ -191,6 +191,18 @@ impl Store {
             .query_map([], account_from_row)?
             .collect::<Result<_, _>>()?;
         Ok(accounts)
+    }
+
+    /// True when the account's thread is already imported: the poll
+    /// path admits a sent email only into a thread it knows.
+    pub fn has_thread(&self, account: &str, jmap_thread_id: &str) -> Result<bool, Error> {
+        let found = self.lock().conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM threads
+                  WHERE account = ?1 AND jmap_thread_id = ?2)",
+            params![account, jmap_thread_id],
+            |r| r.get(0),
+        )?;
+        Ok(found)
     }
 
     pub fn thread(&self, id: ThreadId) -> Result<Option<Thread>, Error> {
@@ -1127,6 +1139,30 @@ mod tests {
                 folder: folder.map(str::to_owned),
             },
         }
+    }
+
+    #[test]
+    fn has_thread_reports_whether_a_threads_imported() {
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        store
+            .import(|tx| {
+                tx.account(&Account {
+                    slug: "household".into(),
+                    name: "Household".into(),
+                    address: "household@example.com".into(),
+                    read_only: false,
+                })?;
+                tx.incoming("household", &incoming(State::Inbox, None, "Body"))
+            })
+            .unwrap();
+
+        assert!(store.has_thread("household", "T9").unwrap());
+        assert!(!store.has_thread("household", "T8").unwrap());
+        // Threads are scoped to the account.
+        assert!(!store.has_thread("eli", "T9").unwrap());
+
+        exec(&store, "ALTER TABLE threads RENAME TO gone_threads;");
+        assert!(store.has_thread("household", "T9").is_err());
     }
 
     #[test]

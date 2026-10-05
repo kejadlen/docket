@@ -3,6 +3,11 @@
 //! scope surfaces in the session as capabilities and `isReadOnly`;
 //! per-mailbox `myRights` report mailbox ACLs, so they gate per-mailbox
 //! actions like filing (task rn), never account-wide scope.
+//!
+//! Keeping up with the server is polling for now (task lylzwoyo):
+//! `poll_once` applies `Email/changes` and `Mailbox/changes` since the
+//! states the last sync left. Push replaces the timer later (task
+//! nwylszul); the changes application stays.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -50,6 +55,9 @@ pub enum JmapError {
         method: &'static str,
         detail: String,
     },
+
+    #[error("{method} cannot calculate changes since the given state")]
+    CannotCalculateChanges { method: &'static str },
 
     #[error("credential {credential:?} offers no mail account in its session")]
     NoMailAccount { credential: String },
@@ -194,9 +202,13 @@ fn parse_reply(method: &'static str, json: &str) -> Result<Value, JmapError> {
             name if name == method => Ok(args.clone()),
             "error" => {
                 let err: ApiError = serde_json::from_value(args.clone()).map_err(malformed)?;
-                Err(match err.description {
-                    Some(description) => detail(format!("{}: {description}", err.kind)),
-                    None => detail(err.kind),
+                Err(if err.kind == "cannotCalculateChanges" {
+                    JmapError::CannotCalculateChanges { method }
+                } else {
+                    match err.description {
+                        Some(description) => detail(format!("{}: {description}", err.kind)),
+                        None => detail(err.kind),
+                    }
                 })
             }
             other => Err(detail(format!("unexpected response {other:?}"))),
@@ -217,6 +229,52 @@ fn parse_list<T: DeserializeOwned>(method: &'static str, args: Value) -> Result<
             what: method,
             source,
         })
+}
+
+/// Pulls a list and its type state out of a `Foo/get` response: that
+/// `state` is the `sinceState` the next `/changes` call starts from
+/// (RFC 8620 §5.2).
+fn parse_stateful_list<T: DeserializeOwned>(
+    method: &'static str,
+    args: Value,
+) -> Result<(Vec<T>, String), JmapError> {
+    #[derive(Deserialize)]
+    struct Got<T> {
+        state: String,
+        list: Vec<T>,
+    }
+    serde_json::from_value::<Got<T>>(args)
+        .map(|got| (got.list, got.state))
+        .map_err(|source| JmapError::Malformed {
+            what: method,
+            source,
+        })
+}
+
+/// One page of a `Foo/changes` reply (RFC 8620 §5.2).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Changes {
+    has_more_changes: bool,
+    new_state: String,
+    created: Vec<String>,
+    updated: Vec<String>,
+    destroyed: Vec<String>,
+}
+
+impl Changes {
+    /// Whether anything at all moved: even a destroy must rebuild the
+    /// mailbox layout.
+    fn changed(&self) -> bool {
+        !(self.created.is_empty() && self.updated.is_empty() && self.destroyed.is_empty())
+    }
+}
+
+fn parse_changes(method: &'static str, args: Value) -> Result<Changes, JmapError> {
+    serde_json::from_value(args).map_err(|source| JmapError::Malformed {
+        what: method,
+        source,
+    })
 }
 
 /// An RFC 5322 address as JMAP parses it (RFC 8621 §4.1.4).
@@ -412,6 +470,14 @@ impl Layout {
             .is_some_and(|id| email.mailbox_ids.get(id) == Some(&true))
     }
 
+    /// True when the message sits in the Inbox mailbox: what the poll
+    /// path imports as received.
+    pub fn is_inbox(&self, email: &Email) -> bool {
+        self.inbox
+            .as_deref()
+            .is_some_and(|id| email.mailbox_ids.get(id) == Some(&true))
+    }
+
     /// Folder names in the session's order, for the folders table.
     pub fn folder_names(&self) -> Vec<String> {
         self.folders.values().cloned().collect()
@@ -425,11 +491,44 @@ struct Imported {
     sent: usize,
 }
 
+/// What the poll loop carries between cycles: the type states to call
+/// `/changes` since, and the layout mail classifies against. Held in
+/// memory — boot re-imports everything, so a restart re-derives it.
+#[derive(Debug)]
+pub struct Sync {
+    pub email_state: String,
+    pub mailbox_state: String,
+    layout: Layout,
+}
+
+/// What one poll cycle did, for the loop's log line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PollCounts {
+    /// Messages imported or refreshed.
+    pub imported: usize,
+    /// Destroyed ids seen. The rows stay cached — adopting destroys as
+    /// Done is its own task.
+    pub destroyed: usize,
+    /// Whether the layout was rebuilt off `Mailbox/changes`.
+    pub mailboxes: bool,
+    /// Whether the server disowned the stored states and a full
+    /// re-import ran instead.
+    pub resynced: bool,
+}
+
+impl PollCounts {
+    /// A cycle with nothing to show, logged at debug rather than info.
+    pub fn is_quiet(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// One page of request and response; small enough to keep bodies cheap.
 const PAGE: usize = 50;
 
 /// Opens sessions: one per credential, against Fastmail unless a test
 /// points the session URL at a stub.
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     session_url: String,
@@ -463,13 +562,13 @@ impl Client {
     }
 
     /// Every mailbox of the account, with the rights the server reports
-    /// for it.
+    /// for it, and the type state the next `/changes` starts from.
     async fn mailboxes(
         &self,
         session: &Session,
         token: &str,
         account_id: &str,
-    ) -> Result<Vec<Mailbox>, JmapError> {
+    ) -> Result<(Vec<Mailbox>, String), JmapError> {
         let args = self
             .call(
                 &session.api_url,
@@ -479,7 +578,7 @@ impl Client {
                        "properties": ["id", "name", "role", "myRights"]}),
             )
             .await?;
-        parse_list("Mailbox/get", args)
+        parse_stateful_list("Mailbox/get", args)
     }
 
     /// Posts one method call and returns the paired response's arguments.
@@ -504,14 +603,15 @@ impl Client {
         parse_reply(method, &body)
     }
 
-    /// The named emails, with bodies.
+    /// The named emails, with bodies, and the type state the next
+    /// `/changes` starts from.
     async fn emails(
         &self,
         api_url: &str,
         token: &str,
         account_id: &str,
         ids: &[String],
-    ) -> Result<Vec<Email>, JmapError> {
+    ) -> Result<(Vec<Email>, String), JmapError> {
         let args = self
             .call(
                 api_url,
@@ -525,7 +625,28 @@ impl Client {
                         "bodyValues": ["text/plain"], "textBody": true}}),
             )
             .await?;
-        parse_list("Email/get", args)
+        parse_stateful_list("Email/get", args)
+    }
+
+    /// One page of `Foo/changes` since `since_state`.
+    async fn changes(
+        &self,
+        api_url: &str,
+        token: &str,
+        account_id: &str,
+        method: &'static str,
+        since_state: &str,
+    ) -> Result<Changes, JmapError> {
+        let args = self
+            .call(
+                api_url,
+                token,
+                method,
+                json!({"accountId": account_id, "sinceState": since_state,
+                       "maxChanges": PAGE}),
+            )
+            .await?;
+        parse_changes(method, args)
     }
 
     /// Opens the credential's session, records its account, and imports
@@ -533,15 +654,20 @@ impl Client {
     /// [`Import::account`] is the seam; the upserts underneath make this
     /// the refresh path too — rights and the mail cache re-read every
     /// time a session opens, while Docket-owned values (state,
-    /// assignees, reads) keep whatever they already hold.
+    /// assignees, reads) keep whatever they already hold. Returns the
+    /// states the import left the account in, for the poll loop.
     ///
     /// [`Import::account`]: crate::store::Import::account
-    pub async fn sync_account(&self, credential: &Credential, store: &Store) -> Result<(), Error> {
+    pub async fn sync_account(
+        &self,
+        credential: &Credential,
+        store: &Store,
+    ) -> Result<Sync, Error> {
         let token = read_token(&credential.token_file)?;
         let session = self.session(&token).await?;
         let (id, account) = session.mail_account(&credential.name)?;
         let rights = account.rights();
-        let mailboxes = self.mailboxes(&session, &token, id).await?;
+        let (mailboxes, mailbox_state) = self.mailboxes(&session, &token, id).await?;
         let layout = Layout::of(&mailboxes);
         let users = store.users()?;
         let folders = layout.folder_names();
@@ -560,6 +686,7 @@ impl Client {
             }
             Ok(())
         })?;
+        let mut email_state = None;
         let imported = self
             .import_mail(
                 &session,
@@ -569,8 +696,15 @@ impl Client {
                 &layout,
                 &users,
                 store,
+                &mut email_state,
             )
             .await?;
+        // An Inbox-less account never fetched a page, so no Email/get
+        // reported a state; ask for nothing to learn one.
+        let email_state = match email_state {
+            Some(state) => state,
+            None => self.emails(&session.api_url, &token, id, &[]).await?.1,
+        };
         tracing::info!(
             credential = %credential.name,
             account = %id,
@@ -581,7 +715,11 @@ impl Client {
             sent = imported.sent,
             "session opened",
         );
-        Ok(())
+        Ok(Sync {
+            email_state,
+            mailbox_state,
+            layout,
+        })
     }
 
     /// The account's Inbox mail plus our sent replies in its threads:
@@ -600,6 +738,7 @@ impl Client {
         layout: &Layout,
         users: &[User],
         store: &Store,
+        email_state: &mut Option<String>,
     ) -> Result<Imported, Error> {
         let mut imported = Imported::default();
         let Some(inbox) = layout.inbox.clone() else {
@@ -627,13 +766,19 @@ impl Client {
             if n == 0 {
                 break;
             }
-            for email in self
+            let (emails, state) = self
                 .emails(&session.api_url, token, account_id, &page.ids)
-                .await?
-            {
+                .await?;
+            // The first page's state is the baseline the poll loop
+            // starts from: mail landing mid-import is then changed-since
+            // this state, so the first poll sweeps it in.
+            if email_state.is_none() {
+                *email_state = Some(state);
+            }
+            for email in &emails {
                 known.insert(email.id.clone());
                 threads.insert(email.thread_id.clone());
-                if let Some(mail) = incoming(&email, layout, users) {
+                if let Some(mail) = incoming(email, layout, users) {
                     store.import(|tx| tx.incoming(slug, &mail))?;
                     imported.received = imported.received.saturating_add(1);
                 }
@@ -661,12 +806,12 @@ impl Client {
             }
         }
         for chunk in wanted.chunks(PAGE) {
-            for email in self
+            let (emails, _) = self
                 .emails(&session.api_url, token, account_id, chunk)
-                .await?
-            {
-                if layout.is_sent(&email)
-                    && let Some(mail) = incoming(&email, layout, users)
+                .await?;
+            for email in &emails {
+                if layout.is_sent(email)
+                    && let Some(mail) = incoming(email, layout, users)
                 {
                     store.import(|tx| tx.incoming(slug, &mail))?;
                     imported.sent = imported.sent.saturating_add(1);
@@ -674,6 +819,133 @@ impl Client {
             }
         }
         Ok(imported)
+    }
+
+    /// One poll cycle: `/changes` for mailboxes and email since the
+    /// states the account was left in, applying what moved. A
+    /// `cannotCalculateChanges` reply means the server disowns those
+    /// states (RFC 8620 §5.2), so the cycle re-imports from scratch
+    /// and the caller carries the fresh states forward.
+    pub async fn poll_once(
+        &self,
+        credential: &Credential,
+        sync: &mut Sync,
+        store: &Store,
+    ) -> Result<PollCounts, Error> {
+        let token = read_token(&credential.token_file)?;
+        let session = self.session(&token).await?;
+        let (id, account) = session.mail_account(&credential.name)?;
+        let mut counts = PollCounts::default();
+
+        let mailboxes = match self
+            .changes(
+                &session.api_url,
+                &token,
+                id,
+                "Mailbox/changes",
+                &sync.mailbox_state,
+            )
+            .await
+        {
+            Ok(page) => page,
+            Err(JmapError::CannotCalculateChanges { .. }) => {
+                *sync = self.sync_account(credential, store).await?;
+                counts.resynced = true;
+                return Ok(counts);
+            }
+            Err(other) => return Err(other.into()),
+        };
+        // An unchanged reply still advances the state (RFC 8620 §5.2).
+        sync.mailbox_state = mailboxes.new_state.clone();
+        if mailboxes.changed() {
+            let (mailboxes, mailbox_state) = self.mailboxes(&session, &token, id).await?;
+            sync.layout = Layout::of(&mailboxes);
+            sync.mailbox_state = mailbox_state;
+            let rights = account.rights();
+            let slug = credential.name.clone();
+            let name = account.name.clone();
+            let address = id.to_owned();
+            let folders = sync.layout.folder_names();
+            store.import(|tx| {
+                tx.account(&Account {
+                    slug,
+                    name,
+                    address,
+                    read_only: rights.read_only,
+                })?;
+                for folder in &folders {
+                    tx.folder(folder)?;
+                }
+                Ok(())
+            })?;
+            counts.mailboxes = true;
+        }
+
+        loop {
+            let page = match self
+                .changes(
+                    &session.api_url,
+                    &token,
+                    id,
+                    "Email/changes",
+                    &sync.email_state,
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(JmapError::CannotCalculateChanges { .. }) => {
+                    *sync = self.sync_account(credential, store).await?;
+                    counts.resynced = true;
+                    return Ok(counts);
+                }
+                Err(other) => return Err(other.into()),
+            };
+            let Changes {
+                has_more_changes,
+                new_state,
+                created,
+                updated,
+                destroyed,
+            } = page;
+            if !destroyed.is_empty() {
+                // Rows stay cached; adopting destroys as Done is its own
+                // task.
+                tracing::debug!(?destroyed, "mail destroyed server-side");
+            }
+            counts.destroyed = counts.destroyed.saturating_add(destroyed.len());
+            let mut ids = created;
+            ids.extend(updated);
+            ids.sort();
+            ids.dedup();
+            if !ids.is_empty() {
+                let (emails, _) = self.emails(&session.api_url, &token, id, &ids).await?;
+                let users = store.users()?;
+                // Received first: a new Inbox message founds the thread
+                // its same-batch sent reply then lands in.
+                for email in &emails {
+                    if sync.layout.is_inbox(email)
+                        && let Some(mail) = incoming(email, &sync.layout, &users)
+                    {
+                        store.import(|tx| tx.incoming(&credential.name, &mail))?;
+                        counts.imported = counts.imported.saturating_add(1);
+                    }
+                }
+                for email in &emails {
+                    if sync.layout.is_sent(email)
+                        && store.has_thread(&credential.name, &email.thread_id)?
+                        && let Some(mail) = incoming(email, &sync.layout, &users)
+                    {
+                        store.import(|tx| tx.incoming(&credential.name, &mail))?;
+                        counts.imported = counts.imported.saturating_add(1);
+                    }
+                }
+            }
+            sync.email_state = new_state;
+            if !has_more_changes {
+                break;
+            }
+        }
+        Ok(counts)
     }
 }
 
@@ -1073,6 +1345,7 @@ mod tests {
         assert_eq!(layout.state_of(&plain), State::Inbox);
         assert_eq!(layout.folder_of(&plain), None);
         assert!(!layout.is_sent(&plain));
+        assert!(layout.is_inbox(&plain));
 
         let labeled = email(&[("M-in", true), ("M-watch", true)]);
         assert_eq!(layout.state_of(&labeled), State::Watch);
@@ -1081,8 +1354,14 @@ mod tests {
         assert_eq!(layout.state_of(&filed), State::Inbox);
         assert_eq!(layout.folder_of(&filed).as_deref(), Some("Receipts"));
 
+        // Not a member: filed out of Inbox, or a sent message.
+        let gone = email(&[("M-receipts", true)]);
+        assert!(!layout.is_inbox(&gone));
+        assert!(!layout.is_inbox(&email(&[("M-in", false)])));
+
         let mine = email(&[("M-sent", true)]);
         assert!(layout.is_sent(&mine));
+        assert!(!layout.is_inbox(&mine));
     }
 
     #[test]
@@ -1125,6 +1404,62 @@ mod tests {
     fn a_query_page_that_wont_parse_fails() {
         let err = parse_query(json!({"ids": 3})).unwrap_err();
         assert!(err.to_string().contains("malformed Email/query"), "{err}");
+    }
+
+    #[test]
+    fn changes_parse_with_their_paging_fields() {
+        let args = json!({
+            "accountId": "a", "oldState": "e0", "newState": "e1",
+            "hasMoreChanges": true,
+            "created": ["E1"], "updated": ["E2"], "destroyed": ["E3"],
+        });
+        let page = parse_changes("Email/changes", args).unwrap();
+        assert!(page.changed());
+        assert!(page.has_more_changes);
+        assert_eq!(page.new_state, "e1");
+        assert_eq!(page.created, ["E1".to_owned()]);
+        assert_eq!(page.updated, ["E2".to_owned()]);
+        assert_eq!(page.destroyed, ["E3".to_owned()]);
+
+        let quiet = parse_changes(
+            "Email/changes",
+            json!({"accountId": "a", "oldState": "e1", "newState": "e1",
+                   "hasMoreChanges": false,
+                   "created": [], "updated": [], "destroyed": []}),
+        )
+        .unwrap();
+        assert!(!quiet.changed());
+
+        let err = parse_changes("Email/changes", json!({"created": 3})).unwrap_err();
+        assert!(err.to_string().contains("malformed Email/changes"), "{err}");
+    }
+
+    #[test]
+    fn a_stateful_list_carries_its_type_state() {
+        let args = json!({"state": "m3", "list": [{"id": "M1", "name": "Inbox",
+                       "role": "inbox", "myRights": rights(true, true, true, true,
+                           true, true, true, true)}]});
+        let (mailboxes, state) = parse_stateful_list::<Mailbox>("Mailbox/get", args).unwrap();
+        assert_eq!(state, "m3");
+        assert_eq!(mailboxes.len(), 1);
+
+        let err = parse_stateful_list::<Mailbox>("Mailbox/get", json!({"list": []})).unwrap_err();
+        assert!(err.to_string().contains("malformed Mailbox/get"), "{err}");
+    }
+
+    #[test]
+    fn a_cannot_calculate_reply_is_its_own_error() {
+        let reply = json!({
+            "methodResponses": [[
+                "error",
+                {"type": "cannotCalculateChanges"},
+                "0",
+            ]],
+        })
+        .to_string();
+        let err = parse_reply("Email/changes", &reply).unwrap_err();
+        assert!(matches!(err, JmapError::CannotCalculateChanges { .. }));
+        assert!(err.to_string().contains("cannot calculate"), "{err}");
     }
 
     #[test]

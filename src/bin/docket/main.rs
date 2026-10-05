@@ -1,4 +1,5 @@
 mod config;
+mod poll;
 
 use clap::Parser as _;
 use miette::IntoDiagnostic as _;
@@ -33,13 +34,16 @@ async fn main() -> miette::Result<()> {
     }
     // One session per credential, before serving: a credential that
     // can't open one is a config or token problem to fix, not an account
-    // to quietly leave out.
+    // to quietly leave out. Each sync then polls for changes in the
+    // background.
     let jmap = docket::jmap::Client::fastmail().into_diagnostic()?;
-    for credential in config.credentials.iter() {
-        jmap.sync_account(credential, &store)
+    for credential in config.credentials.iter().cloned() {
+        let sync = jmap
+            .sync_account(&credential, &store)
             .await
             .into_diagnostic()
             .wrap_err_with(|| format!("opening the JMAP session for {}", credential.name))?;
+        poll::spawn(jmap.clone(), credential, store.clone(), sync);
     }
     let state = docket::routes::AppState::new(store);
     #[cfg(feature = "dev")]
