@@ -7,24 +7,16 @@ use camino::Utf8PathBuf;
 use docket::jmap::{Client, Credential};
 use docket::store::{Clock, Store};
 
-/// Where the smoke test's token lives in 1Password. The item name's
-/// colon is illegal in an `op://` secret reference (alphanumerics,
-/// `-`, `_`, `.`, and spaces only), so the token is fetched by name
-/// with `op item get` rather than `op read`.
-const OP_VAULT: &str = "Private";
-const OP_ITEM: &str = "Fastmail API token: docket smoke test";
-const OP_FIELD: &str = "credential";
+/// The smoke test's token, by item ID: the item's name contains a
+/// colon, which `op://` references don't allow (alphanumerics, `-`,
+/// `_`, `.`, and spaces only), so the ID stands in for the name.
+const TOKEN_REF: &str = "op://Private/dpepkrnjuhnao5h7fd52kvqay4/credential";
 
 /// Reads the token via `op`, which must be installed and signed in.
 fn token() -> Result<String, Box<dyn std::error::Error>> {
     let output = match std::process::Command::new("op")
-        .arg("item")
-        .arg("get")
-        .arg(OP_ITEM)
-        .arg("--vault")
-        .arg(OP_VAULT)
-        .arg("--fields")
-        .arg(OP_FIELD)
+        .arg("read")
+        .arg(TOKEN_REF)
         .output()
     {
         Ok(output) => output,
@@ -35,7 +27,7 @@ fn token() -> Result<String, Box<dyn std::error::Error>> {
     };
     if !output.status.success() {
         return Err(format!(
-            "op item get failed: {}",
+            "op read failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
         .into());
@@ -46,10 +38,27 @@ fn token() -> Result<String, Box<dyn std::error::Error>> {
 #[test]
 #[ignore = "run via `just smoke`; reads its token from 1Password"]
 fn the_session_open_chain_runs_against_fastmail() -> Result<(), Box<dyn std::error::Error>> {
+    let token = token()?;
+    // The server sees only the bearer header, so a bad token surfaces
+    // as an opaque 401; what 1Password handed over is the other half.
+    let pieces = token.split_whitespace().count();
+    if pieces != 1 {
+        return Err(format!(
+            "the 1Password field must hold exactly the token; got {pieces} \
+             whitespace-separated pieces"
+        )
+        .into());
+    }
+    println!(
+        "token from 1Password: {} chars, {}…{}",
+        token.chars().count(),
+        token.chars().take(4).collect::<String>(),
+        token.chars().rev().take(4).collect::<String>()
+    );
     // Credentials are files (systemd LoadCredential in production), so
     // hand the token to the Client through one.
     let file = tempfile::NamedTempFile::new()?;
-    std::fs::write(&file, token()?)?;
+    std::fs::write(&file, token)?;
     let credential = Credential {
         name: "smoke".into(),
         token_file: Utf8PathBuf::from_path_buf(file.path().to_owned())
