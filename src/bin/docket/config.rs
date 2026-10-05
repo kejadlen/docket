@@ -12,9 +12,13 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::de;
 use serde::de::Visitor;
+use std::str::FromStr as _;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::filter::Targets;
 
 const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3000);
 const DEFAULT_DATABASE: &str = "docket.db";
+const DEFAULT_LOG: LevelFilter = LevelFilter::WARN;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -28,6 +32,11 @@ pub struct Config {
     /// relative to the working directory.
     #[serde(default = "default_database", deserialize_with = "non_empty_path")]
     pub database: Utf8PathBuf,
+
+    /// Log level as the node argument, with optional per-target
+    /// overrides as properties: `log "debug" hyper="warn"`.
+    #[serde(default = "default_log", deserialize_with = "log_targets")]
+    pub log: Targets,
 
     /// One node per Fastmail API token (DESIGN.md, Storage):
     /// `credential "household" token-file="/run/credentials/docket/household"`.
@@ -78,6 +87,71 @@ fn default_database() -> Utf8PathBuf {
     Utf8PathBuf::from(DEFAULT_DATABASE)
 }
 
+fn default_log() -> Targets {
+    Targets::new().with_default(DEFAULT_LOG)
+}
+
+fn log_targets<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Targets, D::Error> {
+    deserializer.deserialize_struct("Log", LOG_FIELDS, LogNode)
+}
+
+/// The kdl field names of a `log` node: the level argument (`#0`) and a
+/// would-be second (`#1`, rejected). Properties override per target.
+const LOG_FIELDS: &[&str] = &["#0", "#1"];
+
+struct LogNode;
+
+impl<'de> Visitor<'de> for LogNode {
+    type Value = Targets;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a log node")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Targets, A::Error> {
+        let mut level = None;
+        let mut overrides = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "#0" => level = Some(map.next_value::<Level>()?.0),
+                "#1" => return Err(de::Error::custom("log takes one argument, its level")),
+                target => {
+                    let Level(target_level) = map.next_value()?;
+                    overrides.push((target.to_owned(), target_level));
+                }
+            }
+        }
+        let level =
+            level.ok_or_else(|| de::Error::custom("log needs a level argument: log \"info\""))?;
+        let mut log = Targets::new().with_default(level);
+        for (target, level) in overrides {
+            log = log.with_target(target, level);
+        }
+        Ok(log)
+    }
+}
+
+/// A level parsed inside `visit_str`, where kdl can label a bad value.
+struct Level(LevelFilter);
+
+impl<'de> Deserialize<'de> for Level {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> de::Visitor<'de> for V {
+            type Value = Level;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a log level")
+            }
+
+            fn visit_str<E: de::Error>(self, source: &str) -> Result<Level, E> {
+                LevelFilter::from_str(source).map_err(E::custom).map(Level)
+            }
+        }
+        deserializer.deserialize_str(V)
+    }
+}
+
 fn non_empty_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Utf8PathBuf, D::Error> {
     deserializer.deserialize_str(NonEmptyPath)
 }
@@ -104,7 +178,9 @@ impl Visitor<'_> for NonEmptyPath {
 mod tests {
     use miette::Diagnostic as _;
 
-    use super::{Config, parse};
+    use std::str::FromStr as _;
+
+    use super::{Config, LevelFilter, Targets, parse};
 
     /// The error's message, and whether it points into the source.
     fn error(source: &str) -> (String, bool) {
@@ -122,6 +198,7 @@ mod tests {
             let config = parse(source).unwrap();
             assert_eq!(config.bind.to_string(), "127.0.0.1:3000");
             assert_eq!(config.database, "docket.db");
+            assert_eq!(config.log, Targets::from_str("warn").unwrap());
         }
     }
 
@@ -137,12 +214,26 @@ mod tests {
     }
 
     #[test]
+    fn log_takes_a_level_with_target_overrides() {
+        let config = parse(r#"log "debug" hyper="warn""#).unwrap();
+        let expected = Targets::new()
+            .with_default(LevelFilter::DEBUG)
+            .with_target("hyper", LevelFilter::WARN);
+        assert_eq!(config.log, expected);
+    }
+
+    #[test]
     fn bad_values_point_at_the_value() {
         for (source, message) in [
             (r#"bind "3000""#, "invalid socket address syntax"),
             ("bind 3000", "expected socket address"),
             ("database 1", "expected a non-empty path string"),
             (r#"database """#, "database path is empty"),
+            (r#"log "verbose""#, "error parsing level filter"),
+            (
+                r#"log "info" hyper="verbose""#,
+                "error parsing level filter",
+            ),
         ] {
             let (err, labeled) = error(source);
             assert!(err.contains(message), "{source}: {err}");
@@ -203,6 +294,8 @@ mod tests {
             ("dev", "unknown field `dev`"),
             ("bind", "expected socket address"),
             ("database", "expected a non-empty path string"),
+            ("log", "log needs a level argument"),
+            (r#"log "info" "debug""#, "log takes one argument, its level"),
             ("bind \"127.0.0.1:1\"\nbind \"127.0.0.1:2\"", "sequence"),
             (r#"database "a.db" "b.db""#, "sequence"),
             (r#"database path="a.db""#, "map"),

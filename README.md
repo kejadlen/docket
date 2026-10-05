@@ -43,6 +43,7 @@ credential "household" token-file="/run/credentials/docket/household"
 |---|---|---|
 | `bind` | `127.0.0.1:3000` | Address to listen on. |
 | `database` | `docket.db` | SQLite database file, created if missing. |
+| `log` | `warn` | Log level for the app, with optional per-target overrides as properties: `log "debug" hyper="warn"`. |
 | `credential` | None | A Fastmail API token to sync mail with. Repeat it once per login. |
 
 Each `credential` takes a name, which becomes the account's slug, and a

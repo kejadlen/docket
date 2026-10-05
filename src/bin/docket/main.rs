@@ -6,20 +6,21 @@ use miette::IntoDiagnostic as _;
 use miette::WrapErr as _;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
     miette::set_panic_hook();
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(EnvFilter::from_default_env())
-        .init();
 
     let args = config::Args::parse();
     let config = config::Config::load(&args.config)?;
+    // Tracing starts after the config so its filter comes from the file;
+    // config errors report through miette, which needs no subscriber.
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(config.log)
+        .init();
     // Dev pins the fixture clock so sample ages stay stable; production
     // runs on real time.
     #[cfg(feature = "dev")]

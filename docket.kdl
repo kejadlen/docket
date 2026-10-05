@@ -4,6 +4,7 @@
 // first time and stands in for Tailscale. Delete docket.db to start over.
 bind "127.0.0.1:3000"
 database "docket.db"
+// log "warn"
 
 // A Fastmail API token per login (ADR 1). The name is the account's slug;
 // the token lives in the named file, never in this config. Local dev runs
