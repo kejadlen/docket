@@ -16,11 +16,11 @@ use std::time::Duration;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use jiff::Timestamp;
-use serde::Deserialize;
 use serde::de;
 use serde::de::DeserializeOwned;
 use serde::de::value::MapAccessDeserializer;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::Error;
 use crate::model::{Account, State, User};
@@ -523,6 +523,160 @@ impl PollCounts {
     }
 }
 
+// Every request Docket sends, as the RFCs shape it: one struct per
+// method call, cited by section, so the wire format is
+// compiler-checked and diffable against the spec in one place.
+
+/// RFC 8620 §3.3: the request envelope for one method call.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Request<'a, A> {
+    using: &'static [&'static str],
+    method_calls: [(&'static str, &'a A, &'static str); 1],
+}
+
+/// `Mailbox/get` arguments (RFC 8621 §2.1).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetMailboxes<'a> {
+    account_id: &'a str,
+    /// Null fetches every mailbox (RFC 8620 §5.1).
+    ids: Option<&'a [String]>,
+    properties: &'static [MailboxProperty],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum MailboxProperty {
+    Id,
+    Name,
+    Role,
+    MyRights,
+}
+
+const MAILBOX_PROPERTIES: &[MailboxProperty] = &[
+    MailboxProperty::Id,
+    MailboxProperty::Name,
+    MailboxProperty::Role,
+    MailboxProperty::MyRights,
+];
+
+/// `Email/query` arguments (RFC 8621 §4.4).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryEmails<'a> {
+    account_id: &'a str,
+    filter: EmailFilterCondition<'a>,
+    sort: [Comparator; 1],
+    position: usize,
+    limit: usize,
+}
+
+/// One filter term (RFC 8621 §4.4.1).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmailFilterCondition<'a> {
+    in_mailbox: &'a str,
+}
+
+/// A sort term (RFC 8620 §5.5); the properties Docket sorts by are in
+/// RFC 8621 §4.4.2.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Comparator {
+    property: EmailSortProperty,
+    is_ascending: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum EmailSortProperty {
+    ReceivedAt,
+}
+
+/// `Email/get` arguments (RFC 8621 §4.2).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetEmails<'a> {
+    account_id: &'a str,
+    ids: &'a [String],
+    properties: &'static [EmailProperty],
+    body_properties: &'static [BodyProperty],
+    fetch_text_body_values: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum EmailProperty {
+    Id,
+    ThreadId,
+    MessageId,
+    MailboxIds,
+    ReceivedAt,
+    SentAt,
+    Subject,
+    From,
+    To,
+    Cc,
+    Bcc,
+    Preview,
+    TextBody,
+    BodyValues,
+}
+
+const EMAIL_PROPERTIES: &[EmailProperty] = &[
+    EmailProperty::Id,
+    EmailProperty::ThreadId,
+    EmailProperty::MessageId,
+    EmailProperty::MailboxIds,
+    EmailProperty::ReceivedAt,
+    EmailProperty::SentAt,
+    EmailProperty::Subject,
+    EmailProperty::From,
+    EmailProperty::To,
+    EmailProperty::Cc,
+    EmailProperty::Bcc,
+    EmailProperty::Preview,
+    EmailProperty::TextBody,
+    EmailProperty::BodyValues,
+];
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum BodyProperty {
+    PartId,
+    Type,
+}
+
+const BODY_PROPERTIES: &[BodyProperty] = &[BodyProperty::PartId, BodyProperty::Type];
+
+/// `Thread/get` arguments (RFC 8621 §3.1).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetThreads<'a> {
+    account_id: &'a str,
+    ids: &'a [String],
+    properties: &'static [ThreadProperty],
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum ThreadProperty {
+    Id,
+    Emails,
+}
+
+const THREAD_PROPERTIES: &[ThreadProperty] = &[ThreadProperty::Id, ThreadProperty::Emails];
+
+/// `Foo/changes` arguments (RFC 8620 §5.2).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GetChanges<'a> {
+    account_id: &'a str,
+    since_state: &'a str,
+    max_changes: usize,
+}
+
 /// One page of request and response; small enough to keep bodies cheap.
 const PAGE: usize = 50;
 
@@ -574,22 +728,31 @@ impl Client {
                 &session.api_url,
                 token,
                 "Mailbox/get",
-                json!({"accountId": account_id, "ids": null,
-                       "properties": ["id", "name", "role", "myRights"]}),
+                &GetMailboxes {
+                    account_id,
+                    ids: None,
+                    properties: MAILBOX_PROPERTIES,
+                },
             )
             .await?;
         parse_stateful_list("Mailbox/get", args)
     }
 
     /// Posts one method call and returns the paired response's arguments.
-    async fn call(
+    async fn call<A>(
         &self,
         api_url: &str,
         token: &str,
         method: &'static str,
-        args: Value,
-    ) -> Result<Value, JmapError> {
-        let request = json!({"using": [CORE, MAIL], "methodCalls": [[method, args, "0"]]});
+        args: &A,
+    ) -> Result<Value, JmapError>
+    where
+        A: Serialize,
+    {
+        let request = Request {
+            using: &[CORE, MAIL],
+            method_calls: [(method, args, "0")],
+        };
         let body = self
             .http
             .post(api_url)
@@ -617,12 +780,13 @@ impl Client {
                 api_url,
                 token,
                 "Email/get",
-                json!({"accountId": account_id, "ids": ids,
-                    "properties": ["id", "threadId", "messageId", "mailboxIds",
-                        "receivedAt", "sentAt", "subject", "from", "to", "cc", "bcc",
-                        "preview", "textBody", "bodyValues"],
-                    "bodyProperties": ["partId", "type"],
-                    "fetchTextBodyValues": true}),
+                &GetEmails {
+                    account_id,
+                    ids,
+                    properties: EMAIL_PROPERTIES,
+                    body_properties: BODY_PROPERTIES,
+                    fetch_text_body_values: true,
+                },
             )
             .await?;
         parse_stateful_list("Email/get", args)
@@ -642,8 +806,11 @@ impl Client {
                 api_url,
                 token,
                 method,
-                json!({"accountId": account_id, "sinceState": since_state,
-                       "maxChanges": PAGE}),
+                &GetChanges {
+                    account_id,
+                    since_state,
+                    max_changes: PAGE,
+                },
             )
             .await?;
         parse_changes(method, args)
@@ -755,10 +922,16 @@ impl Client {
                     &session.api_url,
                     token,
                     "Email/query",
-                    json!({"accountId": account_id,
-                        "filter": {"inMailbox": inbox},
-                        "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "position": position, "limit": PAGE}),
+                    &QueryEmails {
+                        account_id,
+                        filter: EmailFilterCondition { in_mailbox: &inbox },
+                        sort: [Comparator {
+                            property: EmailSortProperty::ReceivedAt,
+                            is_ascending: false,
+                        }],
+                        position,
+                        limit: PAGE,
+                    },
                 )
                 .await?;
             let page = parse_query(args)?;
@@ -797,8 +970,11 @@ impl Client {
                     &session.api_url,
                     token,
                     "Thread/get",
-                    json!({"accountId": account_id, "ids": chunk,
-                        "properties": ["id", "emails"]}),
+                    &GetThreads {
+                        account_id,
+                        ids: chunk,
+                        properties: THREAD_PROPERTIES,
+                    },
                 )
                 .await?;
             for thread in parse_list::<ThreadEmails>("Thread/get", args)? {
@@ -1073,6 +1249,81 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn requests_serialize_to_the_spec_shapes() {
+        let mailboxes = serde_json::to_value(GetMailboxes {
+            account_id: "a",
+            ids: None,
+            properties: MAILBOX_PROPERTIES,
+        })
+        .unwrap();
+        assert_eq!(
+            mailboxes,
+            json!({"accountId": "a", "ids": null,
+                   "properties": ["id", "name", "role", "myRights"]})
+        );
+
+        let query = serde_json::to_value(QueryEmails {
+            account_id: "a",
+            filter: EmailFilterCondition {
+                in_mailbox: "inbox",
+            },
+            sort: [Comparator {
+                property: EmailSortProperty::ReceivedAt,
+                is_ascending: false,
+            }],
+            position: 0,
+            limit: PAGE,
+        })
+        .unwrap();
+        assert_eq!(
+            query,
+            json!({"accountId": "a", "filter": {"inMailbox": "inbox"},
+                   "sort": [{"property": "receivedAt", "isAscending": false}],
+                   "position": 0, "limit": PAGE})
+        );
+
+        let emails = serde_json::to_value(GetEmails {
+            account_id: "a",
+            ids: &["e1".into()],
+            properties: EMAIL_PROPERTIES,
+            body_properties: BODY_PROPERTIES,
+            fetch_text_body_values: true,
+        })
+        .unwrap();
+        assert_eq!(
+            emails,
+            json!({"accountId": "a", "ids": ["e1"],
+                   "properties": ["id", "threadId", "messageId", "mailboxIds",
+                       "receivedAt", "sentAt", "subject", "from", "to", "cc", "bcc",
+                       "preview", "textBody", "bodyValues"],
+                   "bodyProperties": ["partId", "type"],
+                   "fetchTextBodyValues": true})
+        );
+
+        let threads = serde_json::to_value(GetThreads {
+            account_id: "a",
+            ids: &["t1".into()],
+            properties: THREAD_PROPERTIES,
+        })
+        .unwrap();
+        assert_eq!(
+            threads,
+            json!({"accountId": "a", "ids": ["t1"], "properties": ["id", "emails"]})
+        );
+
+        let changes = serde_json::to_value(GetChanges {
+            account_id: "a",
+            since_state: "s1",
+            max_changes: PAGE,
+        })
+        .unwrap();
+        assert_eq!(
+            changes,
+            json!({"accountId": "a", "sinceState": "s1", "maxChanges": PAGE})
+        );
+    }
 
     /// A session shaped like Fastmail's: `read_only` is a mail-only token
     /// (the spike's findings), otherwise mail and submission.
