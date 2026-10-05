@@ -747,7 +747,7 @@ impl Client {
         args: &A,
     ) -> Result<Value, JmapError>
     where
-        A: Serialize,
+        A: Serialize + std::fmt::Debug,
     {
         let request = Request {
             using: &[CORE, MAIL],
@@ -763,7 +763,15 @@ impl Client {
             .error_for_status()?
             .text()
             .await?;
-        parse_reply(method, &body)
+        match parse_reply(method, &body) {
+            Ok(args) => Ok(args),
+            Err(error) => {
+                // An invalidArguments reply names nothing; the request
+                // Docket sent is the context it lacks.
+                tracing::warn!(%method, ?args, %error, "JMAP call rejected");
+                Err(error)
+            }
+        }
     }
 
     /// The named emails, with bodies, and the type state the next
