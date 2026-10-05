@@ -49,12 +49,6 @@ fn the_session_open_chain_runs_against_fastmail() -> Result<(), Box<dyn std::err
         )
         .into());
     }
-    println!(
-        "token from 1Password: {} chars, {}…{}",
-        token.chars().count(),
-        token.chars().take(4).collect::<String>(),
-        token.chars().rev().take(4).collect::<String>()
-    );
     // Credentials are files (systemd LoadCredential in production), so
     // hand the token to the Client through one.
     let file = tempfile::NamedTempFile::new()?;
