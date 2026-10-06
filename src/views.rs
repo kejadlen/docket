@@ -260,7 +260,7 @@ fn solo(p: &Page<'_>, group: &Group, m: &Message, compact: bool) -> Markup {
             span.line {
                 span.from { (sender(&p.users, m)) }
                 @if !compact {
-                    span.snip { " — " (m.body) }
+                    span.snip { " — " (body::snippet(&m.body)) }
                 }
             }
         }
@@ -287,7 +287,7 @@ fn row(p: &Page<'_>, m: &Message, compact: bool) -> Markup {
             span.from { (sender(&p.users, m)) }
             span.type-figure.age { (dates::short(p.now, m.at)) }
             @if !compact {
-                span.snip { (m.body) }
+                span.snip { (body::snippet(&m.body)) }
             }
         }
     }

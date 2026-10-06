@@ -1,6 +1,6 @@
 //! Message bodies as the thread view shows them: plain text, escaped,
 //! with its URLs made into links and the quoted history it trails split
-//! off to hide.
+//! off to hide — and the one-line snippet a list row shows.
 
 use maud::{Markup, html};
 
@@ -94,6 +94,21 @@ pub fn linked(text: &str) -> Markup {
             }
         }
     }
+}
+
+/// How much of a body a list row carries: more than a row ever shows, so
+/// CSS still does the clipping, without shipping the whole body.
+const SNIPPET: usize = 160;
+
+/// The start of what a body says, on one line, for a list row.
+pub fn snippet(text: &str) -> String {
+    let (said, _) = split_quoted(text);
+    said.split_whitespace()
+        .flat_map(|word| [" ", word])
+        .skip(1)
+        .flat_map(str::chars)
+        .take(SNIPPET)
+        .collect()
 }
 
 /// Splits a reply into what it says and the quoted history it trails:
@@ -309,6 +324,19 @@ mod tests {
             ("Totals\n__________\n$40", None)
         );
         assert_eq!(split_quoted(rule), (rule, None));
+    }
+
+    #[test]
+    fn snippets_are_one_capped_line_without_the_quote() {
+        assert_eq!(
+            snippet(
+                "  Sounds\tgood.\n\nSee you\r\nthen.\n\nOn Mon, Oct 5, Sam wrote:\n> Thursday?"
+            ),
+            "Sounds good. See you then."
+        );
+        let long = "é".repeat(500);
+        assert_eq!(snippet(&long).chars().count(), SNIPPET);
+        assert_eq!(snippet(""), "");
     }
 
     #[test]
