@@ -10,11 +10,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use camino::Utf8Path;
 use jiff::civil::DateTime;
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
-use rusqlite::{Connection, OptionalExtension as _, Params, Row, ToSql, Transaction, params};
+use rusqlite::{
+    Connection, OptionalExtension as _, Params, Row, ToSql, Transaction, params, params_from_iter,
+};
 
 use crate::Error;
 use crate::model::{
-    Account, Comment, Event, Kind, Message, MessageId, State, Thread, User, Values,
+    Account, Comment, Event, Kind, Message, MessageId, State, Thread, ThreadId, User, Values,
 };
 
 /// Applied in order; `PRAGMA user_version` counts how many have run.
@@ -61,6 +63,37 @@ pub enum Filter<'a> {
     /// ignored for ASCII letters only, as SQLite's LIKE does.
     Search(&'a str),
 }
+
+impl Filter<'_> {
+    /// The WHERE clause over [`MESSAGE_JOINS`] and its arguments, shared
+    /// by loading and counting so the two can't disagree.
+    fn sql(self) -> (&'static str, Vec<rusqlite::types::Value>) {
+        use rusqlite::types::Value::Text;
+        match self {
+            Filter::State(state) => (
+                "m.kind = 'received' AND m.state = ?1",
+                vec![Text(state.slug().to_owned())],
+            ),
+            Filter::ForMe { user, state } => (
+                "m.kind = 'received' AND m.state = ?1 AND (
+                    EXISTS (SELECT 1 FROM assignees a WHERE a.message = m.id AND a.user = ?2)
+                    OR (?1 = 'inbox' AND NOT EXISTS (SELECT 1 FROM assignees a WHERE a.message = m.id))
+                )",
+                vec![Text(state.slug().to_owned()), Text(user.to_owned())],
+            ),
+            Filter::Search(text) => (
+                r"t.subject LIKE ?1 ESCAPE '\' OR m.from_name LIKE ?1 ESCAPE '\'
+                    OR u.slug LIKE ?1 ESCAPE '\' OR m.body LIKE ?1 ESCAPE '\'",
+                vec![Text(format!("%{}%", escape_like(text)))],
+            ),
+        }
+    }
+}
+
+/// What a [`Filter`]'s clause can see besides the message: its thread
+/// (`t`) and the user who sent it (`u`).
+const MESSAGE_JOINS: &str =
+    "JOIN threads t ON t.id = m.thread LEFT JOIN users u ON u.login = m.sent_by";
 
 /// Where "now" comes from: the fixed clock fixtures are written against,
 /// or the system clock for a live server.
@@ -243,30 +276,40 @@ impl Store {
 
     /// Messages matching the filter, oldest first.
     pub fn messages(&self, filter: Filter<'_>) -> Result<Vec<Message>, Error> {
+        let (clause, args) = filter.sql();
+        load_messages(&self.lock().conn, clause, params_from_iter(args))
+    }
+
+    /// How many messages match the filter, without loading them.
+    pub fn count(&self, filter: Filter<'_>) -> Result<usize, Error> {
+        let (clause, args) = filter.sql();
         let inner = self.lock();
-        let conn = &inner.conn;
-        match filter {
-            Filter::State(state) => {
-                load_messages(conn, "m.kind = 'received' AND m.state = ?1", [state])
-            }
-            Filter::ForMe { user, state } => load_messages(
-                conn,
-                "m.kind = 'received' AND m.state = ?1 AND (
-                    EXISTS (SELECT 1 FROM assignees a WHERE a.message = m.id AND a.user = ?2)
-                    OR (?1 = 'inbox' AND NOT EXISTS (SELECT 1 FROM assignees a WHERE a.message = m.id))
-                )",
-                params![state, user],
-            ),
-            Filter::Search(text) => {
-                let pattern = format!("%{}%", escape_like(text));
-                load_messages(
-                    conn,
-                    r"t.subject LIKE ?1 ESCAPE '\' OR m.from_name LIKE ?1 ESCAPE '\'
-                        OR u.slug LIKE ?1 ESCAPE '\' OR m.body LIKE ?1 ESCAPE '\'",
-                    [pattern],
-                )
-            }
-        }
+        let mut stmt = inner.conn.prepare_cached(&format!(
+            "SELECT COUNT(*) FROM messages m {MESSAGE_JOINS} WHERE {clause}"
+        ))?;
+        let n: i64 = stmt.query_row(params_from_iter(args), |r| r.get(0))?;
+        // COUNT(*) is never negative.
+        Ok(usize::try_from(n).unwrap_or_default())
+    }
+
+    /// The threads with these ids, in one query.
+    pub fn threads(&self, ids: &BTreeSet<ThreadId>) -> Result<BTreeMap<ThreadId, Thread>, Error> {
+        let inner = self.lock();
+        let mut stmt = inner.conn.prepare_cached(
+            "SELECT id, account, subject FROM threads
+             WHERE id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let threads = stmt
+            .query_map([json(ids)?], |r| {
+                Ok(Thread {
+                    id: r.get(0)?,
+                    account: r.get(1)?,
+                    subject: r.get(2)?,
+                })
+            })?
+            .map(|t| t.map(|t| (t.id.clone(), t)))
+            .collect::<Result<_, _>>()?;
+        Ok(threads)
     }
 
     /// The thread's messages and comments in time order. A message sorts
@@ -978,9 +1021,7 @@ fn load_messages(
             m.from_name, m.from_addr, m.state, m.folder, m.sent_by, m.sent_to,
             (SELECT json_group_array(user)
                 FROM (SELECT user FROM assignees WHERE message = m.id ORDER BY user))
-         FROM messages m
-         JOIN threads t ON t.id = m.thread
-         LEFT JOIN users u ON u.login = m.sent_by
+         FROM messages m {MESSAGE_JOINS}
          WHERE {filter}
          ORDER BY m.at, m.id"
     );
@@ -2193,6 +2234,7 @@ mod tests {
         assert!(store.history(&fixtures::id(4)).is_err());
         exec(&store, "ALTER TABLE threads RENAME TO gone_threads;");
         db_err(store.add_comment(SAM, &fixtures::id(1), "hi"));
+        assert!(store.threads(&BTreeSet::new()).is_err());
         exec(&store, "ALTER TABLE users RENAME TO gone_users;");
         assert!(store.users().is_err());
         assert!(store.is_empty().is_err());

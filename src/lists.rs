@@ -2,8 +2,10 @@
 //! individual messages, grouped by thread; a group holds only the thread's
 //! messages that belong in that section.
 
+use std::collections::BTreeMap;
+
 use crate::Error;
-use crate::model::{Message, State, Thread, User};
+use crate::model::{Message, State, Thread, ThreadId, User};
 use crate::store::{Filter, Store};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,14 +82,25 @@ pub fn sections(store: &Store, me: &User, view: &View) -> Result<Vec<Section>, E
     Ok(out)
 }
 
-/// How many messages a view lists, for the sidebar.
+/// How many messages a view lists, for the sidebar: the same filters
+/// [`sections`] loads, counted in SQL.
 pub fn count(store: &Store, me: &User, view: &View) -> Result<usize, Error> {
-    let n = sections(store, me, view)?
-        .iter()
-        .flat_map(|s| &s.groups)
-        .map(|g| g.rows.len())
-        .sum();
-    Ok(n)
+    let filters = match view {
+        View::ForMe => State::LANES
+            .map(|state| Filter::ForMe {
+                user: &me.login,
+                state,
+            })
+            .to_vec(),
+        View::Lane(state) => vec![Filter::State(*state)],
+        View::Search(query) => match query.trim() {
+            "" => Vec::new(),
+            query => vec![Filter::Search(query)],
+        },
+    };
+    filters
+        .into_iter()
+        .try_fold(0usize, |n, f| Ok(n.saturating_add(store.count(f)?)))
 }
 
 /// Takes messages oldest first, as the store returns them.
@@ -97,17 +110,20 @@ fn section(
     msgs: Vec<Message>,
     order: Order,
 ) -> Result<Section, Error> {
-    let mut groups: Vec<Group> = Vec::new();
+    let mut rows: BTreeMap<ThreadId, Vec<Message>> = BTreeMap::new();
     for m in msgs {
-        if let Some(g) = groups.iter_mut().find(|g| g.thread.id == m.thread) {
-            g.rows.push(m);
-        } else if let Some(thread) = store.thread(&m.thread)? {
-            groups.push(Group {
-                thread,
-                rows: vec![m],
-            });
-        }
+        rows.entry(m.thread.clone()).or_default().push(m);
     }
+    let mut threads = store.threads(&rows.keys().cloned().collect())?;
+    let mut groups: Vec<Group> = rows
+        .into_iter()
+        .filter_map(|(id, rows)| {
+            Some(Group {
+                thread: threads.remove(&id)?,
+                rows,
+            })
+        })
+        .collect();
     match order {
         Order::OldestFirst => groups.sort_by_key(|g| g.rows.first().map(|m| m.at)),
         Order::NewestFirst => {
@@ -182,6 +198,27 @@ mod tests {
         let store = fixtures::store().unwrap();
         let sam = store.user(SAM).unwrap().unwrap();
         assert_eq!(count(&store, &sam, &View::ForMe).unwrap(), 7);
+
+        // Counts come from SQL, so pin them to the rows each view lists.
+        for login in [SAM, ALEX] {
+            let me = store.user(login).unwrap().unwrap();
+            let views = [
+                View::ForMe,
+                View::Search("estimate".into()),
+                View::Search("  ".into()),
+            ]
+            .into_iter()
+            .chain(State::LANES.map(View::Lane));
+            for view in views {
+                let rows: usize = sections(&store, &me, &view)
+                    .unwrap()
+                    .iter()
+                    .flat_map(|s| &s.groups)
+                    .map(|g| g.rows.len())
+                    .sum();
+                assert_eq!(count(&store, &me, &view).unwrap(), rows, "{login} {view:?}");
+            }
+        }
     }
 
     #[test]
