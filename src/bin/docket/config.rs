@@ -33,8 +33,8 @@ pub struct Config {
     #[serde(default = "default_database", deserialize_with = "non_empty_path")]
     pub database: Utf8PathBuf,
 
-    /// Log level as the node argument, with optional per-target
-    /// overrides as properties: `log "debug" hyper="warn"`.
+    /// Log level as an optional node argument (default `warn`), with
+    /// per-target overrides as properties: `log docket=info`.
     #[serde(default = "default_log", deserialize_with = "log_targets")]
     pub log: Targets,
 
@@ -97,6 +97,8 @@ fn log_targets<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Targets, D:
 
 /// The kdl field names of a `log` node: the level argument (`#0`) and a
 /// would-be second (`#1`, rejected). Properties override per target.
+/// A derived struct can't express this: flattening the properties into a
+/// map forces deserialize_map, which hides kdl's `#0` argument naming.
 const LOG_FIELDS: &[&str] = &["#0", "#1"];
 
 struct LogNode;
@@ -121,8 +123,7 @@ impl<'de> Visitor<'de> for LogNode {
                 }
             }
         }
-        let level =
-            level.ok_or_else(|| de::Error::custom("log needs a level argument: log \"info\""))?;
+        let level = level.unwrap_or(DEFAULT_LOG);
         let mut log = Targets::new().with_default(level);
         for (target, level) in overrides {
             log = log.with_target(target, level);
@@ -226,6 +227,18 @@ mod tests {
     }
 
     #[test]
+    fn log_level_is_optional() {
+        let config = parse("log docket=info").unwrap();
+        let expected = Targets::new()
+            .with_default(LevelFilter::WARN)
+            .with_target("docket", LevelFilter::INFO);
+        assert_eq!(config.log, expected);
+
+        // A bare `log` node means the same as no log node at all.
+        assert_eq!(parse("log").unwrap().log, parse("").unwrap().log);
+    }
+
+    #[test]
     fn bad_values_point_at_the_value() {
         for (source, message) in [
             (r#"bind "3000""#, "invalid socket address syntax"),
@@ -297,7 +310,6 @@ mod tests {
             ("dev", "unknown field `dev`"),
             ("bind", "expected socket address"),
             ("database", "expected a non-empty path string"),
-            ("log", "log needs a level argument"),
             (r#"log "info" "debug""#, "log takes one argument, its level"),
             ("bind \"127.0.0.1:1\"\nbind \"127.0.0.1:2\"", "sequence"),
             (r#"database "a.db" "b.db""#, "sequence"),
