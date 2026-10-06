@@ -112,6 +112,7 @@ fn mailboxes() -> Vec<Value> {
     [
         ("MB-in", "Inbox", Some("inbox"), &rights),
         ("MB-sent", "Sent", Some("sent"), &rights),
+        ("MB-archive", "Archive", Some("archive"), &rights),
         ("MB-drafts", "Drafts", Some("drafts"), &rights),
         ("MB-sched", "Scheduled", Some("scheduled"), &restricted),
         ("MB-do", "Docket/Do", None, &rights),
@@ -486,8 +487,36 @@ async fn api(world: axum::extract::State<World>, headers: HeaderMap, body: Strin
     let method = call[0].as_str().expect("a method name").to_owned();
     let args = &call[1];
 
-    // The one mutating method, so it locks for itself and answers early.
-    if method == "Email/set" {
+    // The mutating methods, so they lock for themselves and answer
+    // early.
+    if method == "Email/set" || method == "Email/destroy" {
+        if method == "Email/destroy" {
+            let mut stub = world.lock().unwrap();
+            let mut destroyed = Vec::new();
+            let mut not_destroyed = serde_json::Map::new();
+            for id in args["destroy"].as_array().expect("an id list") {
+                let id = id.as_str().expect("an id");
+                if stub.refuse.contains(id) {
+                    not_destroyed.insert(
+                        id.to_owned(),
+                        json!({"type": "serverFail", "description": "refused"}),
+                    );
+                    continue;
+                }
+                let mail = stub.accounts.get_mut(account).unwrap();
+                if mail.emails.iter().any(|e| e["id"] == json!(id)) {
+                    mail.emails.retain(|e| e["id"] != json!(id));
+                    destroyed.push(id.to_owned());
+                } else {
+                    not_destroyed.insert(id.to_owned(), json!({"type": "notFound"}));
+                }
+            }
+            stub.snapshot(account);
+            let reply = json!({"accountId": account, "oldState": "s", "newState": "s",
+                               "destroyed": destroyed, "notDestroyed": not_destroyed});
+            return Json(json!({"methodResponses": [["Email/destroy", reply, "0"]]}))
+                .into_response();
+        }
         let mut stub = world.lock().unwrap();
         let mut updated = serde_json::Map::new();
         let mut not_updated = serde_json::Map::new();
@@ -1345,4 +1374,258 @@ async fn a_filing_into_a_vanished_folder_drops() {
 
     assert_eq!(counts.filed, 0, "{counts:?}");
     assert!(store.pending_files("household").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn done_archives_out_of_the_shared_inbox() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .unwrap();
+    assert_eq!(store.pending_archives("household").unwrap().len(), 1);
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.archived, 1, "{counts:?}");
+
+    // Server side: out of the Inbox, into Archive, label and folder
+    // kept.
+    let memberships = {
+        let world = world.lock().unwrap();
+        world.accounts[HOUSEHOLD]
+            .emails
+            .iter()
+            .find(|e| e["id"] == json!("E-school"))
+            .unwrap()["mailboxIds"]
+            .clone()
+    };
+    assert_eq!(
+        memberships,
+        json!({"MB-watch": true, "MB-school": true, "MB-archive": true})
+    );
+    assert!(store.pending_archives("household").unwrap().is_empty());
+    assert_eq!(
+        store
+            .message(school.id)
+            .unwrap()
+            .unwrap()
+            .values()
+            .unwrap()
+            .state,
+        State::Done
+    );
+}
+
+#[tokio::test]
+async fn mail_already_out_of_the_inbox_exits_nowhere() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    // Another client files the school mail out of the Inbox before the
+    // Done lands.
+    world
+        .lock()
+        .unwrap()
+        .update_email(HOUSEHOLD, "E-school", |mail| {
+            mail["mailboxIds"] = json!({"MB-school": true});
+        });
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .unwrap();
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    // No exit to make: the intent clears and nothing moves.
+    assert_eq!(counts.archived, 0, "{counts:?}");
+    assert!(store.pending_archives("household").unwrap().is_empty());
+    let memberships = {
+        let world = world.lock().unwrap();
+        world.accounts[HOUSEHOLD]
+            .emails
+            .iter()
+            .find(|e| e["id"] == json!("E-school"))
+            .unwrap()["mailboxIds"]
+            .clone()
+    };
+    assert_eq!(memberships, json!({"MB-school": true}));
+}
+
+#[tokio::test]
+async fn acl_denied_archives_wait_for_the_rights() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    world
+        .lock()
+        .unwrap()
+        .update_mailbox(HOUSEHOLD, "MB-archive", |m| {
+            m["myRights"]["mayAddItems"] = json!(false);
+        });
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .unwrap();
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(counts.archived, 0, "{counts:?}");
+    assert_eq!(store.pending_archives("household").unwrap().len(), 1);
+
+    // The rights come back and the waiting exit goes through.
+    world
+        .lock()
+        .unwrap()
+        .update_mailbox(HOUSEHOLD, "MB-archive", |m| {
+            m["myRights"]["mayAddItems"] = json!(true);
+        });
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(counts.archived, 1, "{counts:?}");
+    assert!(store.pending_archives("household").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_archive_clears_rather_than_retries() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .unwrap();
+    world.lock().unwrap().refuse.insert("E-school".into());
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.archived, 0, "{counts:?}");
+    assert!(store.pending_archives("household").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_archive_for_mail_thats_gone_drops() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .unwrap();
+    world.lock().unwrap().remove_email(HOUSEHOLD, "E-school");
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.archived, 0, "{counts:?}");
+    assert!(store.pending_archives("household").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_archive_with_nowhere_to_land_drops() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .unwrap();
+    // The server loses its Archive mailbox before the exit lands.
+    world
+        .lock()
+        .unwrap()
+        .remove_mailbox(HOUSEHOLD, "MB-archive");
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.archived, 0, "{counts:?}");
+    assert!(store.pending_archives("household").unwrap().is_empty());
+    let memberships = {
+        let world = world.lock().unwrap();
+        world.accounts[HOUSEHOLD]
+            .emails
+            .iter()
+            .find(|e| e["id"] == json!("E-school"))
+            .unwrap()["mailboxIds"]
+            .clone()
+    };
+    assert_eq!(
+        memberships,
+        json!({"MB-in": true, "MB-watch": true, "MB-school": true})
+    );
+}
+
+#[tokio::test]
+async fn trashing_destroys_through_the_poll() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store.delete("sam@example.com", school.id).unwrap();
+    assert_eq!(store.pending_deletes("household").unwrap().len(), 1);
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.deleted, 1, "{counts:?}");
+    let gone = {
+        let world = world.lock().unwrap();
+        !world.accounts[HOUSEHOLD]
+            .emails
+            .iter()
+            .any(|e| e["id"] == json!("E-school"))
+    };
+    assert!(gone);
+    assert!(store.pending_deletes("household").unwrap().is_empty());
+    // The cached row stays, Done.
+    assert_eq!(
+        store
+            .message(school.id)
+            .unwrap()
+            .unwrap()
+            .values()
+            .unwrap()
+            .state,
+        State::Done
+    );
+}
+
+#[tokio::test]
+async fn a_refused_destruction_clears_rather_than_retries() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store.delete("sam@example.com", school.id).unwrap();
+    world.lock().unwrap().refuse.insert("E-school".into());
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.deleted, 0, "{counts:?}");
+    assert!(store.pending_deletes("household").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_destruction_for_mail_thats_gone_clears() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store.delete("sam@example.com", school.id).unwrap();
+    world.lock().unwrap().remove_email(HOUSEHOLD, "E-school");
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.deleted, 0, "{counts:?}");
+    assert!(store.pending_deletes("household").unwrap().is_empty());
 }

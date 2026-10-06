@@ -6,8 +6,9 @@
 //!
 //! Keeping up with the server is polling for now (task lylzwoyo):
 //! `poll_once` applies `Email/changes` and `Mailbox/changes` since the
-//! states the last sync left, and drains queued filings (task rn) with
-//! `Email/set`. Push replaces the timer later (task nwylszul); the
+//! states the last sync left, and drains the queued filings, archives,
+//! and deletions (tasks rn and sm) with `Email/set` and
+//! `Email/destroy`. Push replaces the timer later (task nwylszul); the
 //! changes application stays.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -433,12 +434,17 @@ struct Layout {
     pub inbox: Option<String>,
     /// The Sent mailbox's id.
     pub sent: Option<String>,
+    /// The Archive mailbox's id: where Done's exit from the Inbox
+    /// lands.
+    pub archive: Option<String>,
     /// Label mailbox id → the state it carries.
     labels: BTreeMap<String, State>,
     /// Mailbox ids in the Docket namespace: the labels and the parent.
     docket: BTreeSet<String>,
     /// Folder mailbox id → its name and ACLs.
     folders: BTreeMap<String, Folder>,
+    /// Every mailbox's ACLs, for the moves that cross system boxes.
+    rights: BTreeMap<String, MailboxRights>,
 }
 
 impl Layout {
@@ -452,10 +458,12 @@ impl Layout {
             .map(|m| m.id.as_str())
             .collect();
         for mailbox in mailboxes {
+            layout.rights.insert(mailbox.id.clone(), mailbox.my_rights);
             match mailbox.role.as_deref() {
                 Some("inbox") => layout.inbox = Some(mailbox.id.clone()),
                 Some("sent") => layout.sent = Some(mailbox.id.clone()),
-                // The other system boxes (Archive, Drafts, Junk, Trash)
+                Some("archive") => layout.archive = Some(mailbox.id.clone()),
+                // The other system boxes (Drafts, Junk, Trash)
                 // are neither folders nor labels.
                 Some(_) => {}
                 None => {
@@ -582,10 +590,56 @@ fn filing_allowed(current: &BTreeMap<String, bool>, layout: &Layout, target: Opt
     leaving && entering
 }
 
+/// The memberships an archive leaves the message in: out of the Inbox,
+/// into Archive, with labels, folders, and other system boxes kept.
+/// None when there is no exit to make — the mail already left the
+/// Inbox, or the server has no Archive mailbox — so the caller clears
+/// the intent without touching anything.
+fn archived_mailboxes(
+    current: &BTreeMap<String, bool>,
+    layout: &Layout,
+) -> Option<BTreeMap<String, bool>> {
+    let archive = layout.archive.as_deref()?;
+    if !current.contains_key(layout.inbox.as_deref()?) {
+        return None;
+    }
+    let mut next: BTreeMap<String, bool> = current
+        .iter()
+        .filter(|(id, member)| **member && Some(id.as_str()) != layout.inbox.as_deref())
+        .map(|(id, _)| (id.clone(), true))
+        .collect();
+    next.insert(archive.to_owned(), true);
+    Some(next)
+}
+
+/// Whether the ACLs permit the archive: the Inbox gives the message
+/// up, and Archive takes it.
+fn archive_allowed(layout: &Layout) -> bool {
+    let leaving = layout
+        .inbox
+        .as_deref()
+        .and_then(|id| layout.rights.get(id))
+        .is_none_or(|rights| rights.may_remove_items);
+    let entering = layout
+        .archive
+        .as_deref()
+        .and_then(|id| layout.rights.get(id))
+        .is_some_and(|rights| rights.may_add_items);
+    leaving && entering
+}
+
 /// Parses an `Email/set` reply's verdict on each id.
 fn parse_set_emails(args: Value) -> Result<SetEmailsReply, JmapError> {
     serde_json::from_value(args).map_err(|source| JmapError::Malformed {
         what: "Email/set",
+        source,
+    })
+}
+
+/// Parses an `Email/destroy` reply's verdict on each id.
+fn parse_destroy_emails(args: Value) -> Result<DestroyEmailsReply, JmapError> {
+    serde_json::from_value(args).map_err(|source| JmapError::Malformed {
+        what: "Email/destroy",
         source,
     })
 }
@@ -619,6 +673,10 @@ pub struct PollCounts {
     pub mailboxes: bool,
     /// Filings pushed server-side.
     pub filed: usize,
+    /// Archives pushed server-side — Done's exit from the Inbox.
+    pub archived: usize,
+    /// Deletions pushed server-side.
+    pub deleted: usize,
     /// Whether the server disowned the stored states and a full
     /// re-import ran instead.
     pub resynced: bool,
@@ -819,6 +877,25 @@ struct SetEmailsReply {
     not_updated: BTreeMap<String, Value>,
 }
 
+/// `Email/destroy` arguments (RFC 8621 §5.5).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DestroyEmails<'a> {
+    account_id: &'a str,
+    destroy: &'a [String],
+}
+
+/// The outcome half of an `Email/destroy` reply: which ids went, and
+/// which the server refused.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DestroyEmailsReply {
+    #[serde(default)]
+    destroyed: Vec<String>,
+    #[serde(default)]
+    not_destroyed: BTreeMap<String, Value>,
+}
+
 /// Opens sessions: one per credential, against Fastmail unless a test
 /// points the session URL at a stub.
 #[derive(Clone)]
@@ -983,6 +1060,29 @@ impl Client {
             )
             .await?;
         parse_set_emails(args)
+    }
+
+    /// Destroys emails with one `Email/destroy`, returning the
+    /// server's verdict on each id.
+    async fn destroy_emails(
+        &self,
+        api_url: &str,
+        token: &str,
+        account_id: &str,
+        destroy: &[String],
+    ) -> Result<DestroyEmailsReply, JmapError> {
+        let args = self
+            .call(
+                api_url,
+                token,
+                "Email/destroy",
+                &DestroyEmails {
+                    account_id,
+                    destroy,
+                },
+            )
+            .await?;
+        parse_destroy_emails(args)
     }
 
     /// Opens the credential's session, records its account, and imports
@@ -1173,10 +1273,10 @@ impl Client {
 
     /// One poll cycle: `/changes` for mailboxes and email since the
     /// states the account was left in, applying what moved, then the
-    /// queued filings go out. A `cannotCalculateChanges` reply means
-    /// the server disowns those states (RFC 8620 §5.2), so the cycle
-    /// re-imports from scratch and the caller carries the fresh states
-    /// forward.
+    /// queued filings, archives, and deletions go out. A
+    /// `cannotCalculateChanges` reply means the server disowns those
+    /// states (RFC 8620 §5.2), so the cycle re-imports from scratch
+    /// and the caller carries the fresh states forward.
     pub async fn poll_once(
         &self,
         credential: &Credential,
@@ -1234,6 +1334,12 @@ impl Client {
 
         counts.filed = self
             .push_files(&session, &token, id, &credential.name, &sync.layout, store)
+            .await?;
+        counts.archived = self
+            .push_archives(&session, &token, id, &credential.name, &sync.layout, store)
+            .await?;
+        counts.deleted = self
+            .push_deletes(&session, &token, id, &credential.name, store)
             .await?;
 
         loop {
@@ -1381,6 +1487,125 @@ impl Client {
         }
         store.clear_pending_files(&clear)?;
         Ok(filed)
+    }
+
+    /// Drains the queued archives — what Done means on a writable
+    /// account: the mail leaves the shared Inbox for Archive, labels
+    /// and folders kept. Self-limiting against fresh memberships: mail
+    /// another client already filed out of the Inbox is left alone,
+    /// its intent cleared silently. ACL-refused entries stay queued and
+    /// nag the log until an admin grants them; server refusals and ids
+    /// the server no longer carries are dropped with a warning instead
+    /// of retried forever.
+    #[allow(clippy::too_many_arguments)]
+    async fn push_archives(
+        &self,
+        session: &Session,
+        token: &str,
+        account_id: &str,
+        slug: &str,
+        layout: &Layout,
+        store: &Store,
+    ) -> Result<usize, Error> {
+        let pending = store.pending_archives(slug)?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        // Memberships come fresh from the server: the store keeps only
+        // the folder they derive from.
+        let mut current: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+        for chunk in pending.chunks(PAGE) {
+            let ids: Vec<String> = chunk.iter().map(|p| p.jmap_id.clone()).collect();
+            let (emails, _) = self
+                .emails(&session.api_url, token, account_id, &ids)
+                .await?;
+            for email in emails {
+                current.insert(email.id.clone(), email.mailbox_ids);
+            }
+        }
+        let mut updates: BTreeMap<String, EmailPatch> = BTreeMap::new();
+        let mut clear: Vec<MessageId> = Vec::new();
+        for p in &pending {
+            let Some(memberships) = current.get(&p.jmap_id) else {
+                tracing::warn!(jmap_id = %p.jmap_id, "archive dropped: the mail is gone server-side");
+                clear.push(p.message);
+                continue;
+            };
+            let Some(next) = archived_mailboxes(memberships, layout) else {
+                // Already out of the Inbox, or no Archive to land in:
+                // nothing to do either way. A vanished Archive mailbox
+                // deserves a trace; an already-exited message doesn't.
+                if layout.archive.is_none() {
+                    tracing::warn!(jmap_id = %p.jmap_id, "archive dropped: the server has no Archive mailbox");
+                }
+                clear.push(p.message);
+                continue;
+            };
+            if !archive_allowed(layout) {
+                tracing::warn!("archive held: mailbox ACLs refuse it");
+                continue;
+            }
+            updates.insert(p.jmap_id.clone(), EmailPatch { mailbox_ids: next });
+        }
+        let mut archived = 0usize;
+        let entries: Vec<(String, EmailPatch)> = updates.into_iter().collect();
+        for chunk in entries.chunks(PAGE) {
+            let update: BTreeMap<String, EmailPatch> = chunk.iter().cloned().collect();
+            let reply = self
+                .set_emails(&session.api_url, token, account_id, &update)
+                .await?;
+            for (id, error) in &reply.not_updated {
+                tracing::warn!(jmap_id = %id, %error, "the server refused an archive");
+            }
+            archived = archived.saturating_add(reply.updated.len());
+            // Refused ids clear too: the server's verdict stands, and
+            // retrying would only requeue the refusal.
+            clear.extend(chunk.iter().filter_map(|(id, _)| {
+                pending.iter().find(|p| &p.jmap_id == id).map(|p| p.message)
+            }));
+        }
+        store.clear_pending_archives(&clear)?;
+        Ok(archived)
+    }
+
+    /// Drains the account's queued deletions (task sm) with
+    /// `Email/destroy` — Fastmail's answer to a destroy is moving the
+    /// mail to Trash. Ids the server refused or no longer carries are
+    /// dropped with a warning rather than retried; the thread already
+    /// went Done when the deletion was queued.
+    async fn push_deletes(
+        &self,
+        session: &Session,
+        token: &str,
+        account_id: &str,
+        slug: &str,
+        store: &Store,
+    ) -> Result<usize, Error> {
+        let pending = store.pending_deletes(slug)?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut deleted = 0usize;
+        let mut clear = Vec::new();
+        let ids: Vec<String> = pending.iter().map(|p| p.jmap_id.clone()).collect();
+        for chunk in ids.chunks(PAGE) {
+            let reply = self
+                .destroy_emails(&session.api_url, token, account_id, chunk)
+                .await?;
+            for (id, error) in &reply.not_destroyed {
+                tracing::warn!(jmap_id = %id, %error, "the server refused a deletion");
+            }
+            deleted = deleted.saturating_add(reply.destroyed.len());
+            // Refused ids clear too: the server's verdict stands, and
+            // retrying would only requeue the refusal.
+            clear.extend(
+                chunk
+                    .iter()
+                    .filter_map(|id| pending.iter().find(|p| &p.jmap_id == id).map(|p| p.message)),
+            );
+        }
+        store.clear_pending_deletes(&clear)?;
+        Ok(deleted)
     }
 }
 
@@ -1882,6 +2107,65 @@ mod tests {
             .collect::<Vec<_>>(),
         );
         assert!(!filing_allowed(&locked, &hoarder, Some("Receipts")));
+    }
+
+    #[test]
+    fn archives_exit_the_inbox_and_keep_everything_else() {
+        let layout = Layout::of(&mailboxes());
+        assert_eq!(layout.archive.as_deref(), Some("M-archive"));
+
+        let in_inbox = BTreeMap::from([
+            ("M-in".to_string(), true),
+            ("M-watch".to_string(), true),
+            ("M-school".to_string(), true),
+        ]);
+        assert_eq!(
+            archived_mailboxes(&in_inbox, &layout),
+            Some(BTreeMap::from([
+                ("M-watch".to_string(), true),
+                ("M-school".to_string(), true),
+                ("M-archive".to_string(), true),
+            ]))
+        );
+
+        // Already out of the Inbox: no exit to make, nothing touched.
+        let filed_out = BTreeMap::from([("M-school".to_string(), true)]);
+        assert_eq!(archived_mailboxes(&filed_out, &layout), None);
+
+        // No Archive mailbox to land in: no exit either.
+        let mut bare = Layout::of(&mailboxes());
+        bare.archive = None;
+        assert_eq!(archived_mailboxes(&in_inbox, &bare), None);
+
+        // Full rights allow it.
+        assert!(archive_allowed(&layout));
+
+        let full = rights(true, true, true, true, true, true, true, true);
+
+        // The Inbox hoarding or Archive shut stops it.
+        let shut = |inbox: Value, archive: Value| {
+            Layout::of(
+                &[
+                    mailbox("M-in", "Inbox", Some("inbox"), inbox),
+                    mailbox("M-archive", "Archive", Some("archive"), archive),
+                ]
+                .into_iter()
+                .map(|m| serde_json::from_value::<Mailbox>(m).unwrap())
+                .collect::<Vec<_>>(),
+            )
+        };
+        let mut hoard = full.clone();
+        hoard["mayRemoveItems"] = json!(false);
+        assert!(!archive_allowed(&shut(hoard, full.clone())));
+        let mut closed = full.clone();
+        closed["mayAddItems"] = json!(false);
+        assert!(!archive_allowed(&shut(full.clone(), closed)));
+    }
+
+    #[test]
+    fn a_destroy_reply_that_wont_parse_fails() {
+        let err = parse_destroy_emails(json!({"destroyed": 3})).unwrap_err();
+        assert!(err.to_string().contains("malformed Email/destroy"), "{err}");
     }
 
     #[test]

@@ -478,3 +478,28 @@ async fn serves_assets() {
         assert!(res.text().await.unwrap().contains(needle));
     }
 }
+
+#[tokio::test]
+async fn trashing_confirms_through_a_dialog_and_marks_done() {
+    let addr = spawn().await;
+    // The trash affordance is a dialog on writable accounts: open it
+    // with showModal, cancel closes without posting, and the form
+    // targets the delete route.
+    let (_, body) = get(addr, SAM, "/inbox?m=8").await;
+    assert!(body.contains(r#"id="trash-8""#));
+    assert!(body.contains("showModal"));
+    assert!(body.contains("Move to Trash?"));
+    assert!(body.contains(r#"formmethod="dialog""#));
+    assert!(body.contains(r#"action="/messages/8/delete""#));
+
+    let res = post(addr, SAM, "/messages/8/delete", &[("back", "/inbox?m=8")]).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let (_, body) = get(addr, SAM, "/search?q=142.18&m=8").await;
+    assert!(body.contains(r#"<span class="badge success"><span class="mark"></span>Done</span>"#));
+
+    // Read-only accounts get neither the dialog nor the route.
+    let (_, body) = get(addr, SAM, "/watch?m=20").await;
+    assert!(!body.contains(r#"id="trash-20""#));
+    let res = post(addr, SAM, "/messages/20/delete", &[("back", "/watch?m=20")]).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}

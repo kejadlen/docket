@@ -454,6 +454,19 @@ fn values_controls(p: &Page<'_>, id: u32, values: &Values, read_only: bool) -> M
                 None => span.type-label.value.unset { "Assign" },
             }
         }, format!("/messages/{id}/assignees"), p.here, people))
+        @if !read_only {
+            button.del-btn type="button" aria-haspopup="dialog"
+                onclick=(format!("document.getElementById('trash-{}').showModal()", id)) { "Trash" }
+            dialog id=(format!("trash-{}", id)) {
+                h3 { "Move to Trash?" }
+                p { "The thread goes Done in Docket; the mail lands in Fastmail's Trash." }
+                form method="post" action=(format!("/messages/{id}/delete")) {
+                    (back(p.here))
+                    button.btn type="submit" formmethod="dialog" autofocus { "Cancel" }
+                    button.btn.danger type="submit" { "Trash" }
+                }
+            }
+        }
     }
 }
 

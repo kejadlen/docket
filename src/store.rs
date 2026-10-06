@@ -23,6 +23,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_jmap_import.sql"),
     include_str!("../migrations/0003_pending_files.sql"),
+    include_str!("../migrations/0004_pending_deletes.sql"),
+    include_str!("../migrations/0005_pending_archives.sql"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,7 +90,7 @@ pub struct Store {
 #[derive(Debug)]
 struct Inner {
     conn: Connection,
-    undo: BTreeMap<String, (MessageId, Values)>,
+    undo: BTreeMap<String, (MessageId, Values, bool)>,
     flash: BTreeMap<String, Flash>,
 }
 
@@ -343,10 +345,20 @@ impl Store {
         };
         let prev = values;
         let mut next = prev.clone();
+        // Whether this edit queued the message's exit from the shared
+        // Inbox, so an undo can cancel it before the poll pushes it.
+        let mut queued_archive = false;
 
         let text = match change {
             Change::State(state) => {
                 next.state = state;
+                // Done means finished: on a writable account the mail
+                // also leaves the shared Inbox for Archive (labels and
+                // folders kept). Read-only accounts change state only.
+                if state == State::Done && !read_only {
+                    queue_archive(&tx, id)?;
+                    queued_archive = true;
+                }
                 format!("Moved to {state}")
             }
             Change::Folder(folder) => {
@@ -384,11 +396,19 @@ impl Store {
         write_values(&tx, id, &next)?;
         insert_event(&tx, id, user, self.now(), &text)?;
         tx.commit()?;
-        inner.undo.insert(user.to_owned(), (id, prev));
+        inner
+            .undo
+            .insert(user.to_owned(), (id, prev, queued_archive));
+        let flash = if queued_archive {
+            // The verb is Done; the archive is what it does.
+            "Done — leaves the shared Inbox".to_owned()
+        } else {
+            text
+        };
         inner.flash.insert(
             user.to_owned(),
             Flash {
-                text,
+                text: flash,
                 undoable: true,
             },
         );
@@ -397,12 +417,18 @@ impl Store {
 
     pub fn undo(&self, user: &str) -> Result<(), Error> {
         let mut inner = self.lock();
-        let (id, prev) = inner
+        let (id, prev, queued_archive) = inner
             .undo
             .get(user)
             .cloned()
             .ok_or(Error::BadRequest("nothing to undo"))?;
         let tx = inner.conn.transaction()?;
+        // An undone Done cancels its queued exit from the Inbox; if the
+        // poll already pushed it, the mail sits in Archive and the
+        // state simply reverts.
+        if queued_archive {
+            tx.execute("DELETE FROM pending_archives WHERE message = ?1", [id])?;
+        }
         // An undone filing reverts server-side too: the queued intent
         // points back at the folder the undo restores.
         let msg = load_message(&tx, id)?.ok_or(Error::NotFound("message"))?;
@@ -456,6 +482,116 @@ impl Store {
         let tx = inner.conn.transaction()?;
         for id in messages {
             tx.execute("DELETE FROM pending_files WHERE message = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes a message (task sm): queued for the poll loop to
+    /// destroy server-side — which lands it in Trash — while the
+    /// thread goes Done here with a history event. Any queued filing
+    /// or archive is superseded.
+    pub fn delete(&self, user: &str, id: MessageId) -> Result<(), Error> {
+        let mut inner = self.lock();
+        let tx = inner.conn.transaction()?;
+        let msg = load_message(&tx, id)?.ok_or(Error::NotFound("message"))?;
+        let read_only = load_thread_account(&tx, msg.thread)?.is_some_and(|a| a.read_only);
+        if read_only {
+            return Err(Error::Forbidden("this account is read-only"));
+        }
+        let prev = msg
+            .values()
+            .ok_or(Error::BadRequest("sent messages have no values"))?
+            .clone();
+        let mut next = prev;
+        next.state = State::Done;
+        tx.execute(
+            "INSERT INTO pending_deletes (message)
+             SELECT ?1 FROM messages WHERE id = ?1 AND jmap_id IS NOT NULL
+             ON CONFLICT (message) DO NOTHING",
+            [id],
+        )?;
+        tx.execute("DELETE FROM pending_files WHERE message = ?1", [id])?;
+        tx.execute("DELETE FROM pending_archives WHERE message = ?1", [id])?;
+        write_values(&tx, id, &next)?;
+        insert_event(&tx, id, user, self.now(), "Deleted")?;
+        tx.commit()?;
+        inner.flash.insert(
+            user.to_owned(),
+            Flash {
+                text: "Deleted".into(),
+                // The server-side trash can't be undone from here.
+                undoable: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// The account's queued deletions, for the poll loop to push (task
+    /// sm).
+    pub fn pending_deletes(&self, account: &str) -> Result<Vec<PendingDelete>, Error> {
+        let inner = self.lock();
+        let mut stmt = inner.conn.prepare_cached(
+            "SELECT p.message, m.jmap_id
+             FROM pending_deletes p JOIN messages m ON m.id = p.message
+             WHERE m.account = ?1 ORDER BY p.message",
+        )?;
+        let pending = stmt
+            .query_map([account], |r| {
+                Ok(PendingDelete {
+                    message: r.get(0)?,
+                    jmap_id: r.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(pending)
+    }
+
+    /// Drops queued deletions once the server has taken them — or
+    /// refused them, which no retry would fix.
+    pub fn clear_pending_deletes(&self, messages: &[MessageId]) -> Result<(), Error> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock();
+        let tx = inner.conn.transaction()?;
+        for id in messages {
+            tx.execute("DELETE FROM pending_deletes WHERE message = ?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The account's queued archives — the Done-is-finished policy —
+    /// for the poll loop to push.
+    pub fn pending_archives(&self, account: &str) -> Result<Vec<PendingArchive>, Error> {
+        let inner = self.lock();
+        let mut stmt = inner.conn.prepare_cached(
+            "SELECT p.message, m.jmap_id
+             FROM pending_archives p JOIN messages m ON m.id = p.message
+             WHERE m.account = ?1 ORDER BY p.message",
+        )?;
+        let pending = stmt
+            .query_map([account], |r| {
+                Ok(PendingArchive {
+                    message: r.get(0)?,
+                    jmap_id: r.get(1)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(pending)
+    }
+
+    /// Drops queued archives once the server has taken them — or
+    /// refused them, or never needed them.
+    pub fn clear_pending_archives(&self, messages: &[MessageId]) -> Result<(), Error> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock();
+        let tx = inner.conn.transaction()?;
+        for id in messages {
+            tx.execute("DELETE FROM pending_archives WHERE message = ?1", [id])?;
         }
         tx.commit()?;
         Ok(())
@@ -532,6 +668,26 @@ pub struct PendingFile {
     pub jmap_id: String,
     /// The folder to file into; None unfiles.
     pub folder: Option<String>,
+}
+
+/// One queued deletion, waiting for the poll loop to push it (task
+/// sm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDelete {
+    pub message: MessageId,
+    /// The JMAP Email id to destroy — cached on the message, read fresh
+    /// at drain time so a reimport's new id is the one that goes out.
+    pub jmap_id: String,
+}
+
+/// One queued archive, waiting for the poll loop to push it: Done's
+/// exit from the shared Inbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingArchive {
+    pub message: MessageId,
+    /// The JMAP Email id to move — cached on the message, read fresh at
+    /// drain time so a reimport's new id is the one that goes out.
+    pub jmap_id: String,
 }
 
 /// Writes inside one transaction, from [`Store::import`].
@@ -889,6 +1045,19 @@ fn queue_file(conn: &Connection, id: MessageId, folder: Option<&str>) -> Result<
     Ok(())
 }
 
+/// Queues the message's exit from the shared Inbox (Done's meaning on
+/// a writable account). Fixture mail has no server side to leave, so
+/// rows without a cached JMAP id stay out.
+fn queue_archive(conn: &Connection, id: MessageId) -> Result<(), Error> {
+    conn.execute(
+        "INSERT INTO pending_archives (message)
+         SELECT ?1 FROM messages WHERE id = ?1 AND jmap_id IS NOT NULL
+         ON CONFLICT (message) DO NOTHING",
+        [id],
+    )?;
+    Ok(())
+}
+
 fn insert_event(
     conn: &Connection,
     message: MessageId,
@@ -1110,6 +1279,195 @@ mod tests {
     }
 
     #[test]
+    fn done_queues_the_exit_from_the_shared_inbox() {
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        store
+            .import(|tx| {
+                tx.account(&Account {
+                    slug: "household".into(),
+                    name: "Household".into(),
+                    address: "household@example.com".into(),
+                    read_only: false,
+                })?;
+                tx.incoming("household", &incoming(State::Inbox, None, "$1,840"))
+            })
+            .unwrap();
+        let id = store
+            .messages(Filter::Search("1,840"))
+            .unwrap()
+            .first()
+            .unwrap()
+            .id;
+        store.sign_in(SAM, "Sam").unwrap();
+
+        // Done on a writable account queues the archive; the history
+        // names the verb, the flash teaches what it does.
+        store.edit(SAM, id, Change::State(State::Done)).unwrap();
+        assert_eq!(values(&store, id).state, State::Done);
+        assert_eq!(
+            store.pending_archives("household").unwrap(),
+            [PendingArchive {
+                message: id,
+                jmap_id: "E9".into(),
+            }]
+        );
+        assert_eq!(
+            store.take_flash(SAM).unwrap(),
+            Flash {
+                text: "Done — leaves the shared Inbox".into(),
+                undoable: true,
+            }
+        );
+        let history: Vec<_> = store
+            .history(id)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.user, e.text))
+            .collect();
+        assert_eq!(history, [(SAM.into(), "Moved to Done".into())]);
+
+        // Undo reverts the state and cancels the queued exit.
+        store.undo(SAM).unwrap();
+        assert_eq!(values(&store, id).state, State::Inbox);
+        assert!(store.pending_archives("household").unwrap().is_empty());
+
+        // Another account's drain never sees them; what the poll
+        // pushed, it clears.
+        store.edit(SAM, id, Change::State(State::Done)).unwrap();
+        assert!(store.pending_archives("eli").unwrap().is_empty());
+        store.clear_pending_archives(&[id]).unwrap();
+        assert!(store.pending_archives("household").unwrap().is_empty());
+        store.clear_pending_archives(&[]).unwrap();
+
+        // Deleting a Done message supersedes its queued archive.
+        store.edit(SAM, id, Change::State(State::Done)).unwrap();
+        store.delete(SAM, id).unwrap();
+        assert!(store.pending_archives("household").unwrap().is_empty());
+        assert_eq!(store.pending_deletes("household").unwrap().len(), 1);
+
+        // A Done that can't queue fails the whole edit, leaving the
+        // state alone.
+        exec(
+            &store,
+            "CREATE TRIGGER no_pending_archive BEFORE INSERT ON pending_archives BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        );
+        store.edit(SAM, id, Change::State(State::Inbox)).unwrap();
+        assert!(matches!(
+            store.edit(SAM, id, Change::State(State::Done)),
+            Err(Error::Db(_))
+        ));
+        exec(&store, "DROP TRIGGER no_pending_archive;");
+        assert_eq!(values(&store, id).state, State::Inbox);
+    }
+
+    #[test]
+    fn done_without_a_server_side_stays_docket_local() {
+        // Read-only accounts and fixture mail mark Done without queueing
+        // anything.
+        let store = fixtures::store().unwrap();
+        let eli = fixtures::ELI_PRACTICE;
+        store.edit(SAM, eli, Change::State(State::Done)).unwrap();
+        assert!(store.pending_archives("eli").unwrap().is_empty());
+        assert_eq!(store.take_flash(SAM).unwrap().text, "Moved to Done");
+        store.edit(SAM, 4, Change::State(State::Done)).unwrap();
+        assert!(store.pending_archives("household").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_gone_pending_archives_table_fails_the_drain() {
+        // A fresh store, so the query compiles against the missing
+        // table rather than replaying a cached statement.
+        let store = fixtures::store().unwrap();
+        exec(&store, "DROP TABLE pending_archives;");
+        assert!(store.pending_archives("household").is_err());
+    }
+
+    #[test]
+    fn deleting_marks_done_and_queues_the_destroy() {
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        store
+            .import(|tx| {
+                tx.account(&Account {
+                    slug: "household".into(),
+                    name: "Household".into(),
+                    address: "household@example.com".into(),
+                    read_only: false,
+                })?;
+                tx.folder("House")?;
+                tx.incoming("household", &incoming(State::Inbox, None, "$1,840"))
+            })
+            .unwrap();
+        let id = store
+            .messages(Filter::Search("1,840"))
+            .unwrap()
+            .first()
+            .unwrap()
+            .id;
+        store.sign_in(SAM, "Sam").unwrap();
+
+        // A queued filing is superseded: the destroy replaces it.
+        store
+            .edit(SAM, id, Change::Folder(Some("House".into())))
+            .unwrap();
+        store.delete(SAM, id).unwrap();
+        assert_eq!(values(&store, id).state, State::Done);
+        assert_eq!(
+            store.pending_deletes("household").unwrap(),
+            [PendingDelete {
+                message: id,
+                jmap_id: "E9".into(),
+            }]
+        );
+        assert!(store.pending_files("household").unwrap().is_empty());
+        assert_eq!(
+            store.take_flash(SAM),
+            Some(Flash {
+                text: "Deleted".into(),
+                undoable: false
+            })
+        );
+        let history: Vec<_> = store
+            .history(id)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.user, e.text))
+            .collect();
+        assert_eq!(
+            history,
+            [
+                (SAM.into(), "Filed to House".into()),
+                (SAM.into(), "Deleted".into())
+            ]
+        );
+
+        // Another account's drain never sees them; what the poll
+        // pushed, it clears.
+        assert!(store.pending_deletes("eli").unwrap().is_empty());
+        store.clear_pending_deletes(&[id]).unwrap();
+        assert!(store.pending_deletes("household").unwrap().is_empty());
+        store.clear_pending_deletes(&[]).unwrap();
+
+        // A deletion that can't queue fails, leaving the state alone.
+        exec(
+            &store,
+            "CREATE TRIGGER no_pending_delete BEFORE INSERT ON pending_deletes BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        );
+        store.edit(SAM, id, Change::State(State::Inbox)).unwrap();
+        assert!(matches!(store.delete(SAM, id), Err(Error::Db(_))));
+        exec(&store, "DROP TRIGGER no_pending_delete;");
+        assert_eq!(values(&store, id).state, State::Inbox);
+    }
+
+    #[test]
+    fn a_gone_pending_deletes_table_fails_the_drain() {
+        // A fresh store, so the query compiles against the missing
+        // table rather than replaying a cached statement.
+        let store = fixtures::store().unwrap();
+        exec(&store, "DROP TABLE pending_deletes;");
+        assert!(store.pending_deletes("household").is_err());
+    }
+
+    #[test]
     fn read_only_accounts_cannot_file() {
         let store = fixtures::store().unwrap();
         let eli = fixtures::ELI_PRACTICE;
@@ -1117,7 +1475,20 @@ mod tests {
             store.edit(SAM, eli, Change::Folder(None)),
             Err(Error::Forbidden(_))
         ));
+        assert!(matches!(store.delete(SAM, eli), Err(Error::Forbidden(_))));
         store.edit(SAM, eli, Change::State(State::Done)).unwrap();
+    }
+
+    #[test]
+    fn fixture_and_sent_mail_delete_differently() {
+        let store = fixtures::store().unwrap();
+        // Fixture mail has no server side to trash, so no row queues —
+        // but the thread still goes Done.
+        store.delete(SAM, 4).unwrap();
+        assert_eq!(values(&store, 4).state, State::Done);
+        assert!(store.pending_deletes("household").unwrap().is_empty());
+        // Sent replies carry no values to transition.
+        assert!(matches!(store.delete(SAM, 2), Err(Error::BadRequest(_))));
     }
 
     #[test]

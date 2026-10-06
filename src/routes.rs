@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/search", get(search))
         .route("/messages/{id}/state", post(set_state))
         .route("/messages/{id}/folder", post(set_folder))
+        .route("/messages/{id}/delete", post(delete_message))
         .route("/messages/{id}/assignees", post(toggle_assignee))
         .route("/threads/{id}/comments", post(add_comment))
         .route("/undo", post(undo))
@@ -250,6 +251,16 @@ async fn edit(
 ) -> Result<Redirect, Error> {
     state.store.edit(&me.login, id, change)?;
     Ok(Redirect::to(safe_back(back)))
+}
+
+async fn delete_message(
+    Extract(state): Extract<AppState>,
+    Me(me): Me,
+    Path(id): Path<MessageId>,
+    Form(form): Form<BackForm>,
+) -> Result<Redirect, Error> {
+    state.store.delete(&me.login, id)?;
+    Ok(Redirect::to(safe_back(&form.back)))
 }
 
 #[derive(Deserialize)]
