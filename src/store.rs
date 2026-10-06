@@ -22,6 +22,7 @@ use crate::model::{
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_jmap_import.sql"),
+    include_str!("../migrations/0003_pending_files.sql"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,7 +353,7 @@ impl Store {
                 if read_only {
                     return Err(Error::Forbidden("this account is read-only"));
                 }
-                match folder {
+                let text = match folder {
                     Some(f) if !folder_exists(&tx, &f)? => {
                         return Err(Error::NotFound("folder"));
                     }
@@ -365,7 +366,9 @@ impl Store {
                         next.folder = None;
                         "Removed from folder".to_owned()
                     }
-                }
+                };
+                queue_file(&tx, id, next.folder.as_deref())?;
+                text
             }
             Change::ToggleAssignee(login) => {
                 let name = load_user(&tx, &login)?.ok_or(Error::NotFound("user"))?.slug;
@@ -400,6 +403,14 @@ impl Store {
             .cloned()
             .ok_or(Error::BadRequest("nothing to undo"))?;
         let tx = inner.conn.transaction()?;
+        // An undone filing reverts server-side too: the queued intent
+        // points back at the folder the undo restores.
+        let msg = load_message(&tx, id)?.ok_or(Error::NotFound("message"))?;
+        if let Kind::Received { values, .. } = &msg.kind
+            && values.folder != prev.folder
+        {
+            queue_file(&tx, id, prev.folder.as_deref())?;
+        }
         write_values(&tx, id, &prev)?;
         insert_event(&tx, id, user, self.now(), "Undone")?;
         tx.commit()?;
@@ -411,6 +422,42 @@ impl Store {
                 undoable: false,
             },
         );
+        Ok(())
+    }
+
+    /// The account's queued filings, for the poll loop to push (task
+    /// rn). The latest intent per message is the only row there is.
+    pub fn pending_files(&self, account: &str) -> Result<Vec<PendingFile>, Error> {
+        let inner = self.lock();
+        let mut stmt = inner.conn.prepare_cached(
+            "SELECT p.message, m.jmap_id, p.folder
+             FROM pending_files p JOIN messages m ON m.id = p.message
+             WHERE m.account = ?1 ORDER BY p.message",
+        )?;
+        let pending = stmt
+            .query_map([account], |r| {
+                Ok(PendingFile {
+                    message: r.get(0)?,
+                    jmap_id: r.get(1)?,
+                    folder: r.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(pending)
+    }
+
+    /// Drops queued filings once the server has taken them — or
+    /// refused them, which no retry would fix.
+    pub fn clear_pending_files(&self, messages: &[MessageId]) -> Result<(), Error> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock();
+        let tx = inner.conn.transaction()?;
+        for id in messages {
+            tx.execute("DELETE FROM pending_files WHERE message = ?1", [id])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -474,6 +521,17 @@ pub enum IncomingKind {
     /// `by` is a login when the From address names one of us; None means
     /// the account's shared identity.
     Sent { by: Option<String>, to: Vec<String> },
+}
+
+/// One queued filing, waiting for the poll loop to push it (task rn).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFile {
+    pub message: MessageId,
+    /// The JMAP Email id to move — cached on the message, read fresh at
+    /// drain time so a reimport's new id is the one that goes out.
+    pub jmap_id: String,
+    /// The folder to file into; None unfiles.
+    pub folder: Option<String>,
 }
 
 /// Writes inside one transaction, from [`Store::import`].
@@ -818,6 +876,19 @@ fn write_values(conn: &Connection, id: MessageId, values: &Values) -> Result<(),
     Ok(())
 }
 
+/// Records a filing for the poll loop to push (task rn). Fixture mail
+/// has no server side to move, so rows without a cached JMAP id stay
+/// out.
+fn queue_file(conn: &Connection, id: MessageId, folder: Option<&str>) -> Result<(), Error> {
+    conn.execute(
+        "INSERT INTO pending_files (message, folder)
+         SELECT ?1, ?2 FROM messages WHERE id = ?1 AND jmap_id IS NOT NULL
+         ON CONFLICT (message) DO UPDATE SET folder = excluded.folder",
+        params![id, folder],
+    )?;
+    Ok(())
+}
+
 fn insert_event(
     conn: &Connection,
     message: MessageId,
@@ -926,6 +997,96 @@ mod tests {
                 (SAM.into(), store.now(), "Undone".into()),
             ]
         );
+    }
+
+    #[test]
+    fn filing_queues_intent_for_the_poll_loop() {
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        store
+            .import(|tx| {
+                tx.account(&Account {
+                    slug: "household".into(),
+                    name: "Household".into(),
+                    address: "household@example.com".into(),
+                    read_only: false,
+                })?;
+                tx.folder("House")?;
+                tx.incoming("household", &incoming(State::Inbox, None, "$1,840"))
+            })
+            .unwrap();
+        let id = store
+            .messages(Filter::Search("1,840"))
+            .unwrap()
+            .first()
+            .unwrap()
+            .id;
+        store.sign_in(SAM, "Sam").unwrap();
+
+        // Filing queues the intent, and the latest one wins.
+        store
+            .edit(SAM, id, Change::Folder(Some("House".into())))
+            .unwrap();
+        store.edit(SAM, id, Change::Folder(None)).unwrap();
+        assert_eq!(
+            store.pending_files("household").unwrap(),
+            [PendingFile {
+                message: id,
+                jmap_id: "E9".into(),
+                folder: None,
+            }]
+        );
+
+        // Another account's drain never sees them.
+        assert!(store.pending_files("eli").unwrap().is_empty());
+
+        // What the poll loop pushed, it clears.
+        store.clear_pending_files(&[id]).unwrap();
+        assert!(store.pending_files("household").unwrap().is_empty());
+        store.clear_pending_files(&[]).unwrap();
+
+        // Undoing a filing re-points the queue at the restored folder.
+        store
+            .edit(SAM, id, Change::Folder(Some("House".into())))
+            .unwrap();
+        assert_eq!(
+            store.pending_files("household").unwrap()[0].folder,
+            Some("House".into())
+        );
+        store.undo(SAM).unwrap();
+        assert_eq!(store.pending_files("household").unwrap()[0].folder, None);
+
+        // A filing that can't queue fails the whole edit, and the
+        // folder it would have set rolls back.
+        exec(
+            &store,
+            "CREATE TRIGGER no_pending BEFORE INSERT ON pending_files BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        );
+        assert!(matches!(
+            store.edit(SAM, id, Change::Folder(Some("House".into()))),
+            Err(Error::Db(_))
+        ));
+        exec(&store, "DROP TRIGGER no_pending;");
+        assert_eq!(values(&store, id).folder, None);
+    }
+
+    #[test]
+    fn a_gone_pending_table_fails_the_drain() {
+        // A fresh store, so the query compiles against the missing
+        // table rather than replaying a cached statement.
+        let store = fixtures::store().unwrap();
+        exec(&store, "DROP TABLE pending_files;");
+        assert!(store.pending_files("household").is_err());
+    }
+
+    #[test]
+    fn fixture_mail_never_queues_a_filing() {
+        let store = fixtures::store().unwrap();
+        store
+            .edit(SAM, 4, Change::Folder(Some("Finance".into())))
+            .unwrap();
+        // No server side to move, so no row: fixture mail has no cached
+        // JMAP id.
+        assert!(store.pending_files("household").unwrap().is_empty());
     }
 
     #[test]

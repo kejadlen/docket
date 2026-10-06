@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use docket::jmap::{CORE, Client, Credential, MAIL, SUBMISSION};
 use docket::model::{Kind, State};
-use docket::store::{Clock, Filter, Store};
+use docket::store::{Change, Clock, Filter, Store};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -307,6 +307,8 @@ fn threads_of(account: &str) -> Vec<Value> {
 #[derive(Default)]
 struct Stub {
     accounts: BTreeMap<&'static str, AccountMail>,
+    /// Email ids `Email/set` refuses, to exercise the notUpdated path.
+    refuse: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -398,6 +400,25 @@ impl Stub {
             .push(mailbox);
         self.snapshot(account);
     }
+
+    /// Rewrites a mailbox's ACLs the way an admin would.
+    fn update_mailbox(&mut self, account: &'static str, id: &str, change: impl FnOnce(&mut Value)) {
+        let mail = self.accounts.get_mut(account).unwrap();
+        let mailbox = mail
+            .mailboxes
+            .iter_mut()
+            .find(|m| m["id"] == json!(id))
+            .unwrap();
+        change(mailbox);
+        self.snapshot(account);
+    }
+
+    /// Deletes a mailbox, the way a server does when a folder goes away.
+    fn remove_mailbox(&mut self, account: &'static str, id: &str) {
+        let mail = self.accounts.get_mut(account).unwrap();
+        mail.mailboxes.retain(|m| m["id"] != json!(id));
+        self.snapshot(account);
+    }
 }
 
 /// The `/changes` reply for one type: the diff from the named state to
@@ -464,6 +485,37 @@ async fn api(world: axum::extract::State<World>, headers: HeaderMap, body: Strin
     let call = &request["methodCalls"][0];
     let method = call[0].as_str().expect("a method name").to_owned();
     let args = &call[1];
+
+    // The one mutating method, so it locks for itself and answers early.
+    if method == "Email/set" {
+        let mut stub = world.lock().unwrap();
+        let mut updated = serde_json::Map::new();
+        let mut not_updated = serde_json::Map::new();
+        for (id, patch) in args["update"].as_object().expect("an update map") {
+            if stub.refuse.contains(id) {
+                not_updated.insert(
+                    id.clone(),
+                    json!({"type": "serverFail", "description": "refused"}),
+                );
+                continue;
+            }
+            let mail = stub.accounts.get_mut(account).unwrap();
+            match mail.emails.iter_mut().find(|e| e["id"] == json!(id)) {
+                // A patch's mailboxIds replaces the whole membership set.
+                Some(email) => {
+                    email["mailboxIds"] = patch["mailboxIds"].clone();
+                    updated.insert(id.clone(), Value::Null);
+                }
+                None => {
+                    not_updated.insert(id.clone(), json!({"type": "notFound"}));
+                }
+            }
+        }
+        stub.snapshot(account);
+        let reply = json!({"accountId": account, "oldState": "s", "newState": "s",
+                           "updated": updated, "notUpdated": not_updated});
+        return Json(json!({"methodResponses": [["Email/set", reply, "0"]]})).into_response();
+    }
 
     let stub = world.lock().unwrap();
     let mail = stub.accounts.get(account).unwrap();
@@ -1093,4 +1145,204 @@ async fn many_changes_page_through() {
 
     assert_eq!(counts.imported, 60, "{counts:?}");
     assert_eq!(store.messages(Filter::Search("")).unwrap().len(), 65);
+}
+
+/// The school message, which sits in Inbox plus a Docket label plus a
+/// folder — the shape filing has to move without disturbing the rest.
+fn school_message(store: &Store) -> docket::model::Message {
+    store
+        .messages(Filter::Search("Buses now return"))
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn filing_pushes_through_the_poll() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit(
+            "sam@example.com",
+            school.id,
+            Change::Folder(Some("Receipts".into())),
+        )
+        .unwrap();
+    assert_eq!(store.pending_files("household").unwrap().len(), 1);
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.filed, 1, "{counts:?}");
+
+    // Server side: out of School, into Receipts, with Inbox and the
+    // Docket label untouched.
+    let memberships = {
+        let world = world.lock().unwrap();
+        world.accounts[HOUSEHOLD]
+            .emails
+            .iter()
+            .find(|e| e["id"] == json!("E-school"))
+            .unwrap()["mailboxIds"]
+            .clone()
+    };
+    assert_eq!(
+        memberships,
+        json!({"MB-in": true, "MB-watch": true, "MB-receipts": true})
+    );
+
+    // The push cleared the queue, and the same cycle's /changes sweep
+    // confirmed the filing in the cached row.
+    assert!(store.pending_files("household").unwrap().is_empty());
+    let after = store.message(school.id).unwrap().unwrap();
+    assert_eq!(after.values().unwrap().folder.as_deref(), Some("Receipts"));
+    assert_eq!(after.values().unwrap().state, State::Watch);
+
+    // Unfiling queues again and empties every folder membership.
+    store
+        .edit("sam@example.com", school.id, Change::Folder(None))
+        .unwrap();
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(counts.filed, 1, "{counts:?}");
+    let memberships = {
+        let world = world.lock().unwrap();
+        world.accounts[HOUSEHOLD]
+            .emails
+            .iter()
+            .find(|e| e["id"] == json!("E-school"))
+            .unwrap()["mailboxIds"]
+            .clone()
+    };
+    assert_eq!(memberships, json!({"MB-in": true, "MB-watch": true}));
+}
+
+#[tokio::test]
+async fn acl_denied_filings_wait_for_the_rights() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    // Receipts stops taking items before the filing reaches it; the
+    // poll rebuilds the layout off Mailbox/changes and holds the queue.
+    world
+        .lock()
+        .unwrap()
+        .update_mailbox(HOUSEHOLD, "MB-receipts", |m| {
+            m["myRights"]["mayAddItems"] = json!(false);
+        });
+    let school = school_message(&store);
+    store
+        .edit(
+            "sam@example.com",
+            school.id,
+            Change::Folder(Some("Receipts".into())),
+        )
+        .unwrap();
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(counts.filed, 0, "{counts:?}");
+    assert_eq!(store.pending_files("household").unwrap().len(), 1);
+
+    // The rights come back and the waiting filing goes through.
+    world
+        .lock()
+        .unwrap()
+        .update_mailbox(HOUSEHOLD, "MB-receipts", |m| {
+            m["myRights"]["mayAddItems"] = json!(true);
+        });
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(counts.filed, 1, "{counts:?}");
+    assert!(store.pending_files("household").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_filing_clears_rather_than_retries() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit(
+            "sam@example.com",
+            school.id,
+            Change::Folder(Some("Receipts".into())),
+        )
+        .unwrap();
+    world.lock().unwrap().refuse.insert("E-school".into());
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    // The server's verdict stands: cleared, not requeued, and the
+    // cached row keeps the user's view until the server says otherwise.
+    assert_eq!(counts.filed, 0, "{counts:?}");
+    assert!(store.pending_files("household").unwrap().is_empty());
+    assert_eq!(
+        store
+            .message(school.id)
+            .unwrap()
+            .unwrap()
+            .values()
+            .unwrap()
+            .folder,
+        Some("Receipts".into())
+    );
+}
+
+#[tokio::test]
+async fn a_filing_for_mail_thats_gone_drops() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit(
+            "sam@example.com",
+            school.id,
+            Change::Folder(Some("Receipts".into())),
+        )
+        .unwrap();
+    world.lock().unwrap().remove_email(HOUSEHOLD, "E-school");
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.filed, 0, "{counts:?}");
+    assert!(store.pending_files("household").unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_filing_into_a_vanished_folder_drops() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit(
+            "sam@example.com",
+            school.id,
+            Change::Folder(Some("Receipts".into())),
+        )
+        .unwrap();
+    // The folder's mailbox disappears before the push lands: no id to
+    // file into, and nothing to retry.
+    world
+        .lock()
+        .unwrap()
+        .remove_mailbox(HOUSEHOLD, "MB-receipts");
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.filed, 0, "{counts:?}");
+    assert!(store.pending_files("household").unwrap().is_empty());
 }

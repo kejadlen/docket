@@ -6,8 +6,9 @@
 //!
 //! Keeping up with the server is polling for now (task lylzwoyo):
 //! `poll_once` applies `Email/changes` and `Mailbox/changes` since the
-//! states the last sync left. Push replaces the timer later (task
-//! nwylszul); the changes application stays.
+//! states the last sync left, and drains queued filings (task rn) with
+//! `Email/set`. Push replaces the timer later (task nwylszul); the
+//! changes application stays.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -23,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::Error;
-use crate::model::{Account, State, User};
+use crate::model::{Account, MessageId, State, User};
 use crate::store::{Incoming, IncomingKind, Store};
 
 /// RFC 8620 §9. The capability URNs Docket looks for.
@@ -436,8 +437,8 @@ struct Layout {
     labels: BTreeMap<String, State>,
     /// Mailbox ids in the Docket namespace: the labels and the parent.
     docket: BTreeSet<String>,
-    /// Folder mailbox id → name.
-    folders: BTreeMap<String, String>,
+    /// Folder mailbox id → its name and ACLs.
+    folders: BTreeMap<String, Folder>,
 }
 
 impl Layout {
@@ -468,9 +469,13 @@ impl Layout {
                             layout.labels.insert(mailbox.id.clone(), state);
                         }
                     } else {
-                        layout
-                            .folders
-                            .insert(mailbox.id.clone(), mailbox.name.clone());
+                        layout.folders.insert(
+                            mailbox.id.clone(),
+                            Folder {
+                                name: mailbox.name.clone(),
+                                rights: mailbox.my_rights,
+                            },
+                        );
                     }
                 }
             }
@@ -493,7 +498,7 @@ impl Layout {
         email
             .mailbox_ids
             .keys()
-            .find_map(|id| self.folders.get(id).cloned())
+            .find_map(|id| self.folders.get(id).map(|f| f.name.clone()))
     }
 
     /// True when the message sits in the Sent mailbox.
@@ -513,8 +518,76 @@ impl Layout {
 
     /// Folder names in the session's order, for the folders table.
     pub fn folder_names(&self) -> Vec<String> {
-        self.folders.values().cloned().collect()
+        self.folders.values().map(|f| f.name.clone()).collect()
     }
+
+    /// The mailbox id a folder name files into.
+    fn folder_id(&self, name: &str) -> Option<&str> {
+        self.folders
+            .iter()
+            .find(|(_, f)| f.name == name)
+            .map(|(id, _)| id.as_str())
+    }
+}
+
+/// A role-less mailbox outside the Docket namespace: a folder, with
+/// the ACLs that gate moving mail into and out of it.
+#[derive(Debug, Clone)]
+struct Folder {
+    name: String,
+    rights: MailboxRights,
+}
+
+/// The memberships a filing leaves the message in: out of every
+/// folder, into the chosen one, with system boxes and `Docket/`
+/// labels untouched (task rn's done-when).
+fn filed_mailboxes(
+    current: &BTreeMap<String, bool>,
+    layout: &Layout,
+    target: Option<&str>,
+) -> BTreeMap<String, bool> {
+    let mut next: BTreeMap<String, bool> = current
+        .iter()
+        .filter(|(id, member)| **member && !layout.folders.contains_key(*id))
+        .map(|(id, _)| (id.clone(), true))
+        .collect();
+    if let Some(name) = target
+        && let Some(id) = layout.folder_id(name)
+    {
+        next.insert(id.to_owned(), true);
+    }
+    next
+}
+
+/// Whether the ACLs permit the filing: the target takes items, and
+/// every folder losing the message gives them up.
+fn filing_allowed(current: &BTreeMap<String, bool>, layout: &Layout, target: Option<&str>) -> bool {
+    let leaving = current
+        .iter()
+        .filter(|(id, member)| **member && layout.folders.contains_key(*id))
+        .all(|(id, _)| {
+            layout
+                .folders
+                .get(id)
+                .is_some_and(|f| f.rights.may_remove_items)
+        });
+    let entering = target
+        .and_then(|name| layout.folder_id(name))
+        .is_none_or(|id| {
+            layout
+                .folders
+                .get(id)
+                .is_some_and(|f| f.rights.may_add_items)
+        });
+    leaving && entering
+}
+
+/// Parses an `Email/set` reply's verdict on each id.
+fn parse_set_emails(args: Value) -> Result<SetEmailsReply, JmapError> {
+    serde_json::from_value(args).map_err(|source| JmapError::Malformed {
+        what: "Email/set",
+        source,
+    })
 }
 
 /// How much mail one sync brought in.
@@ -544,6 +617,8 @@ pub struct PollCounts {
     pub destroyed: usize,
     /// Whether the layout was rebuilt off `Mailbox/changes`.
     pub mailboxes: bool,
+    /// Filings pushed server-side.
+    pub filed: usize,
     /// Whether the server disowned the stored states and a full
     /// re-import ran instead.
     pub resynced: bool,
@@ -717,6 +792,33 @@ struct GetChanges<'a> {
 /// One page of request and response; small enough to keep bodies cheap.
 const PAGE: usize = 50;
 
+/// `Email/set` arguments (RFC 8621 §5): one patch per email.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetEmails<'a> {
+    account_id: &'a str,
+    update: &'a BTreeMap<String, EmailPatch>,
+}
+
+/// One email's patch: setting `mailboxIds` replaces the whole
+/// membership set.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmailPatch {
+    mailbox_ids: BTreeMap<String, bool>,
+}
+
+/// The outcome half of an `Email/set` reply (RFC 8621 §5.3): which ids
+/// took their patches, and which the server refused.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetEmailsReply {
+    #[serde(default)]
+    updated: BTreeMap<String, Option<Value>>,
+    #[serde(default)]
+    not_updated: BTreeMap<String, Value>,
+}
+
 /// Opens sessions: one per credential, against Fastmail unless a test
 /// points the session URL at a stub.
 #[derive(Clone)]
@@ -861,6 +963,26 @@ impl Client {
             )
             .await?;
         parse_changes(method, args)
+    }
+
+    /// Applies membership patches with one `Email/set`, returning the
+    /// server's verdict on each id.
+    async fn set_emails(
+        &self,
+        api_url: &str,
+        token: &str,
+        account_id: &str,
+        update: &BTreeMap<String, EmailPatch>,
+    ) -> Result<SetEmailsReply, JmapError> {
+        let args = self
+            .call(
+                api_url,
+                token,
+                "Email/set",
+                &SetEmails { account_id, update },
+            )
+            .await?;
+        parse_set_emails(args)
     }
 
     /// Opens the credential's session, records its account, and imports
@@ -1050,10 +1172,11 @@ impl Client {
     }
 
     /// One poll cycle: `/changes` for mailboxes and email since the
-    /// states the account was left in, applying what moved. A
-    /// `cannotCalculateChanges` reply means the server disowns those
-    /// states (RFC 8620 §5.2), so the cycle re-imports from scratch
-    /// and the caller carries the fresh states forward.
+    /// states the account was left in, applying what moved, then the
+    /// queued filings go out. A `cannotCalculateChanges` reply means
+    /// the server disowns those states (RFC 8620 §5.2), so the cycle
+    /// re-imports from scratch and the caller carries the fresh states
+    /// forward.
     pub async fn poll_once(
         &self,
         credential: &Credential,
@@ -1108,6 +1231,10 @@ impl Client {
             })?;
             counts.mailboxes = true;
         }
+
+        counts.filed = self
+            .push_files(&session, &token, id, &credential.name, &sync.layout, store)
+            .await?;
 
         loop {
             let page = match self
@@ -1174,6 +1301,86 @@ impl Client {
             }
         }
         Ok(counts)
+    }
+
+    /// Drains the account's queued filings (task rn): each message's
+    /// memberships move it out of whatever folders hold it into the
+    /// chosen one, leaving system boxes and `Docket/` labels untouched.
+    /// Mailbox ACLs decide — entries the rights refuse stay queued and
+    /// nag the log until an admin grants them; ids the server refused
+    /// or no longer carries are dropped with a warning instead of
+    /// retried forever.
+    async fn push_files(
+        &self,
+        session: &Session,
+        token: &str,
+        account_id: &str,
+        slug: &str,
+        layout: &Layout,
+        store: &Store,
+    ) -> Result<usize, Error> {
+        let pending = store.pending_files(slug)?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        // Memberships come fresh from the server: the store keeps only
+        // the folder they derive from.
+        let mut current: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+        for chunk in pending.chunks(PAGE) {
+            let ids: Vec<String> = chunk.iter().map(|p| p.jmap_id.clone()).collect();
+            let (emails, _) = self
+                .emails(&session.api_url, token, account_id, &ids)
+                .await?;
+            for email in emails {
+                current.insert(email.id.clone(), email.mailbox_ids);
+            }
+        }
+        let mut updates: BTreeMap<String, EmailPatch> = BTreeMap::new();
+        let mut clear: Vec<MessageId> = Vec::new();
+        for p in &pending {
+            let Some(memberships) = current.get(&p.jmap_id) else {
+                tracing::warn!(jmap_id = %p.jmap_id, "filing dropped: the mail is gone server-side");
+                clear.push(p.message);
+                continue;
+            };
+            if p.folder
+                .as_deref()
+                .is_some_and(|f| layout.folder_id(f).is_none())
+            {
+                tracing::warn!(?p.folder, "filing dropped: the folder vanished server-side");
+                clear.push(p.message);
+                continue;
+            }
+            if !filing_allowed(memberships, layout, p.folder.as_deref()) {
+                tracing::warn!(?p.folder, "filing held: mailbox ACLs refuse it");
+                continue;
+            }
+            updates.insert(
+                p.jmap_id.clone(),
+                EmailPatch {
+                    mailbox_ids: filed_mailboxes(memberships, layout, p.folder.as_deref()),
+                },
+            );
+        }
+        let mut filed = 0usize;
+        let entries: Vec<(String, EmailPatch)> = updates.into_iter().collect();
+        for chunk in entries.chunks(PAGE) {
+            let update: BTreeMap<String, EmailPatch> = chunk.iter().cloned().collect();
+            let reply = self
+                .set_emails(&session.api_url, token, account_id, &update)
+                .await?;
+            for (id, error) in &reply.not_updated {
+                tracing::warn!(jmap_id = %id, %error, "the server refused a filing");
+            }
+            filed = filed.saturating_add(reply.updated.len());
+            // Refused ids clear too: the server's verdict stands, and
+            // retrying would only requeue the refusal.
+            clear.extend(chunk.iter().filter_map(|(id, _)| {
+                pending.iter().find(|p| &p.jmap_id == id).map(|p| p.message)
+            }));
+        }
+        store.clear_pending_files(&clear)?;
+        Ok(filed)
     }
 }
 
@@ -1592,6 +1799,128 @@ mod tests {
             serde_json::from_value::<Mailbox>(mailbox(id, name, role, full.clone())).unwrap()
         })
         .collect()
+    }
+
+    #[test]
+    fn filings_move_folders_and_leave_labels_alone() {
+        let layout = Layout::of(&mailboxes());
+        let current = BTreeMap::from([
+            ("M-in".to_string(), true),
+            ("M-watch".to_string(), true),
+            ("M-school".to_string(), true),
+        ]);
+        let filed = filed_mailboxes(&current, &layout, Some("Receipts"));
+        assert_eq!(
+            filed,
+            BTreeMap::from([
+                ("M-in".to_string(), true),
+                ("M-watch".to_string(), true),
+                ("M-receipts".to_string(), true),
+            ])
+        );
+
+        // Unfiling drops every folder membership, nothing else.
+        let unfiled = filed_mailboxes(&current, &layout, None);
+        assert_eq!(
+            unfiled,
+            BTreeMap::from([("M-in".to_string(), true), ("M-watch".to_string(), true),])
+        );
+
+        // A folder the layout lost — renamed or removed server-side —
+        // files nothing, but the rest still comes through untouched.
+        let vanished = filed_mailboxes(&current, &layout, Some("Gone"));
+        assert_eq!(
+            vanished,
+            BTreeMap::from([("M-in".to_string(), true), ("M-watch".to_string(), true),])
+        );
+    }
+
+    #[test]
+    fn mailbox_acls_decide_filings() {
+        let full = rights(true, true, true, true, true, true, true, true);
+        let in_school =
+            BTreeMap::from([("M-in".to_string(), true), ("M-school".to_string(), true)]);
+        let layout_of = |receipts: Value| {
+            Layout::of(
+                &[
+                    mailbox("M-in", "Inbox", Some("inbox"), full.clone()),
+                    mailbox("M-school", "School", None, full.clone()),
+                    mailbox("M-receipts", "Receipts", None, receipts),
+                ]
+                .into_iter()
+                .map(|m| serde_json::from_value::<Mailbox>(m).unwrap())
+                .collect::<Vec<_>>(),
+            )
+        };
+
+        let allowed = layout_of(full.clone());
+        assert!(filing_allowed(&in_school, &allowed, Some("Receipts")));
+        assert!(filing_allowed(&in_school, &allowed, None));
+
+        // The target can't take items.
+        let shut = rights(true, false, true, true, true, true, true, true);
+        assert!(!filing_allowed(
+            &in_school,
+            &layout_of(shut),
+            Some("Receipts")
+        ));
+
+        // The folder losing the message can't give it up.
+        let locked = BTreeMap::from([("M-in".to_string(), true), ("M-school".to_string(), true)]);
+        let hoarder = Layout::of(
+            &[
+                mailbox("M-in", "Inbox", Some("inbox"), full.clone()),
+                mailbox("M-school", "School", None, {
+                    let mut r = full.clone();
+                    r["mayRemoveItems"] = json!(false);
+                    r
+                }),
+                mailbox("M-receipts", "Receipts", None, full),
+            ]
+            .into_iter()
+            .map(|m| serde_json::from_value::<Mailbox>(m).unwrap())
+            .collect::<Vec<_>>(),
+        );
+        assert!(!filing_allowed(&locked, &hoarder, Some("Receipts")));
+    }
+
+    #[test]
+    fn set_emails_serializes_and_replies_parse() {
+        let update = BTreeMap::from([(
+            "E1".to_string(),
+            EmailPatch {
+                mailbox_ids: BTreeMap::from([("M1".to_string(), true)]),
+            },
+        )]);
+        let args = serde_json::to_value(SetEmails {
+            account_id: "a",
+            update: &update,
+        })
+        .unwrap();
+        assert_eq!(
+            args,
+            json!({"accountId": "a", "update": {"E1": {"mailboxIds": {"M1": true}}}})
+        );
+
+        let reply = serde_json::from_value::<SetEmailsReply>(json!({
+            "accountId": "a", "oldState": "s1", "newState": "s2",
+            "updated": {"E1": null},
+            "notUpdated": {"E2": {"type": "tooManyRequests"}},
+        }))
+        .unwrap();
+        assert!(reply.updated.contains_key("E1"));
+        assert_eq!(reply.not_updated.len(), 1);
+
+        // Both maps may be absent (RFC 8621 §5.3).
+        let bare = serde_json::from_value::<SetEmailsReply>(json!({"accountId": "a"})).unwrap();
+        assert!(bare.updated.is_empty());
+        assert!(bare.not_updated.is_empty());
+    }
+
+    #[test]
+    fn a_set_email_reply_that_wont_parse_fails() {
+        let err = parse_set_emails(json!({"updated": 3})).unwrap_err();
+        assert!(err.to_string().contains("malformed Email/set"), "{err}");
     }
 
     #[test]
