@@ -117,6 +117,10 @@ const SEARCH_ICON: &str = r#"<svg width="15" height="15" viewBox="0 0 24 24" fil
 /// Lucide's external-link, at Gloss's icon weight.
 const EXTERNAL_ICON: &str = r#"<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>"#;
 
+/// Lucide's arrow-left, at Gloss's icon weight: the mobile way back to
+/// the list; the desktop two-pane has no use for it.
+const BACK_ICON: &str = r#"<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></svg>"#;
+
 pub fn page(p: &Page<'_>) -> Markup {
     html! {
         (DOCTYPE)
@@ -130,7 +134,7 @@ pub fn page(p: &Page<'_>) -> Markup {
                 script defer src="/assets/alpine.js" {}
             }
             body {
-                div.app {
+                div.app.sel[p.selected.is_some()] {
                     (sidebar(p))
                     (list(p))
                     (reader(p))
@@ -305,6 +309,7 @@ fn thread(p: &Page<'_>, t: &ThreadView, selected: &str) -> Markup {
     html! {
         article.thread {
             header.thread-head {
+                a.back href=(view_path(p.view)) aria-label="Back to the list" { (PreEscaped(BACK_ICON)) }
                 h2 { (t.thread.subject) }
                 @if t.account.read_only {
                     span.type-label { "Read-only" }
@@ -393,13 +398,14 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Acco
 }
 
 /// A value that opens its menu when clicked. Menus open upward, as in the
-/// design, unless that would run off the top of the pane.
+/// design, unless that would run off the top of the pane — measured once
+/// shown, since touch layouts make the options taller.
 fn menu(label: Markup, action: String, here: &str, options: Markup) -> Markup {
     html! {
         div.ctrl x-data="{ open: false, up: true }" "@click.outside"="open = false" "@keydown.escape"="open = false" {
             button.ctrl-btn type="button" ":class"="open && 'on'"
-                "@click"="up = $el.getBoundingClientRect().top > 260; open = !open" { (label) }
-            form.menu method="post" action=(action) x-show="open" x-cloak ":class"="up ? 'up' : 'down'" {
+                "@click"="up = true; open = !open; $nextTick(() => { up = $refs.menu.getBoundingClientRect().top >= $el.closest('.reader').getBoundingClientRect().top })" { (label) }
+            form.menu x-ref="menu" method="post" action=(action) x-show="open" x-cloak ":class"="up ? 'up' : 'down'" {
                 (back(here))
                 (options)
             }

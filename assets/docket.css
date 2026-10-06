@@ -11,8 +11,9 @@ button { font: inherit; color: inherit; }
 .count { font-size: var(--gl-step--2); color: var(--gl-color-text-secondary); }
 
 /* Three panes on the fill: bare mailboxes, the list on a card, the thread
-   as a stack of cards. */
-.app { height: 100vh; display: grid; grid-template-columns: 200px 420px minmax(0, 1fr); gap: var(--gl-space-2xs); padding: var(--gl-space-2xs) var(--gl-space-2xs) var(--gl-space-s); background: var(--gl-color-surface-fill); }
+   as a stack of cards. dvh over vh where it exists: mobile URL bars
+   shouldn't shrink the panes twice. */
+.app { height: 100vh; height: 100dvh; display: grid; grid-template-columns: 200px 420px minmax(0, 1fr); gap: var(--gl-space-2xs); padding: var(--gl-space-2xs) var(--gl-space-2xs) var(--gl-space-s); background: var(--gl-color-surface-fill); }
 
 /* Gloss Input: a field on a rule. */
 .field { box-sizing: border-box; width: 100%; border: none; border-bottom: var(--gl-border-w) solid var(--gl-color-border-default); border-radius: 0; background: transparent; padding: 8px 2px; font: var(--gl-step--1) var(--gl-font-text); color: var(--gl-color-text-primary); outline: none; }
@@ -88,7 +89,7 @@ button { font: inherit; color: inherit; }
 .item .from { cursor: pointer; }
 .item .addr, .item .copies { color: var(--gl-color-text-tertiary); }
 .item .copies { font-size: var(--gl-step--2); }
-.item .text { line-height: 1.6; white-space: pre-line; }
+.item .text { line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
 .item .text.closed { cursor: pointer; color: var(--gl-color-text-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* The gutter: date, then the email's values, right-aligned. */
@@ -118,13 +119,16 @@ button { font: inherit; color: inherit; }
 .opt:hover, .opt.cur { background: var(--gl-color-surface-fill); }
 .check { font: 500 var(--gl-step--2)/1 var(--gl-font-mono); }
 
+/* The mobile back link; the desktop two-pane never shows it. */
+.back { display: none; color: var(--gl-color-text-secondary); }
+
 /* Deleting is the one destructive value: quiet until hovered. */
 .del-btn { all: unset; box-sizing: border-box; cursor: pointer; padding: 4px 6px; border-radius: var(--gl-radius); color: var(--gl-color-text-tertiary); font: var(--gl-step--2) var(--gl-font-mono); transition: background var(--gl-dur-fast) var(--gl-ease); }
 .del-btn:hover { background: var(--gl-color-surface-fill); color: var(--gl-color-text-primary); }
 .del-btn:focus-visible { outline: 2px solid var(--gl-color-accent); outline-offset: 1px; }
 
 /* The trash confirm: a small centered modal over a dimmed page. */
-dialog { margin: auto; border: none; border-radius: var(--gl-radius); padding: var(--gl-space-m); background: var(--gl-color-surface-card); color: var(--gl-color-text-primary); box-shadow: var(--gl-shadow-float); max-width: 380px; }
+dialog { margin: auto; border: none; border-radius: var(--gl-radius); padding: var(--gl-space-m); background: var(--gl-color-surface-card); color: var(--gl-color-text-primary); box-shadow: var(--gl-shadow-float); max-width: min(380px, calc(100vw - 2 * var(--gl-space-m))); }
 dialog::backdrop { background: rgb(0 0 0 / .4); }
 dialog h3 { font: 500 var(--gl-step-0)/1.3 var(--gl-font-text); margin: 0 0 var(--gl-space-2xs) 0; }
 dialog p { margin: 0 0 var(--gl-space-s) 0; color: var(--gl-color-text-secondary); }
@@ -138,3 +142,44 @@ dialog form { display: flex; justify-content: flex-end; gap: var(--gl-space-xs);
 .toast form { display: contents; }
 .toast-act { all: unset; cursor: pointer; text-transform: uppercase; letter-spacing: .09em; text-decoration: underline; text-underline-offset: 3px; }
 .toast-x { all: unset; cursor: pointer; opacity: .6; font-size: 16px; line-height: 1; }
+
+/* ── phones: one pane at a time ──
+   The shell drops to a top bar over either the list or the thread —
+   which one rides on .app.sel, the same URL state the desktop two-pane
+   reads. Opening a thread hides the list; the back link returns. */
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); padding: var(--gl-space-3xs) var(--gl-space-3xs) var(--gl-space-2xs); }
+  .side { flex-direction: row; align-items: center; flex-wrap: wrap; gap: var(--gl-space-3xs) var(--gl-space-xs); padding: 0 var(--gl-space-3xs); overflow-y: visible; }
+  .brand-row { gap: var(--gl-space-xs); }
+  .nav { flex-direction: row; flex-wrap: wrap; gap: 2px; order: 3; width: 100%; }
+  .nav-item { margin: 0; padding: 8px 10px; }
+  .grow { display: none; }
+  .who { order: 2; margin-left: auto; }
+  .who-btn { margin: 0; padding: 8px 10px; }
+  .who-login { display: none; }
+  .version { display: none; }
+  .list { padding: var(--gl-space-xs) var(--gl-space-2xs) 0; }
+  .thread { padding: var(--gl-space-xs) var(--gl-space-2xs) var(--gl-space-m); }
+  .thread-head { gap: var(--gl-space-3xs); }
+  .thread-head .back { display: inline-flex; align-items: center; padding: 6px; margin-left: -6px; border-radius: var(--gl-radius); color: var(--gl-color-text-secondary); }
+  .thread-head .back:hover { background: var(--gl-color-surface-fill); }
+  .app.sel .list { display: none; }
+  .app:not(.sel) .reader { display: none; }
+  .item { grid-template-columns: minmax(0, 1fr); gap: var(--gl-space-2xs); }
+  .item .gutter { flex-direction: row; align-items: center; flex-wrap: wrap; gap: var(--gl-space-3xs) var(--gl-space-2xs); text-align: left; }
+  .comment .gutter { justify-content: flex-start; }
+  .toast { left: var(--gl-space-2xs); right: var(--gl-space-2xs); transform: none; min-width: 0; }
+}
+
+/* ── touch: fingers, not cursors ──
+   Every control grows to a 44px hit area, and fields stay at 16px or
+   more, below which iOS Safari zooms the page on focus. */
+@media (pointer: coarse) {
+  .field { font-size: max(16px, var(--gl-step--1)); }
+  .ctrl-btn, .del-btn, .opt, .nav-item, .who-btn { box-sizing: border-box; min-height: 44px; align-items: center; }
+  .who-btn { align-items: stretch; justify-content: center; }
+  .icon-btn, .back, .search-btn { min-width: 44px; min-height: 44px; justify-content: center; align-items: center; }
+  .thread-head .back { margin-left: -14px; }
+  .search-btn { margin: -14px 0; }
+  .toast-act, .toast-x { padding: 12px 8px; margin: -12px 0; }
+}

@@ -182,8 +182,16 @@ async fn lanes_and_search() {
 #[tokio::test]
 async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
     let addr = spawn().await;
+    // An unselected page renders the plain shell; a selection marks it,
+    // which is what the phone layout swaps panes on, and the thread
+    // head carries the mobile back link.
+    let (_, body) = get(addr, SAM, "/").await;
+    assert!(body.contains(r#"<div class="app">"#));
+    assert!(!body.contains("Back to the list"));
     let (status, body) = get(addr, SAM, &format!("/?m={}", mid(4))).await;
     assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"<div class="app sel">"#));
+    assert!(body.contains(r#"href="/" aria-label="Back to the list""#));
     assert!(body.contains("<h2>Gutter repair estimate</h2>"));
     // Only the selected email floats.
     assert!(body.contains(&format!(r#"class="item card sel" id="m{}""#, mid(4))));
