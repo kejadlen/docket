@@ -50,7 +50,7 @@ pub fn view_path(view: &View) -> String {
     }
 }
 
-fn select_path(view: &View, id: u32) -> String {
+fn select_path(view: &View, id: &str) -> String {
     let path = view_path(view);
     let sep = if path.contains('?') { '&' } else { '?' };
     format!("{path}{sep}m={id}")
@@ -247,10 +247,10 @@ fn thread_group(p: &Page<'_>, group: &Group, rows: &[Message], compact: bool) ->
 /// A thread with one message listed collapses into a single row: subject and
 /// time, then sender and snippet.
 fn solo(p: &Page<'_>, group: &Group, m: &Message, compact: bool) -> Markup {
-    let selected = p.selected == Some(m.id);
+    let selected = p.selected.as_deref() == Some(m.id.as_str());
     let unread = p.unread.contains(&m.id);
     html! {
-        a.row.solo.sel[selected].unread[unread] href=(select_path(p.view, m.id)) {
+        a.row.solo.sel[selected].unread[unread] href=(select_path(p.view, &m.id)) {
             span.subj { (group.thread.subject) }
             span.type-figure.age { (dates::short(p.now, m.at)) }
             span.line {
@@ -276,10 +276,10 @@ fn sender(users: &[User], m: &Message) -> String {
 }
 
 fn row(p: &Page<'_>, m: &Message, compact: bool) -> Markup {
-    let selected = p.selected == Some(m.id);
+    let selected = p.selected.as_deref() == Some(m.id.as_str());
     let unread = p.unread.contains(&m.id);
     html! {
-        a.row.sel[selected].unread[unread] href=(select_path(p.view, m.id)) {
+        a.row.sel[selected].unread[unread] href=(select_path(p.view, &m.id)) {
             span.from { (sender(&p.users, m)) }
             span.type-figure.age { (dates::short(p.now, m.at)) }
             @if !compact {
@@ -292,7 +292,7 @@ fn row(p: &Page<'_>, m: &Message, compact: bool) -> Markup {
 fn reader(p: &Page<'_>) -> Markup {
     html! {
         main.reader {
-            @if let (Some(selected), Some(t)) = (p.selected, &p.thread) {
+            @if let (Some(selected), Some(t)) = (p.selected.as_deref(), &p.thread) {
                 (thread(p, t, selected))
             } @else {
                 p.empty { "No thread open." }
@@ -301,7 +301,7 @@ fn reader(p: &Page<'_>) -> Markup {
     }
 }
 
-fn thread(p: &Page<'_>, t: &ThreadView, selected: MessageId) -> Markup {
+fn thread(p: &Page<'_>, t: &ThreadView, selected: &str) -> Markup {
     html! {
         article.thread {
             header.thread-head {
@@ -384,7 +384,7 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Acco
                         title="Open in Fastmail" aria-label="Open in Fastmail" { (PreEscaped(EXTERNAL_ICON)) }
                 }
                 @match m.values() {
-                    Some(values) => (values_controls(p, m.id, values, account.read_only)),
+                    Some(values) => (values_controls(p, &m.id, values, account.read_only)),
                     None => span.type-label.sent { "Sent" },
                 }
             }
@@ -411,7 +411,7 @@ fn check(on: bool) -> Markup {
     html! { span.check { @if on { "✓" } } }
 }
 
-fn values_controls(p: &Page<'_>, id: u32, values: &Values, read_only: bool) -> Markup {
+fn values_controls(p: &Page<'_>, id: &str, values: &Values, read_only: bool) -> Markup {
     let states = html! {
         @for state in State::ALL {
             @let on = state == values.state;
@@ -491,20 +491,27 @@ mod tests {
 
     #[test]
     fn paths() {
+        let id = crate::fixtures::id(4);
         assert_eq!(view_path(&View::ForMe), "/");
         assert_eq!(view_path(&View::Lane(State::Wait)), "/wait");
         assert_eq!(view_path(&View::Search("a&b".into())), "/search?q=a%26b");
-        assert_eq!(select_path(&View::ForMe, 4), "/?m=4");
-        assert_eq!(select_path(&View::Search("x".into()), 4), "/search?q=x&m=4");
+        assert_eq!(select_path(&View::ForMe, &id), format!("/?m={id}"));
+        assert_eq!(
+            select_path(&View::Search("x".into()), &id),
+            format!("/search?q=x&m={id}")
+        );
     }
 
     #[test]
     fn fastmail_links_search_by_message_id() {
         let store = crate::fixtures::store().unwrap();
-        let m = store.message(4).unwrap().unwrap();
+        let m = store.message(&crate::fixtures::id(4)).unwrap().unwrap();
         assert_eq!(
             fastmail_url(&m),
-            "https://app.fastmail.com/mail/search:msgid%3A%3C4%40fixtures.docket.invalid%3E"
+            format!(
+                "https://app.fastmail.com/mail/search:msgid%3A%3C{}%40fixtures.docket.invalid%3E",
+                crate::fixtures::id(4)
+            )
         );
     }
 
@@ -512,9 +519,9 @@ mod tests {
     fn senders_without_a_login_show_the_recipient() {
         let users = [User::new("sam@example.com", "Sam")];
         let sent = |by: Option<&str>| Message {
-            id: 1,
+            id: crate::fixtures::id(1),
             message_id: "m@x".into(),
-            thread: 1,
+            thread: crate::fixtures::id(1),
             at: crate::fixtures::now(),
             cc: Vec::new(),
             bcc: Vec::new(),

@@ -138,7 +138,10 @@ fn render(
     here: &str,
 ) -> Result<Markup, Error> {
     let store = &state.store;
-    let thread = selected.map(|id| open_thread(store, me, id)).transpose()?;
+    let thread = selected
+        .clone()
+        .map(|id| open_thread(store, me, &id))
+        .transpose()?;
     let nav = std::iter::once(View::ForMe)
         .chain(State::LANES.map(View::Lane))
         .map(|v| lists::count(store, me, &v).map(|n| (v, n)))
@@ -161,20 +164,22 @@ fn render(
 
 /// Opening a thread reads the selected message and the latest one, the two
 /// that open expanded.
-fn open_thread(store: &Store, me: &User, id: MessageId) -> Result<ThreadView, Error> {
+fn open_thread(store: &Store, me: &User, id: &str) -> Result<ThreadView, Error> {
     let msg = store.message(id)?.ok_or(Error::NotFound("message"))?;
     let latest = store
-        .thread_messages(msg.thread)?
+        .thread_messages(&msg.thread)?
         .last()
-        .map_or(id, |m| m.id);
+        .map_or_else(|| id.to_owned(), |m| m.id.clone());
     store.mark_read(&me.login, id)?;
-    store.mark_read(&me.login, latest)?;
+    store.mark_read(&me.login, &latest)?;
     Ok(ThreadView {
-        thread: store.thread(msg.thread)?.ok_or(Error::NotFound("thread"))?,
+        thread: store
+            .thread(&msg.thread)?
+            .ok_or(Error::NotFound("thread"))?,
         account: store
-            .thread_account(msg.thread)?
+            .thread_account(&msg.thread)?
             .ok_or(Error::NotFound("account"))?,
-        timeline: store.timeline(msg.thread)?,
+        timeline: store.timeline(&msg.thread)?,
         latest,
     })
 }
@@ -249,7 +254,7 @@ async fn edit(
     change: Change,
     back: &str,
 ) -> Result<Redirect, Error> {
-    state.store.edit(&me.login, id, change)?;
+    state.store.edit(&me.login, &id, change)?;
     Ok(Redirect::to(safe_back(back)))
 }
 
@@ -259,7 +264,7 @@ async fn delete_message(
     Path(id): Path<MessageId>,
     Form(form): Form<BackForm>,
 ) -> Result<Redirect, Error> {
-    state.store.delete(&me.login, id)?;
+    state.store.delete(&me.login, &id)?;
     Ok(Redirect::to(safe_back(&form.back)))
 }
 
@@ -275,7 +280,7 @@ async fn add_comment(
     Path(thread): Path<ThreadId>,
     Form(form): Form<CommentForm>,
 ) -> Result<Redirect, Error> {
-    state.store.add_comment(&me.login, thread, &form.text)?;
+    state.store.add_comment(&me.login, &thread, &form.text)?;
     Ok(Redirect::to(safe_back(&form.back)))
 }
 

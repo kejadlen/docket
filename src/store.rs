@@ -14,8 +14,7 @@ use rusqlite::{Connection, OptionalExtension as _, Params, Row, ToSql, Transacti
 
 use crate::Error;
 use crate::model::{
-    Account, Comment, CommentId, Event, Kind, Message, MessageId, State, Thread, ThreadId, User,
-    Values,
+    Account, Comment, Event, Kind, Message, MessageId, State, Thread, User, Values,
 };
 
 /// Applied in order; `PRAGMA user_version` counts how many have run.
@@ -25,6 +24,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_pending_files.sql"),
     include_str!("../migrations/0004_pending_deletes.sql"),
     include_str!("../migrations/0005_pending_archives.sql"),
+    include_str!("../migrations/0006_jj_style_ids.sql"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,7 +208,7 @@ impl Store {
         Ok(found)
     }
 
-    pub fn thread(&self, id: ThreadId) -> Result<Option<Thread>, Error> {
+    pub fn thread(&self, id: &str) -> Result<Option<Thread>, Error> {
         let thread = self
             .lock()
             .conn
@@ -227,16 +227,16 @@ impl Store {
         Ok(thread)
     }
 
-    pub fn thread_account(&self, thread: ThreadId) -> Result<Option<Account>, Error> {
+    pub fn thread_account(&self, thread: &str) -> Result<Option<Account>, Error> {
         load_thread_account(&self.lock().conn, thread)
     }
 
-    pub fn message(&self, id: MessageId) -> Result<Option<Message>, Error> {
+    pub fn message(&self, id: &str) -> Result<Option<Message>, Error> {
         load_message(&self.lock().conn, id)
     }
 
     /// The thread's messages, oldest first.
-    pub fn thread_messages(&self, thread: ThreadId) -> Result<Vec<Message>, Error> {
+    pub fn thread_messages(&self, thread: &str) -> Result<Vec<Message>, Error> {
         load_messages(&self.lock().conn, "m.thread = ?1", [thread])
     }
 
@@ -270,11 +270,11 @@ impl Store {
 
     /// The thread's messages and comments in time order. A message sorts
     /// before a comment made at the same moment.
-    pub fn timeline(&self, thread: ThreadId) -> Result<Vec<Item>, Error> {
+    pub fn timeline(&self, thread: &str) -> Result<Vec<Item>, Error> {
         let inner = self.lock();
         let messages = load_messages(&inner.conn, "m.thread = ?1", [thread])?;
         let mut stmt = inner.conn.prepare_cached(
-            "SELECT id, thread, author, at, text FROM comments WHERE thread = ?1 ORDER BY at, id",
+            "SELECT id, thread, author, at, text FROM comments WHERE thread = ?1 ORDER BY at, rowid",
         )?;
         let comments = stmt
             .query_map([thread], |r| {
@@ -312,15 +312,15 @@ impl Store {
         Ok(ids)
     }
 
-    pub fn mark_read(&self, user: &str, msg: MessageId) -> Result<(), Error> {
+    pub fn mark_read(&self, user: &str, msg: &str) -> Result<(), Error> {
         insert_read(&self.lock().conn, user, msg)
     }
 
     /// Every change made to the message's values, oldest first.
-    pub fn history(&self, message: MessageId) -> Result<Vec<Event>, Error> {
+    pub fn history(&self, message: &str) -> Result<Vec<Event>, Error> {
         let inner = self.lock();
         let mut stmt = inner.conn.prepare_cached(
-            "SELECT message, user, at, event FROM history WHERE message = ?1 ORDER BY id",
+            "SELECT message, user, at, event FROM history WHERE message = ?1 ORDER BY rowid",
         )?;
         let events = stmt
             .query_map([message], |r| {
@@ -335,11 +335,11 @@ impl Store {
         Ok(events)
     }
 
-    pub fn edit(&self, user: &str, id: MessageId, change: Change) -> Result<(), Error> {
+    pub fn edit(&self, user: &str, id: &str, change: Change) -> Result<(), Error> {
         let mut inner = self.lock();
         let tx = inner.conn.transaction()?;
         let msg = load_message(&tx, id)?.ok_or(Error::NotFound("message"))?;
-        let read_only = load_thread_account(&tx, msg.thread)?.is_some_and(|a| a.read_only);
+        let read_only = load_thread_account(&tx, &msg.thread)?.is_some_and(|a| a.read_only);
         let Kind::Received { values, .. } = msg.kind else {
             return Err(Error::BadRequest("sent messages have no values"));
         };
@@ -398,7 +398,7 @@ impl Store {
         tx.commit()?;
         inner
             .undo
-            .insert(user.to_owned(), (id, prev, queued_archive));
+            .insert(user.to_owned(), (id.to_owned(), prev, queued_archive));
         let flash = if queued_archive {
             // The verb is Done; the archive is what it does.
             "Done — leaves the shared Inbox".to_owned()
@@ -427,18 +427,18 @@ impl Store {
         // poll already pushed it, the mail sits in Archive and the
         // state simply reverts.
         if queued_archive {
-            tx.execute("DELETE FROM pending_archives WHERE message = ?1", [id])?;
+            tx.execute("DELETE FROM pending_archives WHERE message = ?1", [&id])?;
         }
         // An undone filing reverts server-side too: the queued intent
         // points back at the folder the undo restores.
-        let msg = load_message(&tx, id)?.ok_or(Error::NotFound("message"))?;
+        let msg = load_message(&tx, &id)?.ok_or(Error::NotFound("message"))?;
         if let Kind::Received { values, .. } = &msg.kind
             && values.folder != prev.folder
         {
-            queue_file(&tx, id, prev.folder.as_deref())?;
+            queue_file(&tx, &id, prev.folder.as_deref())?;
         }
-        write_values(&tx, id, &prev)?;
-        insert_event(&tx, id, user, self.now(), "Undone")?;
+        write_values(&tx, &id, &prev)?;
+        insert_event(&tx, &id, user, self.now(), "Undone")?;
         tx.commit()?;
         inner.undo.remove(user);
         inner.flash.insert(
@@ -491,11 +491,11 @@ impl Store {
     /// destroy server-side — which lands it in Trash — while the
     /// thread goes Done here with a history event. Any queued filing
     /// or archive is superseded.
-    pub fn delete(&self, user: &str, id: MessageId) -> Result<(), Error> {
+    pub fn delete(&self, user: &str, id: &str) -> Result<(), Error> {
         let mut inner = self.lock();
         let tx = inner.conn.transaction()?;
         let msg = load_message(&tx, id)?.ok_or(Error::NotFound("message"))?;
-        let read_only = load_thread_account(&tx, msg.thread)?.is_some_and(|a| a.read_only);
+        let read_only = load_thread_account(&tx, &msg.thread)?.is_some_and(|a| a.read_only);
         if read_only {
             return Err(Error::Forbidden("this account is read-only"));
         }
@@ -601,7 +601,7 @@ impl Store {
         self.lock().flash.remove(user)
     }
 
-    pub fn add_comment(&self, user: &str, thread: ThreadId, text: &str) -> Result<(), Error> {
+    pub fn add_comment(&self, user: &str, thread: &str, text: &str) -> Result<(), Error> {
         let text = text.trim();
         if text.is_empty() {
             return Err(Error::BadRequest("comment is empty"));
@@ -788,16 +788,16 @@ impl Import<'_> {
             return Err(Error::NotFound("thread"));
         }
         if let Some(values) = m.values() {
-            write_values(&self.tx, m.id, values)?;
+            write_values(&self.tx, &m.id, values)?;
         }
         Ok(())
     }
 
     pub fn comment(&self, c: &Comment) -> Result<(), Error> {
-        insert_comment(&self.tx, Some(c.id), c.thread, &c.author, c.at, &c.text)
+        insert_comment(&self.tx, Some(&c.id), &c.thread, &c.author, c.at, &c.text)
     }
 
-    pub fn read(&self, user: &str, msg: MessageId) -> Result<(), Error> {
+    pub fn read(&self, user: &str, msg: &str) -> Result<(), Error> {
         insert_read(&self.tx, user, msg)
     }
 
@@ -809,9 +809,15 @@ impl Import<'_> {
     /// refreshes.
     pub fn incoming(&self, account: &str, mail: &Incoming) -> Result<(), Error> {
         self.tx.execute(
-            "INSERT INTO threads (account, subject, jmap_thread_id) VALUES (?1, ?2, ?3)
+            "INSERT INTO threads (id, account, subject, jmap_thread_id)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT (account, jmap_thread_id) DO NOTHING",
-            params![account, mail.subject, mail.jmap_thread_id],
+            params![
+                fresh_id(&self.tx)?,
+                account,
+                mail.subject,
+                mail.jmap_thread_id
+            ],
         )?;
         let (kind, from_name, from_addr, state, folder, sent_by, sent_to) = match &mail.kind {
             IncomingKind::Received {
@@ -841,10 +847,10 @@ impl Import<'_> {
         let cc = json(&mail.cc)?;
         let bcc = json(&mail.bcc)?;
         let _upserted = self.tx.execute(
-            "INSERT INTO messages (account, message_id, jmap_id, thread, at, cc, bcc, body,
+            "INSERT INTO messages (id, account, message_id, jmap_id, thread, at, cc, bcc, body,
                 kind, from_name, from_addr, state, folder, sent_by, sent_to)
-             SELECT ?1, ?2, ?3, t.id, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
-             FROM threads t WHERE t.account = ?1 AND t.jmap_thread_id = ?4
+             SELECT ?1, ?2, ?3, ?4, t.id, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+             FROM threads t WHERE t.account = ?2 AND t.jmap_thread_id = ?5
              ON CONFLICT (account, message_id) DO UPDATE SET
                  jmap_id = excluded.jmap_id,
                  thread = excluded.thread,
@@ -858,6 +864,7 @@ impl Import<'_> {
                  sent_by = excluded.sent_by,
                  sent_to = excluded.sent_to",
             params![
+                fresh_id(&self.tx)?,
                 account,
                 mail.message_id,
                 mail.jmap_id,
@@ -929,7 +936,7 @@ fn load_user(conn: &Connection, login: &str) -> Result<Option<User>, Error> {
     Ok(user)
 }
 
-fn load_thread_account(conn: &Connection, thread: ThreadId) -> Result<Option<Account>, Error> {
+fn load_thread_account(conn: &Connection, thread: &str) -> Result<Option<Account>, Error> {
     let account = conn
         .query_row(
             "SELECT a.slug, a.name, a.address, a.read_only
@@ -959,7 +966,7 @@ fn folder_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
     Ok(exists)
 }
 
-fn load_message(conn: &Connection, id: MessageId) -> Result<Option<Message>, Error> {
+fn load_message(conn: &Connection, id: &str) -> Result<Option<Message>, Error> {
     Ok(load_messages(conn, "m.id = ?1", [id])?.into_iter().next())
 }
 
@@ -1017,7 +1024,7 @@ fn message_from_row(r: &Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
-fn write_values(conn: &Connection, id: MessageId, values: &Values) -> Result<(), Error> {
+fn write_values(conn: &Connection, id: &str, values: &Values) -> Result<(), Error> {
     conn.execute(
         "UPDATE messages SET state = ?2, folder = ?3 WHERE id = ?1",
         params![id, values.state, values.folder],
@@ -1035,7 +1042,7 @@ fn write_values(conn: &Connection, id: MessageId, values: &Values) -> Result<(),
 /// Records a filing for the poll loop to push (task rn). Fixture mail
 /// has no server side to move, so rows without a cached JMAP id stay
 /// out.
-fn queue_file(conn: &Connection, id: MessageId, folder: Option<&str>) -> Result<(), Error> {
+fn queue_file(conn: &Connection, id: &str, folder: Option<&str>) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO pending_files (message, folder)
          SELECT ?1, ?2 FROM messages WHERE id = ?1 AND jmap_id IS NOT NULL
@@ -1048,7 +1055,7 @@ fn queue_file(conn: &Connection, id: MessageId, folder: Option<&str>) -> Result<
 /// Queues the message's exit from the shared Inbox (Done's meaning on
 /// a writable account). Fixture mail has no server side to leave, so
 /// rows without a cached JMAP id stay out.
-fn queue_archive(conn: &Connection, id: MessageId) -> Result<(), Error> {
+fn queue_archive(conn: &Connection, id: &str) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO pending_archives (message)
          SELECT ?1 FROM messages WHERE id = ?1 AND jmap_id IS NOT NULL
@@ -1060,39 +1067,47 @@ fn queue_archive(conn: &Connection, id: MessageId) -> Result<(), Error> {
 
 fn insert_event(
     conn: &Connection,
-    message: MessageId,
+    message: &str,
     user: &str,
     at: DateTime,
     text: &str,
 ) -> Result<(), Error> {
     conn.execute(
-        "INSERT INTO history (message, user, at, event) VALUES (?1, ?2, ?3, ?4)",
-        params![message, user, at, text],
+        "INSERT INTO history (id, message, user, at, event) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![fresh_id(conn)?, message, user, at, text],
     )?;
     Ok(())
 }
 
 fn insert_comment(
     conn: &Connection,
-    id: Option<CommentId>,
-    thread: ThreadId,
+    id: Option<&str>,
+    thread: &str,
     author: &str,
     at: DateTime,
     text: &str,
 ) -> Result<(), Error> {
     conn.execute(
         "INSERT INTO comments (id, thread, author, at, text) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, thread, author, at, text],
+        params![id.unwrap_or(&fresh_id(conn)?), thread, author, at, text],
     )?;
     Ok(())
 }
 
-fn insert_read(conn: &Connection, user: &str, msg: MessageId) -> Result<(), Error> {
+fn insert_read(conn: &Connection, user: &str, msg: &str) -> Result<(), Error> {
     conn.execute(
         "INSERT OR IGNORE INTO reads (user, message) VALUES (?1, ?2)",
         params![user, msg],
     )?;
     Ok(())
+}
+
+/// A fresh row id: 64 random bits as jj-style reverse hex — jj's
+/// change-id alphabet, where nibble `0` renders as `z` — giving 16
+/// characters that carry no order and no meaning.
+fn fresh_id(conn: &Connection) -> Result<String, Error> {
+    let bytes: Vec<u8> = conn.query_row("SELECT randomblob(8)", [], |r| r.get(0))?;
+    Ok(crate::model::reverse_hex_bytes(&bytes))
 }
 
 /// Lists of names and addresses are stored as JSON arrays.
@@ -1124,7 +1139,7 @@ mod tests {
     use super::*;
     use crate::fixtures::{self, ALEX, SAM};
 
-    fn values(store: &Store, id: MessageId) -> Values {
+    fn values(store: &Store, id: &str) -> Values {
         store
             .message(id)
             .unwrap()
@@ -1137,8 +1152,10 @@ mod tests {
     #[test]
     fn edits_record_undo_flash_and_history() {
         let store = fixtures::store().unwrap();
-        store.edit(SAM, 4, Change::State(State::Do)).unwrap();
-        assert_eq!(values(&store, 4).state, State::Do);
+        store
+            .edit(SAM, &fixtures::id(4), Change::State(State::Do))
+            .unwrap();
+        assert_eq!(values(&store, &fixtures::id(4)).state, State::Do);
         assert_eq!(
             store.take_flash(SAM),
             Some(Flash {
@@ -1149,12 +1166,12 @@ mod tests {
         assert_eq!(store.take_flash(SAM), None);
 
         store.undo(SAM).unwrap();
-        assert_eq!(values(&store, 4).state, State::Inbox);
+        assert_eq!(values(&store, &fixtures::id(4)).state, State::Inbox);
         assert_eq!(store.take_flash(SAM).unwrap().text, "Undone");
         assert!(matches!(store.undo(SAM), Err(Error::BadRequest(_))));
 
         let history: Vec<_> = store
-            .history(4)
+            .history(&fixtures::id(4))
             .unwrap()
             .into_iter()
             .map(|e| (e.user, e.at, e.text))
@@ -1188,18 +1205,19 @@ mod tests {
             .unwrap()
             .first()
             .unwrap()
-            .id;
+            .id
+            .clone();
         store.sign_in(SAM, "Sam").unwrap();
 
         // Filing queues the intent, and the latest one wins.
         store
-            .edit(SAM, id, Change::Folder(Some("House".into())))
+            .edit(SAM, &id, Change::Folder(Some("House".into())))
             .unwrap();
-        store.edit(SAM, id, Change::Folder(None)).unwrap();
+        store.edit(SAM, &id, Change::Folder(None)).unwrap();
         assert_eq!(
             store.pending_files("household").unwrap(),
             [PendingFile {
-                message: id,
+                message: id.clone(),
                 jmap_id: "E9".into(),
                 folder: None,
             }]
@@ -1209,13 +1227,13 @@ mod tests {
         assert!(store.pending_files("eli").unwrap().is_empty());
 
         // What the poll loop pushed, it clears.
-        store.clear_pending_files(&[id]).unwrap();
+        store.clear_pending_files(&[id.clone()]).unwrap();
         assert!(store.pending_files("household").unwrap().is_empty());
         store.clear_pending_files(&[]).unwrap();
 
         // Undoing a filing re-points the queue at the restored folder.
         store
-            .edit(SAM, id, Change::Folder(Some("House".into())))
+            .edit(SAM, &id, Change::Folder(Some("House".into())))
             .unwrap();
         assert_eq!(
             store.pending_files("household").unwrap()[0].folder,
@@ -1231,11 +1249,11 @@ mod tests {
             "CREATE TRIGGER no_pending BEFORE INSERT ON pending_files BEGIN SELECT RAISE(ABORT, 'no'); END;",
         );
         assert!(matches!(
-            store.edit(SAM, id, Change::Folder(Some("House".into()))),
+            store.edit(SAM, &id, Change::Folder(Some("House".into()))),
             Err(Error::Db(_))
         ));
         exec(&store, "DROP TRIGGER no_pending;");
-        assert_eq!(values(&store, id).folder, None);
+        assert_eq!(values(&store, &id).folder, None);
     }
 
     #[test]
@@ -1251,7 +1269,11 @@ mod tests {
     fn fixture_mail_never_queues_a_filing() {
         let store = fixtures::store().unwrap();
         store
-            .edit(SAM, 4, Change::Folder(Some("Finance".into())))
+            .edit(
+                SAM,
+                &fixtures::id(4),
+                Change::Folder(Some("Finance".into())),
+            )
             .unwrap();
         // No server side to move, so no row: fixture mail has no cached
         // JMAP id.
@@ -1262,14 +1284,23 @@ mod tests {
     fn folders() {
         let store = fixtures::store().unwrap();
         store
-            .edit(SAM, 4, Change::Folder(Some("Finance".into())))
+            .edit(
+                SAM,
+                &fixtures::id(4),
+                Change::Folder(Some("Finance".into())),
+            )
             .unwrap();
-        assert_eq!(values(&store, 4).folder.as_deref(), Some("Finance"));
-        store.edit(SAM, 4, Change::Folder(None)).unwrap();
-        assert_eq!(values(&store, 4).folder, None);
+        assert_eq!(
+            values(&store, &fixtures::id(4)).folder.as_deref(),
+            Some("Finance")
+        );
+        store
+            .edit(SAM, &fixtures::id(4), Change::Folder(None))
+            .unwrap();
+        assert_eq!(values(&store, &fixtures::id(4)).folder, None);
         assert_eq!(store.take_flash(SAM).unwrap().text, "Removed from folder");
         assert!(matches!(
-            store.edit(SAM, 4, Change::Folder(Some("Nope".into()))),
+            store.edit(SAM, &fixtures::id(4), Change::Folder(Some("Nope".into()))),
             Err(Error::NotFound("folder"))
         ));
         assert_eq!(
@@ -1297,17 +1328,18 @@ mod tests {
             .unwrap()
             .first()
             .unwrap()
-            .id;
+            .id
+            .clone();
         store.sign_in(SAM, "Sam").unwrap();
 
         // Done on a writable account queues the archive; the history
         // names the verb, the flash teaches what it does.
-        store.edit(SAM, id, Change::State(State::Done)).unwrap();
-        assert_eq!(values(&store, id).state, State::Done);
+        store.edit(SAM, &id, Change::State(State::Done)).unwrap();
+        assert_eq!(values(&store, &id).state, State::Done);
         assert_eq!(
             store.pending_archives("household").unwrap(),
             [PendingArchive {
-                message: id,
+                message: id.clone(),
                 jmap_id: "E9".into(),
             }]
         );
@@ -1319,7 +1351,7 @@ mod tests {
             }
         );
         let history: Vec<_> = store
-            .history(id)
+            .history(&id)
             .unwrap()
             .into_iter()
             .map(|e| (e.user, e.text))
@@ -1328,20 +1360,20 @@ mod tests {
 
         // Undo reverts the state and cancels the queued exit.
         store.undo(SAM).unwrap();
-        assert_eq!(values(&store, id).state, State::Inbox);
+        assert_eq!(values(&store, &id).state, State::Inbox);
         assert!(store.pending_archives("household").unwrap().is_empty());
 
         // Another account's drain never sees them; what the poll
         // pushed, it clears.
-        store.edit(SAM, id, Change::State(State::Done)).unwrap();
+        store.edit(SAM, &id, Change::State(State::Done)).unwrap();
         assert!(store.pending_archives("eli").unwrap().is_empty());
-        store.clear_pending_archives(&[id]).unwrap();
+        store.clear_pending_archives(&[id.clone()]).unwrap();
         assert!(store.pending_archives("household").unwrap().is_empty());
         store.clear_pending_archives(&[]).unwrap();
 
         // Deleting a Done message supersedes its queued archive.
-        store.edit(SAM, id, Change::State(State::Done)).unwrap();
-        store.delete(SAM, id).unwrap();
+        store.edit(SAM, &id, Change::State(State::Done)).unwrap();
+        store.delete(SAM, &id).unwrap();
         assert!(store.pending_archives("household").unwrap().is_empty());
         assert_eq!(store.pending_deletes("household").unwrap().len(), 1);
 
@@ -1351,13 +1383,13 @@ mod tests {
             &store,
             "CREATE TRIGGER no_pending_archive BEFORE INSERT ON pending_archives BEGIN SELECT RAISE(ABORT, 'no'); END;",
         );
-        store.edit(SAM, id, Change::State(State::Inbox)).unwrap();
+        store.edit(SAM, &id, Change::State(State::Inbox)).unwrap();
         assert!(matches!(
-            store.edit(SAM, id, Change::State(State::Done)),
+            store.edit(SAM, &id, Change::State(State::Done)),
             Err(Error::Db(_))
         ));
         exec(&store, "DROP TRIGGER no_pending_archive;");
-        assert_eq!(values(&store, id).state, State::Inbox);
+        assert_eq!(values(&store, &id).state, State::Inbox);
     }
 
     #[test]
@@ -1365,11 +1397,13 @@ mod tests {
         // Read-only accounts and fixture mail mark Done without queueing
         // anything.
         let store = fixtures::store().unwrap();
-        let eli = fixtures::ELI_PRACTICE;
-        store.edit(SAM, eli, Change::State(State::Done)).unwrap();
+        let eli = fixtures::id(fixtures::ELI_PRACTICE);
+        store.edit(SAM, &eli, Change::State(State::Done)).unwrap();
         assert!(store.pending_archives("eli").unwrap().is_empty());
         assert_eq!(store.take_flash(SAM).unwrap().text, "Moved to Done");
-        store.edit(SAM, 4, Change::State(State::Done)).unwrap();
+        store
+            .edit(SAM, &fixtures::id(4), Change::State(State::Done))
+            .unwrap();
         assert!(store.pending_archives("household").unwrap().is_empty());
     }
 
@@ -1402,19 +1436,20 @@ mod tests {
             .unwrap()
             .first()
             .unwrap()
-            .id;
+            .id
+            .clone();
         store.sign_in(SAM, "Sam").unwrap();
 
         // A queued filing is superseded: the destroy replaces it.
         store
-            .edit(SAM, id, Change::Folder(Some("House".into())))
+            .edit(SAM, &id, Change::Folder(Some("House".into())))
             .unwrap();
-        store.delete(SAM, id).unwrap();
-        assert_eq!(values(&store, id).state, State::Done);
+        store.delete(SAM, &id).unwrap();
+        assert_eq!(values(&store, &id).state, State::Done);
         assert_eq!(
             store.pending_deletes("household").unwrap(),
             [PendingDelete {
-                message: id,
+                message: id.clone(),
                 jmap_id: "E9".into(),
             }]
         );
@@ -1427,7 +1462,7 @@ mod tests {
             })
         );
         let history: Vec<_> = store
-            .history(id)
+            .history(&id)
             .unwrap()
             .into_iter()
             .map(|e| (e.user, e.text))
@@ -1443,7 +1478,7 @@ mod tests {
         // Another account's drain never sees them; what the poll
         // pushed, it clears.
         assert!(store.pending_deletes("eli").unwrap().is_empty());
-        store.clear_pending_deletes(&[id]).unwrap();
+        store.clear_pending_deletes(&[id.clone()]).unwrap();
         assert!(store.pending_deletes("household").unwrap().is_empty());
         store.clear_pending_deletes(&[]).unwrap();
 
@@ -1452,10 +1487,10 @@ mod tests {
             &store,
             "CREATE TRIGGER no_pending_delete BEFORE INSERT ON pending_deletes BEGIN SELECT RAISE(ABORT, 'no'); END;",
         );
-        store.edit(SAM, id, Change::State(State::Inbox)).unwrap();
-        assert!(matches!(store.delete(SAM, id), Err(Error::Db(_))));
+        store.edit(SAM, &id, Change::State(State::Inbox)).unwrap();
+        assert!(matches!(store.delete(SAM, &id), Err(Error::Db(_))));
         exec(&store, "DROP TRIGGER no_pending_delete;");
-        assert_eq!(values(&store, id).state, State::Inbox);
+        assert_eq!(values(&store, &id).state, State::Inbox);
     }
 
     #[test]
@@ -1470,13 +1505,13 @@ mod tests {
     #[test]
     fn read_only_accounts_cannot_file() {
         let store = fixtures::store().unwrap();
-        let eli = fixtures::ELI_PRACTICE;
+        let eli = fixtures::id(fixtures::ELI_PRACTICE);
         assert!(matches!(
-            store.edit(SAM, eli, Change::Folder(None)),
+            store.edit(SAM, &eli, Change::Folder(None)),
             Err(Error::Forbidden(_))
         ));
-        assert!(matches!(store.delete(SAM, eli), Err(Error::Forbidden(_))));
-        store.edit(SAM, eli, Change::State(State::Done)).unwrap();
+        assert!(matches!(store.delete(SAM, &eli), Err(Error::Forbidden(_))));
+        store.edit(SAM, &eli, Change::State(State::Done)).unwrap();
     }
 
     #[test]
@@ -1484,28 +1519,31 @@ mod tests {
         let store = fixtures::store().unwrap();
         // Fixture mail has no server side to trash, so no row queues —
         // but the thread still goes Done.
-        store.delete(SAM, 4).unwrap();
-        assert_eq!(values(&store, 4).state, State::Done);
+        store.delete(SAM, &fixtures::id(4)).unwrap();
+        assert_eq!(values(&store, &fixtures::id(4)).state, State::Done);
         assert!(store.pending_deletes("household").unwrap().is_empty());
         // Sent replies carry no values to transition.
-        assert!(matches!(store.delete(SAM, 2), Err(Error::BadRequest(_))));
+        assert!(matches!(
+            store.delete(SAM, &fixtures::id(2)),
+            Err(Error::BadRequest(_))
+        ));
     }
 
     #[test]
     fn assignees_toggle() {
         let store = fixtures::store().unwrap();
         store
-            .edit(ALEX, 4, Change::ToggleAssignee(ALEX.into()))
+            .edit(ALEX, &fixtures::id(4), Change::ToggleAssignee(ALEX.into()))
             .unwrap();
-        assert!(values(&store, 4).assignees.contains(ALEX));
+        assert!(values(&store, &fixtures::id(4)).assignees.contains(ALEX));
         assert_eq!(store.take_flash(ALEX).unwrap().text, "Assigned Alex");
         store
-            .edit(ALEX, 4, Change::ToggleAssignee(ALEX.into()))
+            .edit(ALEX, &fixtures::id(4), Change::ToggleAssignee(ALEX.into()))
             .unwrap();
-        assert!(values(&store, 4).assignees.is_empty());
+        assert!(values(&store, &fixtures::id(4)).assignees.is_empty());
         assert_eq!(store.take_flash(ALEX).unwrap().text, "Unassigned Alex");
         assert!(matches!(
-            store.edit(ALEX, 4, Change::ToggleAssignee("eli".into())),
+            store.edit(ALEX, &fixtures::id(4), Change::ToggleAssignee("eli".into())),
             Err(Error::NotFound("user"))
         ));
     }
@@ -1514,11 +1552,11 @@ mod tests {
     fn bad_edits() {
         let store = fixtures::store().unwrap();
         assert!(matches!(
-            store.edit(SAM, 999, Change::State(State::Do)),
+            store.edit(SAM, &fixtures::id(999), Change::State(State::Do)),
             Err(Error::NotFound("message"))
         ));
         assert!(matches!(
-            store.edit(SAM, 2, Change::State(State::Do)),
+            store.edit(SAM, &fixtures::id(2), Change::State(State::Do)),
             Err(Error::BadRequest(_))
         ));
     }
@@ -1526,17 +1564,19 @@ mod tests {
     #[test]
     fn comments() {
         let store = fixtures::store().unwrap();
-        let before = store.timeline(1).unwrap().len();
-        store.add_comment(SAM, 1, "  Called them.  ").unwrap();
-        let timeline = store.timeline(1).unwrap();
+        let before = store.timeline(&fixtures::id(1)).unwrap().len();
+        store
+            .add_comment(SAM, &fixtures::id(1), "  Called them.  ")
+            .unwrap();
+        let timeline = store.timeline(&fixtures::id(1)).unwrap();
         assert_eq!(timeline.len(), before + 1);
         assert!(matches!(timeline.last(), Some(Item::Comment(c)) if c.text == "Called them."));
         assert!(matches!(
-            store.add_comment(SAM, 1, "   "),
+            store.add_comment(SAM, &fixtures::id(1), "   "),
             Err(Error::BadRequest(_))
         ));
         assert!(matches!(
-            store.add_comment(SAM, 999, "hi"),
+            store.add_comment(SAM, &fixtures::id(999), "hi"),
             Err(Error::NotFound("thread"))
         ));
     }
@@ -1545,7 +1585,7 @@ mod tests {
     fn timeline_interleaves_comments_by_time() {
         let store = fixtures::store().unwrap();
         let order: Vec<_> = store
-            .timeline(1)
+            .timeline(&fixtures::id(1))
             .unwrap()
             .into_iter()
             .map(|item| match item {
@@ -1553,33 +1593,61 @@ mod tests {
                 Item::Comment(c) => format!("c{}", c.id),
             })
             .collect();
-        assert_eq!(order, ["m1", "c1", "m2", "m3", "m4"]);
+        assert_eq!(
+            order,
+            [
+                format!("m{}", fixtures::id(1)),
+                format!("c{}", fixtures::id(1)),
+                format!("m{}", fixtures::id(2)),
+                format!("m{}", fixtures::id(3)),
+                format!("m{}", fixtures::id(4)),
+            ]
+        );
     }
 
     #[test]
     fn read_tracking() {
         let store = fixtures::store().unwrap();
-        assert!(store.unread(ALEX).unwrap().contains(&fixtures::WATER));
-        store.mark_read(ALEX, fixtures::WATER).unwrap();
-        store.mark_read(ALEX, fixtures::WATER).unwrap();
-        assert!(!store.unread(ALEX).unwrap().contains(&fixtures::WATER));
-        assert!(store.unread(SAM).unwrap().contains(&fixtures::WATER));
+        assert!(
+            store
+                .unread(ALEX)
+                .unwrap()
+                .contains(&fixtures::id(fixtures::WATER))
+        );
+        store
+            .mark_read(ALEX, &fixtures::id(fixtures::WATER))
+            .unwrap();
+        store
+            .mark_read(ALEX, &fixtures::id(fixtures::WATER))
+            .unwrap();
+        assert!(
+            !store
+                .unread(ALEX)
+                .unwrap()
+                .contains(&fixtures::id(fixtures::WATER))
+        );
+        assert!(
+            store
+                .unread(SAM)
+                .unwrap()
+                .contains(&fixtures::id(fixtures::WATER))
+        );
         // Sent messages are never unread.
-        assert!(!store.unread(SAM).unwrap().contains(&2));
+        assert!(!store.unread(SAM).unwrap().contains(&fixtures::id(2)));
     }
 
     #[test]
     fn messages_round_trip() {
         let store = fixtures::store().unwrap();
-        let sent = store.message(2).unwrap().unwrap();
-        assert_eq!(sent.message_id, "2@fixtures.docket.invalid");
+        let sent = store.message(&fixtures::id(2)).unwrap().unwrap();
+        assert_eq!(sent.message_id, fixtures::message_id(2));
         assert_eq!(sent.cc, ["Alex"]);
         assert_eq!(sent.bcc, ["Pat Lee"]);
         assert!(
             matches!(&sent.kind, Kind::Sent { by, to } if by == &Some(SAM.to_owned())
                 && to == &["Northwind Roofing".to_string()])
         );
-        let got = store.message(5).unwrap().unwrap();
+        let got = store.message(&fixtures::id(5)).unwrap().unwrap();
         assert_eq!(got.at, jiff::civil::date(2026, 9, 30).at(15, 30, 0, 0));
         assert_eq!(
             got.values(),
@@ -1589,7 +1657,7 @@ mod tests {
                 assignees: BTreeSet::from([SAM.to_owned()]),
             })
         );
-        assert!(store.message(999).unwrap().is_none());
+        assert!(store.message(&fixtures::id(999)).unwrap().is_none());
     }
 
     #[test]
@@ -1614,12 +1682,18 @@ mod tests {
         assert_eq!(store.user(SAM).unwrap().unwrap().slug, "Sam");
         assert!(store.user("pat@example.com").unwrap().is_none());
         assert_eq!(
-            store.thread(1).unwrap().unwrap().subject,
+            store.thread(&fixtures::id(1)).unwrap().unwrap().subject,
             "Gutter repair estimate"
         );
-        assert!(store.thread(999).unwrap().is_none());
-        assert!(store.thread_account(11).unwrap().unwrap().read_only);
-        assert!(store.thread_account(999).unwrap().is_none());
+        assert!(store.thread(&fixtures::id(999)).unwrap().is_none());
+        assert!(
+            store
+                .thread_account(&fixtures::id(11))
+                .unwrap()
+                .unwrap()
+                .read_only
+        );
+        assert!(store.thread_account(&fixtures::id(999)).unwrap().is_none());
     }
 
     #[test]
@@ -1642,7 +1716,7 @@ mod tests {
         store
             .import(|tx| {
                 tx.thread(&Thread {
-                    id: 1,
+                    id: fixtures::id(1),
                     account: "eli".into(),
                     subject: "Practice".into(),
                 })
@@ -1650,7 +1724,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.accounts().unwrap(), [account]);
-        assert!(!store.thread_account(1).unwrap().unwrap().read_only);
+        assert!(
+            !store
+                .thread_account(&fixtures::id(1))
+                .unwrap()
+                .unwrap()
+                .read_only
+        );
     }
 
     /// The shape of a JMAP delivery, for the incoming() tests.
@@ -1725,10 +1805,11 @@ mod tests {
             .unwrap()
             .first()
             .unwrap()
-            .id;
+            .id
+            .clone();
         // Triaged in Docket after the import: the state moves here.
         store.sign_in(ALEX, "Alex").unwrap();
-        store.edit(ALEX, id, Change::State(State::Do)).unwrap();
+        store.edit(ALEX, &id, Change::State(State::Do)).unwrap();
 
         // The next session reports a new body and no folder; the state we
         // set survives, the server's fields refresh.
@@ -1736,10 +1817,45 @@ mod tests {
             .import(|tx| tx.incoming("household", &incoming(State::Inbox, None, "$2,120")))
             .unwrap();
         assert_eq!(store.messages(Filter::Search("2,120")).unwrap().len(), 1);
-        let after = store.message(id).unwrap().unwrap();
+        let after = store.message(&id).unwrap().unwrap();
         assert_eq!(after.body, "$2,120");
         assert_eq!(after.values().unwrap().state, State::Do);
         assert_eq!(after.values().unwrap().folder, None);
+    }
+
+    #[test]
+    fn incoming_reports_a_table_that_refuses_writes() {
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        store
+            .import(|tx| {
+                tx.account(&Account {
+                    slug: "household".into(),
+                    name: "Household".into(),
+                    address: "household@example.com".into(),
+                    read_only: false,
+                })
+            })
+            .unwrap();
+
+        exec(
+            &store,
+            "CREATE TRIGGER no_threads BEFORE INSERT ON threads BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        );
+        assert!(matches!(
+            store.import(|tx| tx.incoming("household", &incoming(State::Inbox, None, "x"))),
+            Err(Error::Db(_))
+        ));
+        exec(&store, "DROP TRIGGER no_threads;");
+
+        exec(
+            &store,
+            "CREATE TRIGGER no_messages BEFORE INSERT ON messages BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        );
+        assert!(matches!(
+            store.import(|tx| tx.incoming("household", &incoming(State::Inbox, None, "x"))),
+            Err(Error::Db(_))
+        ));
+        exec(&store, "DROP TRIGGER no_messages;");
     }
 
     #[test]
@@ -1778,13 +1894,15 @@ mod tests {
             .unwrap()
             .first()
             .unwrap()
-            .thread;
+            .thread
+            .clone();
         let b = store
             .messages(Filter::Search("his"))
             .unwrap()
             .first()
             .unwrap()
-            .thread;
+            .thread
+            .clone();
         assert_ne!(a, b);
     }
 
@@ -1813,12 +1931,23 @@ mod tests {
         .unwrap();
 
         let store = Store::init(conn, Clock::Fixed(fixtures::now())).unwrap();
-        let msg = store.message(4).unwrap().unwrap();
+        // The mail survived, its ids remade: found by Message-ID now, and
+        // the new id is jj-style reverse hex — 16 characters, no digits,
+        // no order.
+        let msg = store
+            .messages(Filter::Search("Revised estimate"))
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap();
+        assert_eq!(msg.message_id, "m4@northwind.co");
+        assert_eq!(msg.id.len(), 16);
+        assert!(msg.id.chars().all(|c| ('k'..='z').contains(&c)));
         assert_eq!(
             msg.values().unwrap().assignees,
             BTreeSet::from([ALEX.to_owned()])
         );
-        assert!(!store.unread(ALEX).unwrap().contains(&4));
+        assert!(!store.unread(ALEX).unwrap().contains(&msg.id));
 
         // The relaxed schema now takes shared-identity sends.
         store
@@ -1882,13 +2011,13 @@ mod tests {
     #[test]
     fn importing_into_a_missing_thread_fails() {
         let store = fixtures::store().unwrap();
-        let mut m = store.message(4).unwrap().unwrap();
-        m.id = 100;
+        let mut m = store.message(&fixtures::id(4)).unwrap().unwrap();
+        m.id = fixtures::id(100);
         m.message_id = "new@example.com".into();
-        m.thread = 999;
+        m.thread = fixtures::id(999);
         let result = store.import(|tx| tx.message(&m));
         assert!(matches!(result, Err(Error::NotFound("thread"))));
-        assert!(store.message(100).unwrap().is_none());
+        assert!(store.message(&fixtures::id(100)).unwrap().is_none());
     }
 
     #[test]
@@ -1900,25 +2029,36 @@ mod tests {
         assert!(store.is_empty().unwrap());
         fixtures::seed(&store).unwrap();
         assert!(!store.is_empty().unwrap());
-        store.edit(SAM, 4, Change::State(State::Wait)).unwrap();
         store
-            .edit(SAM, 4, Change::ToggleAssignee(ALEX.into()))
+            .edit(SAM, &fixtures::id(4), Change::State(State::Wait))
             .unwrap();
-        store.add_comment(SAM, 1, "Called them.").unwrap();
-        store.mark_read(SAM, fixtures::WATER).unwrap();
+        store
+            .edit(SAM, &fixtures::id(4), Change::ToggleAssignee(ALEX.into()))
+            .unwrap();
+        store
+            .add_comment(SAM, &fixtures::id(1), "Called them.")
+            .unwrap();
+        store
+            .mark_read(SAM, &fixtures::id(fixtures::WATER))
+            .unwrap();
         drop(store);
 
         let store = Store::open(&path, Clock::Fixed(fixtures::now())).unwrap();
         assert!(!store.is_empty().unwrap());
-        let v = values(&store, 4);
+        let v = values(&store, &fixtures::id(4));
         assert_eq!(v.state, State::Wait);
         assert_eq!(v.assignees, BTreeSet::from([ALEX.to_owned()]));
         assert!(matches!(
-            store.timeline(1).unwrap().last(),
+            store.timeline(&fixtures::id(1)).unwrap().last(),
             Some(Item::Comment(c)) if c.text == "Called them."
         ));
-        assert!(!store.unread(SAM).unwrap().contains(&fixtures::WATER));
-        assert_eq!(store.history(4).unwrap().len(), 2);
+        assert!(
+            !store
+                .unread(SAM)
+                .unwrap()
+                .contains(&fixtures::id(fixtures::WATER))
+        );
+        assert_eq!(store.history(&fixtures::id(4)).unwrap().len(), 2);
         // Undo and toasts belong to the session that made the edit.
         assert!(store.take_flash(SAM).is_none());
         assert!(matches!(store.undo(SAM), Err(Error::BadRequest(_))));
@@ -1929,25 +2069,35 @@ mod tests {
         let store = fixtures::store().unwrap();
         // The schema refuses a received message without a state, and a
         // folder that doesn't exist.
+        let id = fixtures::id(4);
         let inner = store.lock();
         assert!(
             inner
                 .conn
-                .execute("UPDATE messages SET state = NULL WHERE id = 4", [])
+                .execute(
+                    &format!("UPDATE messages SET state = NULL WHERE id = '{id}'"),
+                    []
+                )
                 .is_err()
         );
         assert!(
             inner
                 .conn
-                .execute("UPDATE messages SET folder = 'Nope' WHERE id = 4", [])
+                .execute(
+                    &format!("UPDATE messages SET folder = 'Nope' WHERE id = '{id}'"),
+                    []
+                )
                 .is_err()
         );
         inner
             .conn
-            .execute("UPDATE messages SET cc = 'not json' WHERE id = 4", [])
+            .execute(
+                &format!("UPDATE messages SET cc = 'not json' WHERE id = '{id}'"),
+                [],
+            )
             .unwrap();
         drop(inner);
-        assert!(matches!(store.message(4), Err(Error::Db(_))));
+        assert!(matches!(store.message(&id), Err(Error::Db(_))));
     }
 
     fn exec(store: &Store, sql: &str) {
@@ -1964,58 +2114,60 @@ mod tests {
         );
         // The state update goes in before the history row that fails.
         assert!(matches!(
-            store.edit(SAM, 4, Change::State(State::Do)),
+            store.edit(SAM, &fixtures::id(4), Change::State(State::Do)),
             Err(Error::Db(_))
         ));
         assert!(matches!(
-            store.edit(SAM, 4, Change::ToggleAssignee(ALEX.into())),
+            store.edit(SAM, &fixtures::id(4), Change::ToggleAssignee(ALEX.into())),
             Err(Error::Db(_))
         ));
-        assert_eq!(values(&store, 4).state, State::Inbox);
-        assert!(values(&store, 4).assignees.is_empty());
-        assert!(store.history(4).unwrap().is_empty());
+        assert_eq!(values(&store, &fixtures::id(4)).state, State::Inbox);
+        assert!(values(&store, &fixtures::id(4)).assignees.is_empty());
+        assert!(store.history(&fixtures::id(4)).unwrap().is_empty());
         assert!(store.take_flash(SAM).is_none());
 
         // A failed undo stays undoable.
         exec(&store, "DROP TRIGGER no_history;");
-        store.edit(SAM, 4, Change::State(State::Do)).unwrap();
+        store
+            .edit(SAM, &fixtures::id(4), Change::State(State::Do))
+            .unwrap();
         exec(
             &store,
             "CREATE TRIGGER no_history BEFORE INSERT ON history BEGIN SELECT RAISE(ABORT, 'no'); END;",
         );
         assert!(matches!(store.undo(SAM), Err(Error::Db(_))));
-        assert_eq!(values(&store, 4).state, State::Do);
+        assert_eq!(values(&store, &fixtures::id(4)).state, State::Do);
         exec(&store, "DROP TRIGGER no_history;");
         store.undo(SAM).unwrap();
-        assert_eq!(values(&store, 4).state, State::Inbox);
+        assert_eq!(values(&store, &fixtures::id(4)).state, State::Inbox);
     }
 
     #[test]
     fn database_errors_surface() {
         let store = fixtures::store().unwrap();
-        let msg = store.message(4).unwrap().unwrap();
+        let msg = store.message(&fixtures::id(4)).unwrap().unwrap();
         exec(&store, "PRAGMA query_only = ON;");
         let db_err = |r: Result<(), Error>| assert!(matches!(r, Err(Error::Db(_))), "{r:?}");
-        db_err(store.edit(SAM, 4, Change::State(State::Do)));
-        db_err(store.mark_read(SAM, 4));
+        db_err(store.edit(SAM, &fixtures::id(4), Change::State(State::Do)));
+        db_err(store.mark_read(SAM, &fixtures::id(4)));
         db_err(store.sign_in("pat@example.com", "pat").map(|_| ()));
-        db_err(store.add_comment(SAM, 1, "hi"));
+        db_err(store.add_comment(SAM, &fixtures::id(1), "hi"));
         db_err(store.import(|tx| tx.folder("Travel")));
         db_err(store.import(|tx| tx.message(&msg)));
         exec(&store, "PRAGMA query_only = OFF;");
 
         // Each table the store reads, gone in turn.
         exec(&store, "ALTER TABLE folders RENAME TO gone_folders;");
-        db_err(store.edit(SAM, 4, Change::Folder(Some("House".into()))));
+        db_err(store.edit(SAM, &fixtures::id(4), Change::Folder(Some("House".into()))));
         assert!(store.folders().is_err());
         exec(&store, "ALTER TABLE comments RENAME TO gone_comments;");
-        assert!(store.timeline(1).is_err());
+        assert!(store.timeline(&fixtures::id(1)).is_err());
         exec(&store, "ALTER TABLE reads RENAME TO gone_reads;");
         assert!(store.unread(SAM).is_err());
         exec(&store, "ALTER TABLE history RENAME TO gone_history;");
-        assert!(store.history(4).is_err());
+        assert!(store.history(&fixtures::id(4)).is_err());
         exec(&store, "ALTER TABLE threads RENAME TO gone_threads;");
-        db_err(store.add_comment(SAM, 1, "hi"));
+        db_err(store.add_comment(SAM, &fixtures::id(1), "hi"));
         exec(&store, "ALTER TABLE users RENAME TO gone_users;");
         assert!(store.users().is_err());
         assert!(store.is_empty().is_err());

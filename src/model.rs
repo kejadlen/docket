@@ -7,9 +7,27 @@ use std::fmt;
 
 use jiff::civil::DateTime;
 
-pub type MessageId = u32;
-pub type ThreadId = u32;
-pub type CommentId = u32;
+pub type MessageId = String;
+pub type ThreadId = String;
+pub type CommentId = String;
+
+/// The reverse-hex alphabet jj's change ids use: nibble `0` renders as
+/// `z`, so the ids carry no order and no meaning.
+pub(crate) const REVERSE_HEX: [char; 16] = [
+    'z', 'y', 'x', 'w', 'v', 'u', 't', 's', 'r', 'q', 'p', 'o', 'n', 'm', 'l', 'k',
+];
+
+pub(crate) fn reverse_hex(bits: u64) -> String {
+    reverse_hex_bytes(&bits.to_be_bytes())
+}
+
+pub(crate) fn reverse_hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|b| [b >> 4, b & 0xf])
+        .filter_map(|nibble| REVERSE_HEX.get(usize::from(nibble)).copied())
+        .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum State {

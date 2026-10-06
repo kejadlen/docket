@@ -7,14 +7,35 @@ use std::collections::BTreeSet;
 use jiff::civil::{DateTime, date};
 
 use crate::Error;
-use crate::model::{Account, Comment, Kind, Message, MessageId, State, Thread, User, Values};
+use crate::model::{Account, Comment, Kind, Message, State, Thread, User, Values, reverse_hex};
 use crate::store::{Clock, Store};
 
-pub const WATER: MessageId = 7;
-pub const ELI_PRACTICE: MessageId = 20;
+/// Seeds for the rows tests name by number.
+pub const WATER: u32 = 7;
+pub const ELI_PRACTICE: u32 = 20;
 
 pub const ALEX: &str = "alex@example.com";
 pub const SAM: &str = "sam@example.com";
+
+/// The fixture row id for a seed number: the seed hashed (splitmix64)
+/// and rendered as jj-style reverse hex, so rows keep stable jj-looking
+/// ids while the fixtures stay written in numbers.
+pub fn id(seed: u32) -> String {
+    reverse_hex(splitmix64(u64::from(seed)))
+}
+
+/// The fixture Message-ID for a seed number.
+pub fn message_id(seed: u32) -> String {
+    format!("{}@fixtures.docket.invalid", id(seed))
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
 
 /// Thursday, 1 October 2026, at noon.
 pub fn now() -> DateTime {
@@ -23,10 +44,6 @@ pub fn now() -> DateTime {
 
 fn at(month: i8, day: i8, hour: i8, minute: i8) -> DateTime {
     date(2026, month, day).at(hour, minute, 0, 0)
-}
-
-fn message_id(id: MessageId) -> String {
-    format!("{id}@fixtures.docket.invalid")
 }
 
 fn strings(xs: &[&str]) -> Vec<String> {
@@ -41,9 +58,9 @@ struct Builder {
 }
 
 impl Builder {
-    fn thread(&mut self, id: u32, account: &str, subject: &str) {
+    fn thread(&mut self, seed: u32, account: &str, subject: &str) {
         self.threads.push(Thread {
-            id,
+            id: id(seed),
             account: account.to_owned(),
             subject: subject.to_owned(),
         });
@@ -52,7 +69,7 @@ impl Builder {
     #[allow(clippy::too_many_arguments)]
     fn recv(
         &mut self,
-        id: MessageId,
+        seed: u32,
         thread: u32,
         at: DateTime,
         (from, addr): (&str, &str),
@@ -61,9 +78,9 @@ impl Builder {
         cc: &[&str],
     ) {
         self.messages.push(Message {
-            id,
-            message_id: message_id(id),
-            thread,
+            id: id(seed),
+            message_id: message_id(seed),
+            thread: id(thread),
             at,
             cc: strings(cc),
             bcc: Vec::new(),
@@ -85,7 +102,7 @@ impl Builder {
 
     fn sent(
         &mut self,
-        id: MessageId,
+        seed: u32,
         thread: u32,
         at: DateTime,
         (by, to): (&str, &[&str]),
@@ -93,9 +110,9 @@ impl Builder {
         (cc, bcc): (&[&str], &[&str]),
     ) {
         self.messages.push(Message {
-            id,
-            message_id: message_id(id),
-            thread,
+            id: id(seed),
+            message_id: message_id(seed),
+            thread: id(thread),
             at,
             cc: strings(cc),
             bcc: strings(bcc),
@@ -108,12 +125,12 @@ impl Builder {
     }
 
     fn comment(&mut self, thread: u32, author: &str, at: DateTime, text: &str) {
-        let id = u32::try_from(self.comments.len())
+        let n = u32::try_from(self.comments.len())
             .unwrap_or(u32::MAX)
             .saturating_add(1);
         self.comments.push(Comment {
-            id,
-            thread,
+            id: id(n),
+            thread: id(thread),
             author: author.to_owned(),
             at,
             text: text.to_owned(),
@@ -330,9 +347,9 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         .messages
         .iter()
         .filter(|m| m.at < cutoff)
-        .flat_map(|m| [(ALEX, m.id), (SAM, m.id)])
+        .flat_map(|m| [(ALEX, m.id.clone()), (SAM, m.id.clone())])
         .collect();
-    reads.push((SAM, 5));
+    reads.push((SAM, id(5)));
 
     store.import(|tx| {
         for user in &users {
@@ -354,7 +371,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
             tx.comment(comment)?;
         }
         for (user, id) in reads {
-            tx.read(user, id)?;
+            tx.read(user, &id)?;
         }
         Ok(())
     })

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use axum::Router;
+use docket::fixtures;
 use docket::routes::{AppState, router};
 use reqwest::{Client, StatusCode, redirect};
 use tokio::net::TcpListener;
@@ -37,6 +38,10 @@ fn slug(login: &str) -> String {
         .next()
         .map(|c| c.to_uppercase().chain(chars).collect())
         .unwrap_or_default()
+}
+
+fn mid(n: u32) -> String {
+    fixtures::id(n)
 }
 
 async fn get(addr: SocketAddr, login: &str, path: &str) -> (StatusCode, String) {
@@ -100,7 +105,7 @@ async fn requires_both_identity_headers() {
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{login:?} {slug:?}");
     }
     // Nobody got added along the way.
-    let (_, body) = get(addr, ALEX, "/?m=4").await;
+    let (_, body) = get(addr, ALEX, &format!("/?m={}", mid(4))).await;
     assert!(!body.contains(EVE));
 }
 
@@ -113,7 +118,7 @@ async fn anyone_tailscale_lets_in_is_a_user() {
 
     // The name follows the latest X-User-Slug.
     let body = client()
-        .get(format!("http://{addr}/?m=4"))
+        .get(format!("http://{addr}/?m={}", mid(4)))
         .header("Remote-User", "eve@example.com")
         .header("X-User-Slug", "Evie")
         .send()
@@ -166,7 +171,7 @@ async fn lanes_and_search() {
     assert!(body.contains("Nothing here."));
     // A search result row links back into the search.
     let (_, body) = get(addr, SAM, "/search?q=checkup").await;
-    assert!(body.contains("/search?q=checkup&amp;m=15"));
+    assert!(body.contains(&format!("/search?q=checkup&amp;m={}", mid(15))));
 
     for path in ["/done", "/nope", "/folders/Medical", "/?m=999"] {
         let (status, _) = get(addr, SAM, path).await;
@@ -177,34 +182,35 @@ async fn lanes_and_search() {
 #[tokio::test]
 async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
     let addr = spawn().await;
-    let (status, body) = get(addr, SAM, "/?m=4").await;
+    let (status, body) = get(addr, SAM, &format!("/?m={}", mid(4))).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("<h2>Gutter repair estimate</h2>"));
     // Only the selected email floats.
-    assert!(body.contains(r#"class="item card sel" id="m4""#));
-    assert!(body.contains(r#"class="item card" id="m3""#));
+    assert!(body.contains(&format!(r#"class="item card sel" id="m{}""#, mid(4))));
+    assert!(body.contains(&format!(r#"class="item card" id="m{}""#, mid(3))));
     assert!(body.contains(r#"<span class="type-label sent">Sent</span>"#));
     assert!(body.contains(r#"<span class="badge accent"><span class="mark"></span>Do</span>"#));
     assert!(body.contains(r#"<span class="badge success"><span class="mark"></span>Done</span>"#));
-    assert!(body.contains(
-        "https://app.fastmail.com/mail/search:msgid%3A%3C4%40fixtures.docket.invalid%3E"
-    ));
+    assert!(body.contains(&format!(
+        "https://app.fastmail.com/mail/search:msgid%3A%3C{}%40fixtures.docket.invalid%3E",
+        mid(4)
+    )));
     assert!(body.contains(r#"<button class="btn primary" type="submit">Comment</button>"#));
     assert!(body.contains("cc Alex · bcc Pat Lee"));
     assert!(body.contains("cc Sam, Alex"));
     assert!(body.contains("→ Northwind Roofing"));
     assert!(body.contains("The Hendersons paid about $1,600"));
-    assert!(body.contains(r#"action="/messages/4/state""#));
-    assert!(body.contains(r#"action="/messages/4/folder""#));
-    assert!(body.contains(r#"action="/messages/4/assignees""#));
+    assert!(body.contains(&format!(r#"action="/messages/{}/state""#, mid(4))));
+    assert!(body.contains(&format!(r#"action="/messages/{}/folder""#, mid(4))));
+    assert!(body.contains(&format!(r#"action="/messages/{}/assignees""#, mid(4))));
     assert!(body.contains(r#"<span class="type-label value unset">Assign</span>"#));
     assert!(body.contains(r#"<span class="type-label value">House</span>"#));
-    assert!(body.contains(r#"value="/?m=4""#));
+    assert!(body.contains(&format!(r#"value="/?m={}""#, mid(4))));
 
-    let (_, body) = get(addr, ALEX, "/?m=6").await;
+    let (_, body) = get(addr, ALEX, &format!("/?m={}", mid(6))).await;
     assert!(body.contains(r#"<span class="type-label value">→ ALEX</span>"#));
     assert!(!body.contains(r#"<span class="type-label value">—</span>"#));
-    let (_, body) = get(addr, SAM, "/inbox?m=8").await;
+    let (_, body) = get(addr, SAM, &format!("/inbox?m={}", mid(8))).await;
     assert!(body.contains(r#"<span class="type-label value">—</span>"#));
     assert!(!body.contains("Read-only"));
 }
@@ -212,15 +218,15 @@ async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
 #[tokio::test]
 async fn read_only_accounts_show_folder_as_plain_text() {
     let addr = spawn().await;
-    let (_, body) = get(addr, SAM, "/watch?m=20").await;
+    let (_, body) = get(addr, SAM, &format!("/watch?m={}", mid(20))).await;
     assert!(body.contains(r#"<span class="type-label">Read-only</span>"#));
     assert!(body.contains(r#"<span class="type-label value static">—</span>"#));
-    assert!(!body.contains(r#"action="/messages/20/folder""#));
-    assert!(body.contains(r#"action="/messages/20/state""#));
+    assert!(!body.contains(&format!(r#"action="/messages/{}/folder""#, mid(20))));
+    assert!(body.contains(&format!(r#"action="/messages/{}/state""#, mid(20))));
     let res = post(
         addr,
         SAM,
-        "/messages/20/folder",
+        &format!("/messages/{}/folder", mid(20)),
         &[("folder", "School"), ("back", "/")],
     )
     .await;
@@ -231,13 +237,13 @@ async fn read_only_accounts_show_folder_as_plain_text() {
 async fn opening_a_message_marks_it_read() {
     let addr = spawn().await;
     let (_, body) = get(addr, ALEX, "/").await;
-    assert!(body.contains(r#"class="row solo unread" href="/?m=7""#));
-    get(addr, ALEX, "/?m=7").await;
+    assert!(body.contains(&format!(r#"class="row solo unread" href="/?m={}""#, mid(7))));
+    get(addr, ALEX, &format!("/?m={}", mid(7))).await;
     let (_, body) = get(addr, ALEX, "/").await;
-    assert!(body.contains(r#"class="row solo" href="/?m=7""#));
+    assert!(body.contains(&format!(r#"class="row solo" href="/?m={}""#, mid(7))));
     // Read tracking is per person.
     let (_, body) = get(addr, SAM, "/").await;
-    assert!(body.contains(r#"class="row solo unread" href="/?m=7""#));
+    assert!(body.contains(&format!(r#"class="row solo unread" href="/?m={}""#, mid(7))));
 }
 
 #[tokio::test]
@@ -246,23 +252,23 @@ async fn editing_values_with_undo() {
     let res = post(
         addr,
         SAM,
-        "/messages/4/state",
-        &[("state", "do"), ("back", "/?m=4")],
+        &format!("/messages/{}/state", mid(4)),
+        &[("state", "do"), ("back", &format!("/?m={}", mid(4)))],
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    assert_eq!(location(&res), "/?m=4");
+    assert_eq!(location(&res), &format!("/?m={}", mid(4)));
 
-    let (_, body) = get(addr, SAM, "/?m=4").await;
+    let (_, body) = get(addr, SAM, &format!("/?m={}", mid(4))).await;
     assert!(body.contains("Moved to Do"));
     assert!(body.contains(r#"action="/undo""#));
     // The toast shows once.
-    let (_, body) = get(addr, SAM, "/?m=4").await;
+    let (_, body) = get(addr, SAM, &format!("/?m={}", mid(4))).await;
     assert!(!body.contains("Moved to Do"));
 
-    let res = post(addr, SAM, "/undo", &[("back", "/?m=4")]).await;
+    let res = post(addr, SAM, "/undo", &[("back", &format!("/?m={}", mid(4)))]).await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    let (_, body) = get(addr, SAM, "/?m=4").await;
+    let (_, body) = get(addr, SAM, &format!("/?m={}", mid(4))).await;
     assert!(body.contains("Undone"));
     assert!(!body.contains(r#"action="/undo""#));
     let res = post(addr, SAM, "/undo", &[("back", "/")]).await;
@@ -271,7 +277,7 @@ async fn editing_values_with_undo() {
     let res = post(
         addr,
         SAM,
-        "/messages/4/folder",
+        &format!("/messages/{}/folder", mid(4)),
         &[("folder", "Finance"), ("back", "/")],
     )
     .await;
@@ -279,32 +285,32 @@ async fn editing_values_with_undo() {
     let res = post(
         addr,
         SAM,
-        "/messages/4/folder",
+        &format!("/messages/{}/folder", mid(4)),
         &[("folder", ""), ("back", "/")],
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    let (_, body) = get(addr, SAM, "/?m=4").await;
+    let (_, body) = get(addr, SAM, &format!("/?m={}", mid(4))).await;
     assert!(body.contains("Removed from folder"));
 
     let res = post(
         addr,
         SAM,
-        "/messages/4/assignees",
+        &format!("/messages/{}/assignees", mid(4)),
         &[("user", ALEX), ("back", "/")],
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     // Now it's Alex's; Sam's For me no longer lists it, Alex's does.
     let (_, body) = get(addr, ALEX, "/").await;
-    assert!(body.contains(r#"href="/?m=4""#));
+    assert!(body.contains(&format!(r#"href="/?m={}""#, mid(4))));
     let (_, body) = get(addr, SAM, "/").await;
-    assert!(!body.contains(r#"href="/?m=4""#));
+    assert!(!body.contains(&format!(r#"href="/?m={}""#, mid(4))));
 
     let res = post(
         addr,
         SAM,
-        "/messages/4/state",
+        &format!("/messages/{}/state", mid(4)),
         &[("state", "read"), ("back", "/")],
     )
     .await;
@@ -312,7 +318,7 @@ async fn editing_values_with_undo() {
     let res = post(
         addr,
         SAM,
-        "/messages/2/state",
+        &format!("/messages/{}/state", mid(2)),
         &[("state", "do"), ("back", "/")],
     )
     .await;
@@ -320,7 +326,7 @@ async fn editing_values_with_undo() {
     let res = post(
         addr,
         SAM,
-        "/messages/4/state",
+        &format!("/messages/{}/state", mid(4)),
         &[("state", "do"), ("back", "https://evil.example")],
     )
     .await;
@@ -333,17 +339,20 @@ async fn comments_join_the_thread() {
     let res = post(
         addr,
         ALEX,
-        "/threads/1/comments",
-        &[("text", "I'll call them."), ("back", "/?m=4")],
+        &format!("/threads/{}/comments", mid(1)),
+        &[
+            ("text", "I'll call them."),
+            ("back", &format!("/?m={}", mid(4))),
+        ],
     )
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    let (_, body) = get(addr, SAM, "/?m=4").await;
+    let (_, body) = get(addr, SAM, &format!("/?m={}", mid(4))).await;
     assert!(body.contains("I&#39;ll call them.") || body.contains("I'll call them."));
     let res = post(
         addr,
         ALEX,
-        "/threads/1/comments",
+        &format!("/threads/{}/comments", mid(1)),
         &[("text", " "), ("back", "/")],
     )
     .await;
@@ -355,7 +364,7 @@ async fn cross_site_posts_are_refused() {
     let addr = spawn().await;
     let send = |origin: &'static str| {
         client()
-            .post(format!("http://{addr}/messages/4/state"))
+            .post(format!("http://{addr}/messages/{}/state", mid(4)))
             .header("Remote-User", SAM)
             .header("X-User-Slug", "Sam")
             .header("Origin", origin)
@@ -485,21 +494,33 @@ async fn trashing_confirms_through_a_dialog_and_marks_done() {
     // The trash affordance is a dialog on writable accounts: open it
     // with showModal, cancel closes without posting, and the form
     // targets the delete route.
-    let (_, body) = get(addr, SAM, "/inbox?m=8").await;
-    assert!(body.contains(r#"id="trash-8""#));
+    let (_, body) = get(addr, SAM, &format!("/inbox?m={}", mid(8))).await;
+    assert!(body.contains(&format!(r#"id="trash-{}""#, mid(8))));
     assert!(body.contains("showModal"));
     assert!(body.contains("Move to Trash?"));
     assert!(body.contains(r#"formmethod="dialog""#));
-    assert!(body.contains(r#"action="/messages/8/delete""#));
+    assert!(body.contains(&format!(r#"action="/messages/{}/delete""#, mid(8))));
 
-    let res = post(addr, SAM, "/messages/8/delete", &[("back", "/inbox?m=8")]).await;
+    let res = post(
+        addr,
+        SAM,
+        &format!("/messages/{}/delete", mid(8)),
+        &[("back", &format!("/inbox?m={}", mid(8)))],
+    )
+    .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    let (_, body) = get(addr, SAM, "/search?q=142.18&m=8").await;
+    let (_, body) = get(addr, SAM, &format!("/search?q=142.18&m={}", mid(8))).await;
     assert!(body.contains(r#"<span class="badge success"><span class="mark"></span>Done</span>"#));
 
     // Read-only accounts get neither the dialog nor the route.
-    let (_, body) = get(addr, SAM, "/watch?m=20").await;
+    let (_, body) = get(addr, SAM, &format!("/watch?m={}", mid(20))).await;
     assert!(!body.contains(r#"id="trash-20""#));
-    let res = post(addr, SAM, "/messages/20/delete", &[("back", "/watch?m=20")]).await;
+    let res = post(
+        addr,
+        SAM,
+        &format!("/messages/{}/delete", mid(20)),
+        &[("back", &format!("/watch?m={}", mid(20)))],
+    )
+    .await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }

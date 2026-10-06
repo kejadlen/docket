@@ -784,11 +784,11 @@ async fn each_credential_opens_a_session_and_imports_its_mail() {
 
     // Threads group their messages under one subject.
     assert_eq!(
-        store.thread(roofer1.thread).unwrap().unwrap().subject,
+        store.thread(&roofer1.thread).unwrap().unwrap().subject,
         "Gutter repair estimate"
     );
     assert_eq!(
-        store.thread(school.thread).unwrap().unwrap().subject,
+        store.thread(&school.thread).unwrap().unwrap().subject,
         "Field trip"
     );
     assert_ne!(roofer1.thread, school.thread);
@@ -1194,7 +1194,7 @@ async fn filing_pushes_through_the_poll() {
     store
         .edit(
             "sam@example.com",
-            school.id,
+            &school.id,
             Change::Folder(Some("Receipts".into())),
         )
         .unwrap();
@@ -1226,13 +1226,13 @@ async fn filing_pushes_through_the_poll() {
     // The push cleared the queue, and the same cycle's /changes sweep
     // confirmed the filing in the cached row.
     assert!(store.pending_files("household").unwrap().is_empty());
-    let after = store.message(school.id).unwrap().unwrap();
+    let after = store.message(&school.id).unwrap().unwrap();
     assert_eq!(after.values().unwrap().folder.as_deref(), Some("Receipts"));
     assert_eq!(after.values().unwrap().state, State::Watch);
 
     // Unfiling queues again and empties every folder membership.
     store
-        .edit("sam@example.com", school.id, Change::Folder(None))
+        .edit("sam@example.com", &school.id, Change::Folder(None))
         .unwrap();
     let counts = client
         .poll_once(&household, &mut sync, &store)
@@ -1266,7 +1266,7 @@ async fn acl_denied_filings_wait_for_the_rights() {
     store
         .edit(
             "sam@example.com",
-            school.id,
+            &school.id,
             Change::Folder(Some("Receipts".into())),
         )
         .unwrap();
@@ -1300,7 +1300,7 @@ async fn a_refused_filing_clears_rather_than_retries() {
     store
         .edit(
             "sam@example.com",
-            school.id,
+            &school.id,
             Change::Folder(Some("Receipts".into())),
         )
         .unwrap();
@@ -1317,7 +1317,7 @@ async fn a_refused_filing_clears_rather_than_retries() {
     assert!(store.pending_files("household").unwrap().is_empty());
     assert_eq!(
         store
-            .message(school.id)
+            .message(&school.id)
             .unwrap()
             .unwrap()
             .values()
@@ -1334,7 +1334,7 @@ async fn a_filing_for_mail_thats_gone_drops() {
     store
         .edit(
             "sam@example.com",
-            school.id,
+            &school.id,
             Change::Folder(Some("Receipts".into())),
         )
         .unwrap();
@@ -1356,7 +1356,7 @@ async fn a_filing_into_a_vanished_folder_drops() {
     store
         .edit(
             "sam@example.com",
-            school.id,
+            &school.id,
             Change::Folder(Some("Receipts".into())),
         )
         .unwrap();
@@ -1381,7 +1381,7 @@ async fn done_archives_out_of_the_shared_inbox() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     let school = school_message(&store);
     store
-        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .edit("sam@example.com", &school.id, Change::State(State::Done))
         .unwrap();
     assert_eq!(store.pending_archives("household").unwrap().len(), 1);
 
@@ -1410,7 +1410,7 @@ async fn done_archives_out_of_the_shared_inbox() {
     assert!(store.pending_archives("household").unwrap().is_empty());
     assert_eq!(
         store
-            .message(school.id)
+            .message(&school.id)
             .unwrap()
             .unwrap()
             .values()
@@ -1433,7 +1433,7 @@ async fn mail_already_out_of_the_inbox_exits_nowhere() {
         });
     let school = school_message(&store);
     store
-        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .edit("sam@example.com", &school.id, Change::State(State::Done))
         .unwrap();
 
     let counts = client
@@ -1467,7 +1467,7 @@ async fn acl_denied_archives_wait_for_the_rights() {
         });
     let school = school_message(&store);
     store
-        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .edit("sam@example.com", &school.id, Change::State(State::Done))
         .unwrap();
 
     let counts = client
@@ -1497,7 +1497,7 @@ async fn a_refused_archive_clears_rather_than_retries() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     let school = school_message(&store);
     store
-        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .edit("sam@example.com", &school.id, Change::State(State::Done))
         .unwrap();
     world.lock().unwrap().refuse.insert("E-school".into());
 
@@ -1515,7 +1515,7 @@ async fn an_archive_for_mail_thats_gone_drops() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     let school = school_message(&store);
     store
-        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .edit("sam@example.com", &school.id, Change::State(State::Done))
         .unwrap();
     world.lock().unwrap().remove_email(HOUSEHOLD, "E-school");
 
@@ -1533,7 +1533,7 @@ async fn an_archive_with_nowhere_to_land_drops() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     let school = school_message(&store);
     store
-        .edit("sam@example.com", school.id, Change::State(State::Done))
+        .edit("sam@example.com", &school.id, Change::State(State::Done))
         .unwrap();
     // The server loses its Archive mailbox before the exit lands.
     world
@@ -1567,7 +1567,7 @@ async fn an_archive_with_nowhere_to_land_drops() {
 async fn trashing_destroys_through_the_poll() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     let school = school_message(&store);
-    store.delete("sam@example.com", school.id).unwrap();
+    store.delete("sam@example.com", &school.id).unwrap();
     assert_eq!(store.pending_deletes("household").unwrap().len(), 1);
 
     let counts = client
@@ -1588,7 +1588,7 @@ async fn trashing_destroys_through_the_poll() {
     // The cached row stays, Done.
     assert_eq!(
         store
-            .message(school.id)
+            .message(&school.id)
             .unwrap()
             .unwrap()
             .values()
@@ -1602,7 +1602,7 @@ async fn trashing_destroys_through_the_poll() {
 async fn a_refused_destruction_clears_rather_than_retries() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     let school = school_message(&store);
-    store.delete("sam@example.com", school.id).unwrap();
+    store.delete("sam@example.com", &school.id).unwrap();
     world.lock().unwrap().refuse.insert("E-school".into());
 
     let counts = client
@@ -1618,7 +1618,7 @@ async fn a_refused_destruction_clears_rather_than_retries() {
 async fn a_destruction_for_mail_thats_gone_clears() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     let school = school_message(&store);
-    store.delete("sam@example.com", school.id).unwrap();
+    store.delete("sam@example.com", &school.id).unwrap();
     world.lock().unwrap().remove_email(HOUSEHOLD, "E-school");
 
     let counts = client

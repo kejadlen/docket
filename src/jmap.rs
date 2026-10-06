@@ -1446,7 +1446,7 @@ impl Client {
         for p in &pending {
             let Some(memberships) = current.get(&p.jmap_id) else {
                 tracing::warn!(jmap_id = %p.jmap_id, "filing dropped: the mail is gone server-side");
-                clear.push(p.message);
+                clear.push(p.message.clone());
                 continue;
             };
             if p.folder
@@ -1454,7 +1454,7 @@ impl Client {
                 .is_some_and(|f| layout.folder_id(f).is_none())
             {
                 tracing::warn!(?p.folder, "filing dropped: the folder vanished server-side");
-                clear.push(p.message);
+                clear.push(p.message.clone());
                 continue;
             }
             if !filing_allowed(memberships, layout, p.folder.as_deref()) {
@@ -1482,7 +1482,10 @@ impl Client {
             // Refused ids clear too: the server's verdict stands, and
             // retrying would only requeue the refusal.
             clear.extend(chunk.iter().filter_map(|(id, _)| {
-                pending.iter().find(|p| &p.jmap_id == id).map(|p| p.message)
+                pending
+                    .iter()
+                    .find(|p| &p.jmap_id == id)
+                    .map(|p| p.message.clone())
             }));
         }
         store.clear_pending_files(&clear)?;
@@ -1528,7 +1531,7 @@ impl Client {
         for p in &pending {
             let Some(memberships) = current.get(&p.jmap_id) else {
                 tracing::warn!(jmap_id = %p.jmap_id, "archive dropped: the mail is gone server-side");
-                clear.push(p.message);
+                clear.push(p.message.clone());
                 continue;
             };
             let Some(next) = archived_mailboxes(memberships, layout) else {
@@ -1538,7 +1541,7 @@ impl Client {
                 if layout.archive.is_none() {
                     tracing::warn!(jmap_id = %p.jmap_id, "archive dropped: the server has no Archive mailbox");
                 }
-                clear.push(p.message);
+                clear.push(p.message.clone());
                 continue;
             };
             if !archive_allowed(layout) {
@@ -1561,7 +1564,10 @@ impl Client {
             // Refused ids clear too: the server's verdict stands, and
             // retrying would only requeue the refusal.
             clear.extend(chunk.iter().filter_map(|(id, _)| {
-                pending.iter().find(|p| &p.jmap_id == id).map(|p| p.message)
+                pending
+                    .iter()
+                    .find(|p| &p.jmap_id == id)
+                    .map(|p| p.message.clone())
             }));
         }
         store.clear_pending_archives(&clear)?;
@@ -1598,11 +1604,12 @@ impl Client {
             deleted = deleted.saturating_add(reply.destroyed.len());
             // Refused ids clear too: the server's verdict stands, and
             // retrying would only requeue the refusal.
-            clear.extend(
-                chunk
+            clear.extend(chunk.iter().filter_map(|id| {
+                pending
                     .iter()
-                    .filter_map(|id| pending.iter().find(|p| &p.jmap_id == id).map(|p| p.message)),
-            );
+                    .find(|p| &p.jmap_id == id)
+                    .map(|p| p.message.clone())
+            }));
         }
         store.clear_pending_deletes(&clear)?;
         Ok(deleted)
