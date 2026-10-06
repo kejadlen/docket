@@ -1383,31 +1383,22 @@ async fn done_archives_out_of_the_shared_inbox() {
     store
         .edit("sam@example.com", &school.id, Change::State(State::Done))
         .unwrap();
-    assert_eq!(store.pending_archives("household").unwrap().len(), 1);
+    assert_eq!(store.pending_moves("household").unwrap().len(), 1);
 
     let counts = client
         .poll_once(&household, &mut sync, &store)
         .await
         .unwrap();
 
-    assert_eq!(counts.archived, 1, "{counts:?}");
+    assert_eq!(counts.moved, 1, "{counts:?}");
 
-    // Server side: out of the Inbox, into Archive, label and folder
-    // kept.
-    let memberships = {
-        let world = world.lock().unwrap();
-        world.accounts[HOUSEHOLD]
-            .emails
-            .iter()
-            .find(|e| e["id"] == json!("E-school"))
-            .unwrap()["mailboxIds"]
-            .clone()
-    };
+    // Server side: out of the Inbox and the label, into Archive,
+    // folder kept.
     assert_eq!(
-        memberships,
-        json!({"MB-watch": true, "MB-school": true, "MB-archive": true})
+        memberships_of(&world, "E-school"),
+        json!({"MB-school": true, "MB-archive": true})
     );
-    assert!(store.pending_archives("household").unwrap().is_empty());
+    assert!(store.pending_moves("household").unwrap().is_empty());
     assert_eq!(
         store
             .message(&school.id)
@@ -1417,6 +1408,89 @@ async fn done_archives_out_of_the_shared_inbox() {
             .unwrap()
             .state,
         State::Done
+    );
+}
+
+/// The household stub's current memberships for one email.
+fn memberships_of(world: &World, id: &str) -> Value {
+    let world = world.lock().unwrap();
+    world.accounts[HOUSEHOLD]
+        .emails
+        .iter()
+        .find(|e| e["id"] == json!(id))
+        .unwrap()["mailboxIds"]
+        .clone()
+}
+
+#[tokio::test]
+async fn every_lane_leaves_the_shared_inbox_and_undo_brings_it_back() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", &school.id, Change::State(State::Do))
+        .unwrap();
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    // Out of the Inbox, Watch's label swapped for Do's, folder kept.
+    assert_eq!(counts.moved, 1, "{counts:?}");
+    assert_eq!(
+        memberships_of(&world, "E-school"),
+        json!({"MB-do": true, "MB-school": true})
+    );
+    assert!(store.pending_moves("household").unwrap().is_empty());
+
+    // Undo restores Watch, so the mail goes back to the Watch label —
+    // still out of the Inbox, since every lane but Inbox is.
+    store.undo("sam@example.com").unwrap();
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(counts.moved, 1, "{counts:?}");
+    assert_eq!(
+        memberships_of(&world, "E-school"),
+        json!({"MB-watch": true, "MB-school": true})
+    );
+
+    // Inbox puts it back, label off.
+    store
+        .edit("sam@example.com", &school.id, Change::State(State::Inbox))
+        .unwrap();
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(counts.moved, 1, "{counts:?}");
+    assert_eq!(
+        memberships_of(&world, "E-school"),
+        json!({"MB-in": true, "MB-school": true})
+    );
+}
+
+#[tokio::test]
+async fn a_lane_without_its_label_keeps_the_mail_in_the_inbox() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    let school = school_message(&store);
+    // The stub has no Docket/Wait; leaving the Inbox without it would
+    // read as Done to every other client.
+    store
+        .edit("sam@example.com", &school.id, Change::State(State::Wait))
+        .unwrap();
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert_eq!(counts.moved, 0, "{counts:?}");
+    assert!(store.pending_moves("household").unwrap().is_empty());
+    assert_eq!(
+        memberships_of(&world, "E-school"),
+        json!({"MB-in": true, "MB-watch": true, "MB-school": true})
     );
 }
 
@@ -1442,8 +1516,8 @@ async fn mail_already_out_of_the_inbox_exits_nowhere() {
         .unwrap();
 
     // No exit to make: the intent clears and nothing moves.
-    assert_eq!(counts.archived, 0, "{counts:?}");
-    assert!(store.pending_archives("household").unwrap().is_empty());
+    assert_eq!(counts.moved, 0, "{counts:?}");
+    assert!(store.pending_moves("household").unwrap().is_empty());
     let memberships = {
         let world = world.lock().unwrap();
         world.accounts[HOUSEHOLD]
@@ -1474,8 +1548,8 @@ async fn acl_denied_archives_wait_for_the_rights() {
         .poll_once(&household, &mut sync, &store)
         .await
         .unwrap();
-    assert_eq!(counts.archived, 0, "{counts:?}");
-    assert_eq!(store.pending_archives("household").unwrap().len(), 1);
+    assert_eq!(counts.moved, 0, "{counts:?}");
+    assert_eq!(store.pending_moves("household").unwrap().len(), 1);
 
     // The rights come back and the waiting exit goes through.
     world
@@ -1488,8 +1562,8 @@ async fn acl_denied_archives_wait_for_the_rights() {
         .poll_once(&household, &mut sync, &store)
         .await
         .unwrap();
-    assert_eq!(counts.archived, 1, "{counts:?}");
-    assert!(store.pending_archives("household").unwrap().is_empty());
+    assert_eq!(counts.moved, 1, "{counts:?}");
+    assert!(store.pending_moves("household").unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1506,8 +1580,8 @@ async fn a_refused_archive_clears_rather_than_retries() {
         .await
         .unwrap();
 
-    assert_eq!(counts.archived, 0, "{counts:?}");
-    assert!(store.pending_archives("household").unwrap().is_empty());
+    assert_eq!(counts.moved, 0, "{counts:?}");
+    assert!(store.pending_moves("household").unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1524,8 +1598,8 @@ async fn an_archive_for_mail_thats_gone_drops() {
         .await
         .unwrap();
 
-    assert_eq!(counts.archived, 0, "{counts:?}");
-    assert!(store.pending_archives("household").unwrap().is_empty());
+    assert_eq!(counts.moved, 0, "{counts:?}");
+    assert!(store.pending_moves("household").unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1546,8 +1620,8 @@ async fn an_archive_with_nowhere_to_land_drops() {
         .await
         .unwrap();
 
-    assert_eq!(counts.archived, 0, "{counts:?}");
-    assert!(store.pending_archives("household").unwrap().is_empty());
+    assert_eq!(counts.moved, 0, "{counts:?}");
+    assert!(store.pending_moves("household").unwrap().is_empty());
     let memberships = {
         let world = world.lock().unwrap();
         world.accounts[HOUSEHOLD]

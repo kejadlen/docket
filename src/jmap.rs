@@ -434,8 +434,7 @@ struct Layout {
     pub inbox: Option<String>,
     /// The Sent mailbox's id.
     pub sent: Option<String>,
-    /// The Archive mailbox's id: where Done's exit from the Inbox
-    /// lands.
+    /// The Archive mailbox's id: where Done lands.
     pub archive: Option<String>,
     /// Label mailbox id → the state it carries.
     labels: BTreeMap<String, State>,
@@ -529,6 +528,15 @@ impl Layout {
         self.folders.values().map(|f| f.name.clone()).collect()
     }
 
+    /// The label mailbox id that carries `state`, if the server has
+    /// one. Creating missing labels is task xy.
+    fn label_of(&self, state: State) -> Option<&str> {
+        self.labels
+            .iter()
+            .find(|(_, s)| **s == state)
+            .map(|(id, _)| id.as_str())
+    }
+
     /// The mailbox id a folder name files into.
     fn folder_id(&self, name: &str) -> Option<&str> {
         self.folders
@@ -590,41 +598,80 @@ fn filing_allowed(current: &BTreeMap<String, bool>, layout: &Layout, target: Opt
     leaving && entering
 }
 
-/// The memberships an archive leaves the message in: out of the Inbox,
-/// into Archive, with labels, folders, and other system boxes kept.
-/// None when there is no exit to make — the mail already left the
-/// Inbox, or the server has no Archive mailbox — so the caller clears
-/// the intent without touching anything.
-fn archived_mailboxes(
-    current: &BTreeMap<String, bool>,
-    layout: &Layout,
-) -> Option<BTreeMap<String, bool>> {
-    let archive = layout.archive.as_deref()?;
-    if !current.contains_key(layout.inbox.as_deref()?) {
-        return None;
-    }
-    let mut next: BTreeMap<String, bool> = current
-        .iter()
-        .filter(|(id, member)| **member && Some(id.as_str()) != layout.inbox.as_deref())
-        .map(|(id, _)| (id.clone(), true))
-        .collect();
-    next.insert(archive.to_owned(), true);
-    Some(next)
+/// What a queued state move comes to against fresh memberships.
+#[derive(Debug, PartialEq, Eq)]
+enum Move {
+    /// The memberships to write.
+    To(BTreeMap<String, bool>),
+    /// The mail already sits where the state says.
+    Settled,
+    /// The server lacks the mailbox the state lands in.
+    Nowhere,
 }
 
-/// Whether the ACLs permit the archive: the Inbox gives the message
-/// up, and Archive takes it.
-fn archive_allowed(layout: &Layout) -> bool {
-    let leaving = layout
-        .inbox
-        .as_deref()
-        .and_then(|id| layout.rights.get(id))
-        .is_none_or(|rights| rights.may_remove_items);
-    let entering = layout
-        .archive
-        .as_deref()
-        .and_then(|id| layout.rights.get(id))
-        .is_some_and(|rights| rights.may_add_items);
+/// The memberships that say `state` (DESIGN.md, State): out of the
+/// Inbox, Archive, and every label, then into the state's own mailbox
+/// — the Inbox, its `Docket/` label, or Archive for Done — with
+/// folders and other system boxes kept. Mail with neither Inbox nor
+/// label already reads as Done, so Done leaves it where it is rather
+/// than pulling filed mail into Archive.
+fn moved_mailboxes(current: &BTreeMap<String, bool>, layout: &Layout, state: State) -> Move {
+    let members: BTreeMap<String, bool> = current
+        .iter()
+        .filter(|(_, member)| **member)
+        .map(|(id, _)| (id.clone(), true))
+        .collect();
+    let in_lane = |id: &str| Some(id) == layout.inbox.as_deref() || layout.labels.contains_key(id);
+    let is_place = |id: &str| in_lane(id) || Some(id) == layout.archive.as_deref();
+    if state == State::Done && !members.keys().any(|id| in_lane(id)) {
+        return Move::Settled;
+    }
+    let target = match state {
+        State::Inbox => layout.inbox.as_deref(),
+        State::Done => layout.archive.as_deref(),
+        State::Do | State::Wait | State::Watch => layout.label_of(state),
+    };
+    let Some(target) = target else {
+        return Move::Nowhere;
+    };
+    let mut next: BTreeMap<String, bool> = members
+        .iter()
+        .filter(|(id, _)| !is_place(id))
+        .map(|(id, _)| (id.clone(), true))
+        .collect();
+    next.insert(target.to_owned(), true);
+    if next == members {
+        Move::Settled
+    } else {
+        Move::To(next)
+    }
+}
+
+/// Whether the ACLs permit the move: every mailbox losing the message
+/// gives it up, and every one gaining it takes it.
+fn move_allowed(
+    current: &BTreeMap<String, bool>,
+    next: &BTreeMap<String, bool>,
+    layout: &Layout,
+) -> bool {
+    let leaving = current
+        .iter()
+        .filter(|(id, member)| **member && !next.contains_key(*id))
+        .all(|(id, _)| {
+            layout
+                .rights
+                .get(id)
+                .is_none_or(|rights| rights.may_remove_items)
+        });
+    let entering = next
+        .keys()
+        .filter(|id| current.get(*id) != Some(&true))
+        .all(|id| {
+            layout
+                .rights
+                .get(id)
+                .is_some_and(|rights| rights.may_add_items)
+        });
     leaving && entering
 }
 
@@ -673,8 +720,8 @@ pub struct PollCounts {
     pub mailboxes: bool,
     /// Filings pushed server-side.
     pub filed: usize,
-    /// Archives pushed server-side — Done's exit from the Inbox.
-    pub archived: usize,
+    /// State moves pushed server-side.
+    pub moved: usize,
     /// Deletions pushed server-side.
     pub deleted: usize,
     /// Whether the server disowned the stored states and a full
@@ -1273,7 +1320,7 @@ impl Client {
 
     /// One poll cycle: `/changes` for mailboxes and email since the
     /// states the account was left in, applying what moved, then the
-    /// queued filings, archives, and deletions go out. A
+    /// queued filings, state moves, and deletions go out. A
     /// `cannotCalculateChanges` reply means the server disowns those
     /// states (RFC 8620 §5.2), so the cycle re-imports from scratch
     /// and the caller carries the fresh states forward.
@@ -1335,8 +1382,8 @@ impl Client {
         counts.filed = self
             .push_files(&session, &token, id, &credential.name, &sync.layout, store)
             .await?;
-        counts.archived = self
-            .push_archives(&session, &token, id, &credential.name, &sync.layout, store)
+        counts.moved = self
+            .push_moves(&session, &token, id, &credential.name, &sync.layout, store)
             .await?;
         counts.deleted = self
             .push_deletes(&session, &token, id, &credential.name, store)
@@ -1492,16 +1539,15 @@ impl Client {
         Ok(filed)
     }
 
-    /// Drains the queued archives — what Done means on a writable
-    /// account: the mail leaves the shared Inbox for Archive, labels
-    /// and folders kept. Self-limiting against fresh memberships: mail
-    /// another client already filed out of the Inbox is left alone,
-    /// its intent cleared silently. ACL-refused entries stay queued and
-    /// nag the log until an admin grants them; server refusals and ids
-    /// the server no longer carries are dropped with a warning instead
-    /// of retried forever.
-    #[allow(clippy::too_many_arguments)]
-    async fn push_archives(
+    /// Drains the queued state moves: each message's memberships move
+    /// to the mailboxes that say its state (DESIGN.md, State), folders
+    /// kept. Self-limiting against fresh memberships: mail already
+    /// where its state says is left alone, its intent cleared silently.
+    /// ACL-refused entries stay queued and nag the log until an admin
+    /// grants them; server refusals, ids the server no longer carries,
+    /// and states whose mailbox the server lacks are dropped with a
+    /// warning instead of retried forever.
+    async fn push_moves(
         &self,
         session: &Session,
         token: &str,
@@ -1510,7 +1556,7 @@ impl Client {
         layout: &Layout,
         store: &Store,
     ) -> Result<usize, Error> {
-        let pending = store.pending_archives(slug)?;
+        let pending = store.pending_moves(slug)?;
         if pending.is_empty() {
             return Ok(0);
         }
@@ -1530,27 +1576,31 @@ impl Client {
         let mut clear: Vec<MessageId> = Vec::new();
         for p in &pending {
             let Some(memberships) = current.get(&p.jmap_id) else {
-                tracing::warn!(jmap_id = %p.jmap_id, "archive dropped: the mail is gone server-side");
+                tracing::warn!(jmap_id = %p.jmap_id, "move dropped: the mail is gone server-side");
                 clear.push(p.message.clone());
                 continue;
             };
-            let Some(next) = archived_mailboxes(memberships, layout) else {
-                // Already out of the Inbox, or no Archive to land in:
-                // nothing to do either way. A vanished Archive mailbox
-                // deserves a trace; an already-exited message doesn't.
-                if layout.archive.is_none() {
-                    tracing::warn!(jmap_id = %p.jmap_id, "archive dropped: the server has no Archive mailbox");
+            let next = match moved_mailboxes(memberships, layout, p.state) {
+                Move::To(next) => next,
+                Move::Settled => {
+                    clear.push(p.message.clone());
+                    continue;
                 }
-                clear.push(p.message.clone());
-                continue;
+                Move::Nowhere => {
+                    // Leaving the Inbox with nowhere to land would read
+                    // as Done server-side, so the mail stays put.
+                    tracing::warn!(jmap_id = %p.jmap_id, state = %p.state, "move dropped: the server has no mailbox for the state");
+                    clear.push(p.message.clone());
+                    continue;
+                }
             };
-            if !archive_allowed(layout) {
-                tracing::warn!("archive held: mailbox ACLs refuse it");
+            if !move_allowed(memberships, &next, layout) {
+                tracing::warn!(state = %p.state, "move held: mailbox ACLs refuse it");
                 continue;
             }
             updates.insert(p.jmap_id.clone(), EmailPatch { mailbox_ids: next });
         }
-        let mut archived = 0usize;
+        let mut moved = 0usize;
         let entries: Vec<(String, EmailPatch)> = updates.into_iter().collect();
         for chunk in entries.chunks(PAGE) {
             let update: BTreeMap<String, EmailPatch> = chunk.iter().cloned().collect();
@@ -1558,9 +1608,9 @@ impl Client {
                 .set_emails(&session.api_url, token, account_id, &update)
                 .await?;
             for (id, error) in &reply.not_updated {
-                tracing::warn!(jmap_id = %id, %error, "the server refused an archive");
+                tracing::warn!(jmap_id = %id, %error, "the server refused a move");
             }
-            archived = archived.saturating_add(reply.updated.len());
+            moved = moved.saturating_add(reply.updated.len());
             // Refused ids clear too: the server's verdict stands, and
             // retrying would only requeue the refusal.
             clear.extend(chunk.iter().filter_map(|(id, _)| {
@@ -1570,8 +1620,8 @@ impl Client {
                     .map(|p| p.message.clone())
             }));
         }
-        store.clear_pending_archives(&clear)?;
-        Ok(archived)
+        store.clear_pending_moves(&clear)?;
+        Ok(moved)
     }
 
     /// Drains the account's queued deletions (task sm) with
@@ -2117,35 +2167,81 @@ mod tests {
     }
 
     #[test]
-    fn archives_exit_the_inbox_and_keep_everything_else() {
+    fn state_moves_follow_the_membership_table() {
         let layout = Layout::of(&mailboxes());
         assert_eq!(layout.archive.as_deref(), Some("M-archive"));
+        let boxes = |ids: &[&str]| -> BTreeMap<String, bool> {
+            ids.iter().map(|id| (id.to_string(), true)).collect()
+        };
+        let to = |ids: &[&str]| Move::To(boxes(ids));
 
-        let in_inbox = BTreeMap::from([
-            ("M-in".to_string(), true),
-            ("M-watch".to_string(), true),
-            ("M-school".to_string(), true),
-        ]);
+        // Do and Watch leave the Inbox for their label; folders stay.
+        let in_inbox = boxes(&["M-in", "M-school"]);
         assert_eq!(
-            archived_mailboxes(&in_inbox, &layout),
-            Some(BTreeMap::from([
-                ("M-watch".to_string(), true),
-                ("M-school".to_string(), true),
-                ("M-archive".to_string(), true),
-            ]))
+            moved_mailboxes(&in_inbox, &layout, State::Do),
+            to(&["M-do", "M-school"])
+        );
+        // Switching lanes swaps the label, and leaving Archive is part
+        // of leaving Done.
+        assert_eq!(
+            moved_mailboxes(&boxes(&["M-do", "M-archive"]), &layout, State::Watch),
+            to(&["M-watch"])
+        );
+        // Inbox puts it back, label off.
+        assert_eq!(
+            moved_mailboxes(&boxes(&["M-watch", "M-school"]), &layout, State::Inbox),
+            to(&["M-in", "M-school"])
+        );
+        // Done takes it out of both and into Archive.
+        assert_eq!(
+            moved_mailboxes(
+                &boxes(&["M-in", "M-watch", "M-school"]),
+                &layout,
+                State::Done
+            ),
+            to(&["M-archive", "M-school"])
         );
 
-        // Already out of the Inbox: no exit to make, nothing touched.
-        let filed_out = BTreeMap::from([("M-school".to_string(), true)]);
-        assert_eq!(archived_mailboxes(&filed_out, &layout), None);
+        // Already where the state says: nothing to push. Filed mail
+        // with neither Inbox nor label already reads as Done, so Done
+        // doesn't drag it into Archive; false memberships don't count.
+        assert_eq!(
+            moved_mailboxes(&in_inbox, &layout, State::Inbox),
+            Move::Settled
+        );
+        assert_eq!(
+            moved_mailboxes(&boxes(&["M-do"]), &layout, State::Do),
+            Move::Settled
+        );
+        let filed_out =
+            BTreeMap::from([("M-school".to_string(), true), ("M-in".to_string(), false)]);
+        assert_eq!(
+            moved_mailboxes(&filed_out, &layout, State::Done),
+            Move::Settled
+        );
 
-        // No Archive mailbox to land in: no exit either.
+        // No mailbox for the state: nowhere to land. This layout has no
+        // Docket/Wait.
+        assert_eq!(
+            moved_mailboxes(&in_inbox, &layout, State::Wait),
+            Move::Nowhere
+        );
         let mut bare = Layout::of(&mailboxes());
         bare.archive = None;
-        assert_eq!(archived_mailboxes(&in_inbox, &bare), None);
+        bare.inbox = None;
+        assert_eq!(
+            moved_mailboxes(&boxes(&["M-do"]), &bare, State::Done),
+            Move::Nowhere
+        );
+        assert_eq!(
+            moved_mailboxes(&boxes(&["M-do"]), &bare, State::Inbox),
+            Move::Nowhere
+        );
 
         // Full rights allow it.
-        assert!(archive_allowed(&layout));
+        let next = boxes(&["M-archive", "M-school"]);
+        let current = boxes(&["M-in", "M-school"]);
+        assert!(move_allowed(&current, &next, &layout));
 
         let full = rights(true, true, true, true, true, true, true, true);
 
@@ -2163,10 +2259,10 @@ mod tests {
         };
         let mut hoard = full.clone();
         hoard["mayRemoveItems"] = json!(false);
-        assert!(!archive_allowed(&shut(hoard, full.clone())));
+        assert!(!move_allowed(&current, &next, &shut(hoard, full.clone())));
         let mut closed = full.clone();
         closed["mayAddItems"] = json!(false);
-        assert!(!archive_allowed(&shut(full.clone(), closed)));
+        assert!(!move_allowed(&current, &next, &shut(full.clone(), closed)));
     }
 
     #[test]
