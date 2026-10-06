@@ -198,7 +198,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         1,
         at(9, 26, 14, 10),
         roofer,
-        "Here are the photos from the site visit.",
+        "Here are the photos from the site visit: https://photos.northwind.example/visit/926.",
         (Inbox, Some("House"), &[]),
         &[],
     );

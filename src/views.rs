@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use jiff::civil::DateTime;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
-use crate::dates;
 use crate::lists::{Group, Section, View};
 use crate::model::{Account, Comment, Kind, Message, MessageId, State, Thread, User, Values};
 use crate::store::{Flash, Item};
+use crate::{body, dates};
 
 /// Everything one page shows, loaded before rendering starts.
 pub struct Page<'a> {
@@ -379,7 +379,7 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Acco
                 @if !copies.is_empty() {
                     span.copies { (copies.join(" · ")) }
                 }
-                span.text x-show="open" x-cloak[!open] { (m.body) }
+                span.text x-show="open" x-cloak[!open] { (body::linked(&m.body)) }
                 span.text.closed x-show="!open" x-cloak[open] "@click"="open = true" { (m.body) }
             }
             div.gutter {

@@ -197,6 +197,10 @@ async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
     assert!(body.contains(&format!(r#"class="item card sel" id="m{}""#, mid(4))));
     assert!(body.contains(&format!(r#"class="item card" id="m{}""#, mid(3))));
     assert!(body.contains(r#"<span class="type-label sent">Sent</span>"#));
+    // URLs in an open body link out; the sentence's period stays text.
+    assert!(body.contains(
+        r#"site visit: <a href="https://photos.northwind.example/visit/926" target="_blank" rel="noopener">https://photos.northwind.example/visit/926</a>.</span>"#
+    ));
     assert!(body.contains(r#"<span class="badge accent"><span class="mark"></span>Do</span>"#));
     assert!(body.contains(r#"<span class="badge success"><span class="mark"></span>Done</span>"#));
     assert!(body.contains(&format!(
