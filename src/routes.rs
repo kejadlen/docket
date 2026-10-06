@@ -9,6 +9,7 @@ use axum::routing::{get, post};
 use axum::{Form, Router};
 use maud::Markup;
 use serde::Deserialize;
+use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::Error;
@@ -50,6 +51,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/gloss.css", get(gloss_css))
         .route("/assets/docket.css", get(docket_css))
         .route("/assets/alpine.js", get(alpine_js))
+        .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

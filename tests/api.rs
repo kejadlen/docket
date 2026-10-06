@@ -542,3 +542,18 @@ async fn trashing_confirms_through_a_dialog_and_marks_done() {
     .await;
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn pages_gzip_for_browsers_that_ask() {
+    let addr = spawn().await;
+    let res = client()
+        .get(format!("http://{addr}/"))
+        .header("Remote-User", SAM)
+        .header("X-User-Slug", slug(SAM))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-encoding"], "gzip");
+}
