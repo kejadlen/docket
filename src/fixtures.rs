@@ -207,7 +207,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         1,
         at(9, 27, 10, 2),
         roofer,
-        "Revised estimate attached, includes the downspout: $2,120. We can start October 14 if you confirm by the 3rd.",
+        "Revised estimate attached, includes the downspout: $2,120. We can start October 14 if you confirm by the 3rd.\n\nOn Sat, Sep 26, 2026 at 3:02 PM, Sam wrote:\n> Does this include the downspout on the north side?",
         (Inbox, Some("House"), &[]),
         &["Sam", "Alex"],
     );

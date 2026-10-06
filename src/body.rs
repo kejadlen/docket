@@ -1,5 +1,6 @@
 //! Message bodies as the thread view shows them: plain text, escaped,
-//! with its URLs made into links.
+//! with its URLs made into links and the quoted history it trails split
+//! off to hide.
 
 use maud::{Markup, html};
 
@@ -95,6 +96,79 @@ pub fn linked(text: &str) -> Markup {
     }
 }
 
+/// Splits a reply into what it says and the quoted history it trails:
+/// from an Outlook-style separator ("-----Original Message-----", or a
+/// rule over a "From:" line) to the end, or else a closing run of `>`
+/// lines with the "On …, … wrote:" attribution above it. Only a trailing
+/// quote goes — inline replies need the lines they answer — and a body
+/// that is all quote keeps it, so nothing ever renders empty.
+pub fn split_quoted(text: &str) -> (&str, Option<&str>) {
+    let mut at = 0usize;
+    let lines: Vec<(usize, &str)> = text
+        .split_inclusive('\n')
+        .map(|line| {
+            let start = at;
+            at = at.saturating_add(line.len());
+            (start, line.trim())
+        })
+        .collect();
+    let Some(start) = separator(&lines).or_else(|| quote_tail(&lines)) else {
+        return (text, None);
+    };
+    let said = text[..start].trim_end();
+    if said.is_empty() {
+        return (text, None);
+    }
+    (said, Some(text[start..].trim()))
+}
+
+/// Where an Outlook-style separator starts the quoted history.
+fn separator(lines: &[(usize, &str)]) -> Option<usize> {
+    let next = lines.iter().skip(1).map(Some).chain([None]);
+    lines
+        .iter()
+        .zip(next)
+        .find(|((_, line), next)| {
+            let original =
+                line.starts_with("-----") && line.to_lowercase().contains("original message");
+            let rule = line.len() >= 10 && line.chars().all(|c| c == '_');
+            original || (rule && next.is_some_and(|(_, n)| n.starts_with("From:")))
+        })
+        .map(|((at, _), _)| *at)
+}
+
+/// Where a closing run of `>` lines starts, taking in the attribution
+/// line above it — wrapped onto two lines if need be.
+fn quote_tail(lines: &[(usize, &str)]) -> Option<usize> {
+    let quoted = |line: &str| line.is_empty() || line.starts_with('>');
+    let first = lines
+        .iter()
+        .rposition(|(_, line)| !quoted(line))
+        .map_or(0, |i| i.saturating_add(1));
+    if !lines
+        .iter()
+        .skip(first)
+        .any(|(_, line)| line.starts_with('>'))
+    {
+        return None;
+    }
+    // The line above index i, with its index.
+    let above = |i: usize| {
+        let j = i.checked_sub(1)?;
+        lines.get(j).map(|(_, line)| (j, *line))
+    };
+    let mut start = first;
+    if let Some((j, wrote)) = above(first).filter(|(_, line)| line.ends_with("wrote:")) {
+        start = j;
+        // A wrapped attribution's first line opens with "On" and a date.
+        let opens = |on: &str| on.starts_with("On ") && on.contains(|c: char| c.is_ascii_digit());
+        if let Some((k, _)) = above(j).filter(|(_, on)| !wrote.starts_with("On ") && opens(on)) {
+            start = k;
+        }
+    }
+    lines.get(start).map(|(at, _)| *at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +248,77 @@ mod tests {
             linked("<b> https://a.com/?x=1&y=\"2\"").into_string(),
             r#"&lt;b&gt; <a href="https://a.com/?x=1&amp;y=" target="_blank" rel="noopener">https://a.com/?x=1&amp;y=</a>&quot;2&quot;"#
         );
+    }
+
+    #[test]
+    fn a_trailing_quote_splits_off_with_its_attribution() {
+        assert_eq!(
+            split_quoted("Sounds good.\n\nOn Mon, Oct 5, Sam wrote:\n> Thursday?\n>\n> -S\n"),
+            (
+                "Sounds good.",
+                Some("On Mon, Oct 5, Sam wrote:\n> Thursday?\n>\n> -S")
+            )
+        );
+        // An attribution wrapped onto two lines comes along whole.
+        assert_eq!(
+            split_quoted(
+                "Yes.\nOn Mon, Oct 5, 2026 at 9:41 AM\nSam <sam@example.com> wrote:\n> Thursday?"
+            ),
+            (
+                "Yes.",
+                Some("On Mon, Oct 5, 2026 at 9:41 AM\nSam <sam@example.com> wrote:\n> Thursday?")
+            )
+        );
+        // A bare quote with no attribution, CRLF line ends.
+        assert_eq!(
+            split_quoted("Yes.\r\n> Thursday?\r\n"),
+            ("Yes.", Some("> Thursday?"))
+        );
+        // A "wrote:" line on its own is attribution enough; the line
+        // above it stays when it doesn't open one.
+        assert_eq!(
+            split_quoted("Yes.\nSam wrote:\n> Thursday?"),
+            ("Yes.", Some("Sam wrote:\n> Thursday?"))
+        );
+        assert_eq!(
+            split_quoted("On it.\nI wrote:\n> Thursday?"),
+            ("On it.", Some("I wrote:\n> Thursday?"))
+        );
+    }
+
+    #[test]
+    fn outlook_separators_quote_everything_after() {
+        assert_eq!(
+            split_quoted("Approved.\n\n-----Original Message-----\nFrom: Pat\nPlease approve."),
+            (
+                "Approved.",
+                Some("-----Original Message-----\nFrom: Pat\nPlease approve.")
+            )
+        );
+        assert_eq!(
+            split_quoted("Approved.\n________________________________\nFrom: Pat\nSent: Monday"),
+            (
+                "Approved.",
+                Some("________________________________\nFrom: Pat\nSent: Monday")
+            )
+        );
+        // A rule that heads no "From:" is just a rule.
+        let rule = "Totals\n__________\nFrom here, it's $40.";
+        assert_eq!(
+            split_quoted("Totals\n__________\n$40"),
+            ("Totals\n__________\n$40", None)
+        );
+        assert_eq!(split_quoted(rule), (rule, None));
+    }
+
+    #[test]
+    fn inline_and_all_quote_bodies_stay_whole() {
+        // Replies between quoted lines need them for context.
+        let inline = "> Thursday?\nYes.\n> Who drives?\nMe.";
+        assert_eq!(split_quoted(inline), (inline, None));
+        // Nothing but quote: hiding it would leave nothing.
+        assert_eq!(split_quoted("> fwd\n> fwd"), ("> fwd\n> fwd", None));
+        assert_eq!(split_quoted("Plain.\n\n"), ("Plain.\n\n", None));
+        assert_eq!(split_quoted(""), ("", None));
     }
 }

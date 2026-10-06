@@ -366,10 +366,13 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Acco
         copies.push(format!("bcc {}", m.bcc.join(", ")));
     }
     let state = if open {
-        "{ open: true }"
+        "{ open: true, quoted: false }"
     } else {
-        "{ open: false }"
+        "{ open: false, quoted: false }"
     };
+    // The quoted history a reply trails stays folded behind a toggle, so
+    // a thread doesn't repeat itself message after message.
+    let (said, quoted) = body::split_quoted(&m.body);
     html! {
         div.item.card.sel[selected] id=(format!("m{}", m.id)) x-data=(state) {
             div.body {
@@ -379,8 +382,14 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Acco
                 @if !copies.is_empty() {
                     span.copies { (copies.join(" · ")) }
                 }
-                span.text x-show="open" x-cloak[!open] { (body::linked(&m.body)) }
-                span.text.closed x-show="!open" x-cloak[open] "@click"="open = true" { (m.body) }
+                span.text x-show="open" x-cloak[!open] { (body::linked(said)) }
+                @if let Some(quoted) = quoted {
+                    button.quote-btn type="button" x-show="open" x-cloak[!open]
+                        "@click"="quoted = !quoted" ":aria-expanded"="quoted"
+                        x-text="quoted ? 'Hide quoted text' : 'Show quoted text'" { "Show quoted text" }
+                    span.text.quoted x-show="open && quoted" x-cloak { (body::linked(quoted)) }
+                }
+                span.text.closed x-show="!open" x-cloak[open] "@click"="open = true" { (said) }
             }
             div.gutter {
                 span.when {

@@ -197,6 +197,12 @@ async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
     assert!(body.contains(&format!(r#"class="item card sel" id="m{}""#, mid(4))));
     assert!(body.contains(&format!(r#"class="item card" id="m{}""#, mid(3))));
     assert!(body.contains(r#"<span class="type-label sent">Sent</span>"#));
+    // A reply's quoted history folds behind a toggle, out of the body
+    // and its one-line preview.
+    assert!(body.contains(r#"confirm by the 3rd.</span><button class="quote-btn" type="button""#));
+    assert!(body.contains(
+        r#"x-show="open &amp;&amp; quoted" x-cloak>On Sat, Sep 26, 2026 at 3:02 PM, Sam wrote:"#
+    ));
     // URLs in an open body link out; the sentence's period stays text.
     assert!(body.contains(
         r#"site visit: <a href="https://photos.northwind.example/visit/926" target="_blank" rel="noopener">https://photos.northwind.example/visit/926</a>.</span>"#

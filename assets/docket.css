@@ -90,6 +90,15 @@ button { font: inherit; color: inherit; }
 .item .addr, .item .copies { color: var(--gl-color-text-tertiary); }
 .item .copies { font-size: var(--gl-step--2); }
 .item .text { line-height: 1.6; white-space: pre-line; overflow-wrap: anywhere; }
+/* A reply's quoted history: folded behind a quiet toggle, faint when open. */
+.quote-btn { all: unset; box-sizing: border-box; display: inline-flex; align-items: center; align-self: flex-start; cursor: pointer; padding: 4px 6px; margin-left: -6px; border-radius: var(--gl-radius); color: var(--gl-color-text-tertiary); font: var(--gl-step--2) var(--gl-font-mono); transition: background var(--gl-dur-fast) var(--gl-ease); }
+.quote-btn:hover { background: var(--gl-color-surface-fill); color: var(--gl-color-text-primary); }
+.quote-btn:focus-visible { outline: 2px solid var(--gl-color-accent); outline-offset: 1px; }
+.item .text.quoted { color: var(--gl-color-text-tertiary); }
+/* Body links stay in the text's ink — teal is spoken for — and say
+   they're links with the underline alone. */
+.item .text a { color: inherit; }
+.item .text a:hover { color: var(--gl-color-text-primary); }
 .item .text.closed { cursor: pointer; color: var(--gl-color-text-tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 /* The gutter: date, then the email's values, right-aligned. */
@@ -176,7 +185,7 @@ dialog form { display: flex; justify-content: flex-end; gap: var(--gl-space-xs);
    more, below which iOS Safari zooms the page on focus. */
 @media (pointer: coarse) {
   .field { font-size: max(16px, var(--gl-step--1)); }
-  .ctrl-btn, .del-btn, .opt, .nav-item, .who-btn { box-sizing: border-box; min-height: 44px; align-items: center; }
+  .ctrl-btn, .del-btn, .quote-btn, .opt, .nav-item, .who-btn { box-sizing: border-box; min-height: 44px; align-items: center; }
   .who-btn { align-items: stretch; justify-content: center; }
   .icon-btn, .back, .search-btn { min-width: 44px; min-height: 44px; justify-content: center; align-items: center; }
   .thread-head .back { margin-left: -14px; }
