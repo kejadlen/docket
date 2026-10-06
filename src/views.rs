@@ -328,8 +328,8 @@ fn thread(p: &Page<'_>, t: &ThreadView, selected: &str) -> Markup {
             }
             form.comment-box method="post" action=(format!("/threads/{}/comments", t.thread.id)) {
                 (back(p.here))
-                input.field type="text" name="text" required placeholder="Add an internal comment to this thread"
-                    aria-label="Internal comment" autocomplete="off";
+                input.field type="text" name="text" required placeholder="Add a comment"
+                    aria-label="Comment" autocomplete="off";
                 button.btn.primary type="submit" { "Comment" }
             }
         }
@@ -386,7 +386,7 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Acco
                 @if let Some(quoted) = quoted {
                     button.quote-btn type="button" x-show="open" x-cloak[!open]
                         "@click"="quoted = !quoted" ":aria-expanded"="quoted"
-                        x-text="quoted ? 'Hide quoted text' : 'Show quoted text'" { "Show quoted text" }
+                        x-text="quoted ? 'Hide quote' : 'Show quote'" { "Show quote" }
                     span.text.quoted x-show="open && quoted" x-cloak { (body::linked(quoted)) }
                 }
                 span.text.closed x-show="!open" x-cloak[open] "@click"="open = true" { (said) }
@@ -474,7 +474,6 @@ fn values_controls(p: &Page<'_>, id: &str, values: &Values, read_only: bool) -> 
                 onclick=(format!("document.getElementById('trash-{}').showModal()", id)) { "Trash" }
             dialog id=(format!("trash-{}", id)) {
                 h3 { "Move to Trash?" }
-                p { "The thread goes Done in Docket; the mail lands in Fastmail's Trash." }
                 form method="post" action=(format!("/messages/{id}/delete")) {
                     (back(p.here))
                     button.btn type="submit" formmethod="dialog" autofocus { "Cancel" }

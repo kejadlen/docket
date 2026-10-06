@@ -139,8 +139,7 @@ button { font: inherit; color: inherit; }
 /* The trash confirm: a small centered modal over a dimmed page. */
 dialog { margin: auto; border: none; border-radius: var(--gl-radius); padding: var(--gl-space-m); background: var(--gl-color-surface-card); color: var(--gl-color-text-primary); box-shadow: var(--gl-shadow-float); max-width: min(380px, calc(100vw - 2 * var(--gl-space-m))); }
 dialog::backdrop { background: rgb(0 0 0 / .4); }
-dialog h3 { font: 500 var(--gl-step-0)/1.3 var(--gl-font-text); margin: 0 0 var(--gl-space-2xs) 0; }
-dialog p { margin: 0 0 var(--gl-space-s) 0; color: var(--gl-color-text-secondary); }
+dialog h3 { font: 500 var(--gl-step-0)/1.3 var(--gl-font-text); margin: 0 0 var(--gl-space-s) 0; }
 dialog form { display: flex; justify-content: flex-end; gap: var(--gl-space-xs); }
 .btn.danger { background: var(--gl-color-danger); color: #fff; }
 

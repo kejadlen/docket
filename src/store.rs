@@ -376,7 +376,7 @@ impl Store {
                     }
                     None => {
                         next.folder = None;
-                        "Removed from folder".to_owned()
+                        "Unfiled".to_owned()
                     }
                 };
                 queue_file(&tx, id, next.folder.as_deref())?;
@@ -399,19 +399,10 @@ impl Store {
         inner
             .undo
             .insert(user.to_owned(), (id.to_owned(), prev, queued_move));
-        // Every state but Inbox takes the mail out of the shared Inbox,
-        // and the flash teaches that. The verb for Done is Done.
-        let flash = match next.state {
-            State::Done if queued_move => "Done — leaves the shared Inbox".to_owned(),
-            State::Do | State::Wait | State::Watch if queued_move => {
-                format!("{text} — leaves the shared Inbox")
-            }
-            _ => text,
-        };
         inner.flash.insert(
             user.to_owned(),
             Flash {
-                text: flash,
+                text,
                 undoable: true,
             },
         );
@@ -1303,7 +1294,7 @@ mod tests {
             .edit(SAM, &fixtures::id(4), Change::Folder(None))
             .unwrap();
         assert_eq!(values(&store, &fixtures::id(4)).folder, None);
-        assert_eq!(store.take_flash(SAM).unwrap().text, "Removed from folder");
+        assert_eq!(store.take_flash(SAM).unwrap().text, "Unfiled");
         assert!(matches!(
             store.edit(SAM, &fixtures::id(4), Change::Folder(Some("Nope".into()))),
             Err(Error::NotFound("folder"))
@@ -1337,8 +1328,7 @@ mod tests {
             .clone();
         store.sign_in(SAM, "Sam").unwrap();
 
-        // Done on a writable account queues the move; the history
-        // names the verb, the flash teaches what it does.
+        // Done on a writable account queues the move.
         store.edit(SAM, &id, Change::State(State::Done)).unwrap();
         assert_eq!(values(&store, &id).state, State::Done);
         assert_eq!(
@@ -1352,7 +1342,7 @@ mod tests {
         assert_eq!(
             store.take_flash(SAM).unwrap(),
             Flash {
-                text: "Done — leaves the shared Inbox".into(),
+                text: "Moved to Done".into(),
                 undoable: true,
             }
         );
@@ -1375,10 +1365,7 @@ mod tests {
         // The other lanes leave the Inbox too; the latest state is the
         // one that goes out.
         store.edit(SAM, &id, Change::State(State::Wait)).unwrap();
-        assert_eq!(
-            store.take_flash(SAM).unwrap().text,
-            "Moved to Wait — leaves the shared Inbox"
-        );
+        assert_eq!(store.take_flash(SAM).unwrap().text, "Moved to Wait");
         store.edit(SAM, &id, Change::State(State::Inbox)).unwrap();
         assert_eq!(store.take_flash(SAM).unwrap().text, "Moved to Inbox");
         assert_eq!(

@@ -309,7 +309,7 @@ async fn editing_values_with_undo() {
     .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     let (_, body) = get(addr, SAM, &format!("/?m={}", mid(4))).await;
-    assert!(body.contains("Removed from folder"));
+    assert!(body.contains("Unfiled"));
 
     let res = post(
         addr,
