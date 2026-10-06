@@ -35,9 +35,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime stage.
 FROM debian:trixie-slim
 
-# JMAP over TLS.
+# ca-certificates for JMAP over TLS; sqlite3 to inspect the database.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates sqlite3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/docket /usr/local/bin/docket
