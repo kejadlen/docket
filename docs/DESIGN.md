@@ -67,7 +67,15 @@ New messages arrive in Inbox. Other messages in the same thread are unaffected �
 
 There is no Read state. "Alex should read this" is Inbox, assigned to Alex. Alex reads it, then moves it on or unassigns himself.
 
-State lives in Docket's database and, on writable accounts, is mirrored as **labels**: mailboxes under a `Docket/` parent (`Docket/Do`, `Docket/Wait`, `Docket/Watch`). Inbox and Done have no label. JMAP mailbox membership is per message, so labels map directly. Labels sit alongside folders — a message can be in `Receipts` and labeled `Docket/Watch` — so state is visible (and editable) in Mail.app and Fastmail web. On read-only accounts, state is database-only.
+State lives in Docket's database. On writable accounts it is also where the message sits on the mail server:
+
+| Mailboxes | State |
+|---|---|
+| Inbox | Inbox |
+| `Docket/Do`, `Docket/Wait`, or `Docket/Watch` | Do, Wait, or Watch |
+| Neither | Done |
+
+The `Docket/` mailboxes are **labels**. JMAP mailbox membership is per message, so a message can be in `Receipts` and labeled `Docket/Watch` at once, and state is visible (and editable) in Mail.app and Fastmail web. Changing state in Docket moves the message to match: Do, Wait, and Watch take it out of the Inbox and add the label, Done takes it out of both and into Archive, and Inbox puts it back. A message in the Inbox that also has a label takes the label's state. On read-only accounts, state is database-only.
 
 Per-person read tracking lives in the database — `$seen` is shared across clients and can't say who read something. Opening a message in Docket marks it read for that user. Read tracking drives unread marks only; it never changes state or assignees.
 
@@ -82,9 +90,9 @@ Each message has zero or more assignees (me, them, or both). It's a soft signal,
 
 ### Folders and filing
 
-Folders are for filing and are managed by Fastmail (including server-side rules); Docket doesn't derive state from them. Any mailbox outside `Docket/` is a folder. Filing is a Docket action on writable accounts only, separate from state:
+Folders are for filing and are managed by Fastmail (including server-side rules). A folder is any mailbox outside `Docket/` without a JMAP role, so the Inbox, Archive, and other system mailboxes aren't folders. Filing is a Docket action on writable accounts only, separate from state:
 
-- Each message is in one folder (or Inbox/Archive). Filing moves the message out of its current folder into the chosen one; `Docket/` labels are untouched.
+- Each message is in at most one folder. Filing moves the message out of its current folder into the chosen one and leaves the Inbox and `Docket/` labels alone, so it never changes state.
 - Folders are also a filter in Docket views ("Do, in School").
 
 ### Comments
@@ -113,9 +121,9 @@ There is no toolbar and no thread-level action. Each message's state, folder, an
 
 The primary other client is **Mail.app over IMAP**; Fastmail web stays in folders mode. IMAP has no labels, so each `Docket/` mailbox appears as a folder holding its own apparent copy of the message (one message underneath — read state is shared).
 
-- Normal clients can read, file, and reply. In Mail.app, an IMAP move only affects the mailbox being moved out of, so filing Inbox → Receipts keeps the `Docket/` label.
-- Triage works from Mail.app by dragging: Inbox → `Docket/Watch` sets the state and removes it from Inbox; option-drag keeps it in both.
-- Label changes made elsewhere are user actions, and Docket adopts them rather than reverting: a `Docket/` label added sets that state; a state label removed with no replacement → **Done**; a message moved to Trash → **Done**; an Inbox message removed from Inbox → **Done**. Assignees and comments are Docket-only.
+- Normal clients can read, file, and reply. In Mail.app, an IMAP move only affects the mailbox being moved out of, so filing Inbox → Receipts keeps the `Docket/` label. Filing an unlabeled message out of the Inbox makes it Done.
+- Triage works from Mail.app by dragging: Inbox → `Docket/Watch` sets the state and removes it from Inbox; option-drag keeps it in both, and the label still sets the state.
+- Mailbox changes made elsewhere are user actions, and Docket adopts them rather than reverting, reading the new state from the table in [State](#state). Trash is the one exception: a message moved to Trash is **Done** whatever labels it keeps. Assignees and comments are Docket-only.
 - Accepted cost: filed messages with a state appear in two folders in Mail.app (and likely twice in its search). Collapsing the `Docket` parent in the sidebar hides most of it.
 - Changes made elsewhere appear in the thread as "via another client".
 
