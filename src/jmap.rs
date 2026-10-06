@@ -331,23 +331,41 @@ struct Email {
     pub cc: Option<Vec<EmailAddress>>,
     pub bcc: Option<Vec<EmailAddress>>,
     pub text_body: Option<Vec<BodyPart>>,
+    pub html_body: Option<Vec<BodyPart>>,
     pub body_values: Option<BTreeMap<String, BodyValue>>,
 }
 
-/// The message's text: its first plain-text part, falling back to the
-/// server's preview when there isn't one.
+/// The message's text: its first plain-text part, then its first HTML
+/// part converted to text, then the server's preview. A message with
+/// none of those says so rather than rendering blank.
 fn body_of(email: &Email) -> String {
-    if let (Some(parts), Some(values)) = (&email.text_body, &email.body_values) {
-        for part in parts
+    let first = |parts: Option<&[BodyPart]>, media_type: &str| {
+        parts
+            .unwrap_or_default()
             .iter()
-            .filter(|part| part.media_type.starts_with("text/plain"))
-        {
-            if let Some(value) = values.get(&part.part_id) {
-                return value.value.clone();
-            }
-        }
+            .filter(|part| part.media_type.starts_with(media_type))
+            .filter_map(|part| {
+                email
+                    .body_values
+                    .as_ref()
+                    .and_then(|values| values.get(&part.part_id))
+            })
+            .map(|value| value.value.as_str())
+            .find(|value| !value.trim().is_empty())
+    };
+    if let Some(plain) = first(email.text_body.as_deref(), "text/plain") {
+        return plain.into();
     }
-    email.preview.clone().unwrap_or_default()
+    if let Some(html) = first(email.html_body.as_deref(), "text/html") {
+        // from_read over a byte slice can't fail; the raw HTML is an
+        // unreachable stand-in for that error.
+        return html2text::from_read(html.as_bytes(), usize::MAX).unwrap_or_else(|_| html.into());
+    }
+    email
+        .preview
+        .as_deref()
+        .filter(|preview| !preview.trim().is_empty())
+        .map_or_else(|| "(no body)".into(), str::to_owned)
 }
 
 /// Shapes a fetched email for the store. `None` skips a senderless
@@ -618,6 +636,8 @@ struct GetEmails<'a> {
     properties: &'static [EmailProperty],
     body_properties: &'static [BodyProperty],
     fetch_text_body_values: bool,
+    #[serde(rename = "fetchHTMLBodyValues")]
+    fetch_html_body_values: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -636,6 +656,7 @@ enum EmailProperty {
     Bcc,
     Preview,
     TextBody,
+    HtmlBody,
     BodyValues,
 }
 
@@ -653,6 +674,7 @@ const EMAIL_PROPERTIES: &[EmailProperty] = &[
     EmailProperty::Bcc,
     EmailProperty::Preview,
     EmailProperty::TextBody,
+    EmailProperty::HtmlBody,
     EmailProperty::BodyValues,
 ];
 
@@ -810,6 +832,7 @@ impl Client {
                     properties: EMAIL_PROPERTIES,
                     body_properties: BODY_PROPERTIES,
                     fetch_text_body_values: true,
+                    fetch_html_body_values: true,
                 },
             )
             .await?;
@@ -1319,6 +1342,7 @@ mod tests {
             properties: EMAIL_PROPERTIES,
             body_properties: BODY_PROPERTIES,
             fetch_text_body_values: true,
+            fetch_html_body_values: true,
         })
         .unwrap();
         assert_eq!(
@@ -1326,9 +1350,9 @@ mod tests {
             json!({"accountId": "a", "ids": ["e1"],
                    "properties": ["id", "threadId", "messageId", "mailboxIds",
                        "receivedAt", "sentAt", "subject", "from", "to", "cc", "bcc",
-                       "preview", "textBody", "bodyValues"],
+                       "preview", "textBody", "htmlBody", "bodyValues"],
                    "bodyProperties": ["partId", "type"],
-                   "fetchTextBodyValues": true})
+                   "fetchTextBodyValues": true, "fetchHTMLBodyValues": true})
         );
 
         let threads = serde_json::to_value(GetThreads {
@@ -1645,7 +1669,7 @@ mod tests {
     }
 
     #[test]
-    fn the_body_is_the_first_plain_text_part() {
+    fn the_body_falls_through_plain_html_then_preview() {
         let mut mail = email(&[("M-in", true)]);
         mail.text_body = Some(vec![BodyPart {
             part_id: "p1".into(),
@@ -1659,12 +1683,31 @@ mod tests {
         )]));
         assert_eq!(body_of(&mail), "Buses return at 4:15.");
 
-        // HTML-only mail falls back to the preview.
-        mail.text_body = Some(vec![BodyPart {
-            part_id: "p1".into(),
+        // An empty plain part falls through to the HTML part instead of
+        // stopping at the blank.
+        mail.html_body = Some(vec![BodyPart {
+            part_id: "h1".into(),
             media_type: "text/html".into(),
         }]);
-        assert_eq!(body_of(&mail), "A schedule update…");
+        let values = mail.body_values.as_mut().unwrap();
+        values.insert(
+            "h1".into(),
+            BodyValue {
+                value: "<p>Buses return at 4:15.</p>".into(),
+            },
+        );
+        values.insert(
+            "p1".into(),
+            BodyValue {
+                value: "  \n".into(),
+            },
+        );
+        assert_eq!(body_of(&mail), "Buses return at 4:15.\n");
+
+        // HTML-only mail converts instead of showing the truncated
+        // preview.
+        mail.text_body = None;
+        assert_eq!(body_of(&mail), "Buses return at 4:15.\n");
 
         // A plain part with no fetched body value also falls through.
         mail.text_body = Some(vec![
@@ -1677,7 +1720,23 @@ mod tests {
                 media_type: "text/plain".into(),
             },
         ]);
+        mail.body_values.as_mut().unwrap().insert(
+            "p1".into(),
+            BodyValue {
+                value: "Buses return at 4:15.".into(),
+            },
+        );
         assert_eq!(body_of(&mail), "Buses return at 4:15.");
+
+        // With no parts at all, the preview carries the body.
+        mail.text_body = None;
+        mail.html_body = None;
+        assert_eq!(body_of(&mail), "A schedule update…");
+
+        // A message with no text anywhere says so instead of rendering
+        // blank.
+        mail.preview = Some("  \n".into());
+        assert_eq!(body_of(&mail), "(no body)");
     }
 
     #[test]

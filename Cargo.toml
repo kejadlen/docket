@@ -18,6 +18,7 @@ axum = "*"
 camino = "*"
 clap = { version = "*", features = ["derive", "env"] }
 fs-err = "*"
+html2text = "*"
 jiff = { version = "*", features = ["serde"] }
 kdl = "*"
 maud = { version = "*", features = ["axum"] }
