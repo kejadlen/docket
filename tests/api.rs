@@ -297,6 +297,21 @@ async fn html_mail_renders_in_a_sandboxed_frame() {
 }
 
 #[tokio::test]
+async fn edits_show_up_in_the_thread_as_events() {
+    let addr = spawn().await;
+    let path = format!("/messages/{}/state", mid(4));
+    post(addr, SAM, &path, &[("state", "do"), ("back", "/")]).await;
+
+    let (_, body) = get(addr, ALEX, &format!("/?m={}", mid(4))).await;
+    assert!(
+        body.contains(
+            r#"<div class="item event"><div class="body"><span class="event-text">Sam moved to Do</span></div>"#
+        ),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn read_only_accounts_show_folder_as_plain_text() {
     let addr = spawn().await;
     let (_, body) = get(addr, SAM, &format!("/watch?m={}", mid(20))).await;

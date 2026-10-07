@@ -8,7 +8,9 @@ use jiff::civil::DateTime;
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 
 use crate::lists::{Group, Section, View};
-use crate::model::{Account, Comment, Kind, Message, MessageId, State, Thread, User, Values};
+use crate::model::{
+    Account, Comment, Event, Kind, Message, MessageId, State, Thread, User, Values,
+};
 use crate::store::{Flash, Item};
 use crate::{body, dates};
 
@@ -319,6 +321,7 @@ fn thread(p: &Page<'_>, t: &ThreadView, selected: &str) -> Markup {
                 @for item in &t.timeline {
                     @match item {
                         Item::Comment(c) => (comment(p, c)),
+                        Item::Event(e) => (event(p, e)),
                         Item::Message(m) => {
                             @let open = m.id == selected || m.id == t.latest;
                             (message(p, m, open, m.id == selected, &t.account))
@@ -346,6 +349,35 @@ fn comment(p: &Page<'_>, c: &Comment) -> Markup {
             div.gutter { span.type-figure.date { (dates::short(p.now, c.at)) } }
         }
     }
+}
+
+/// A change to a message's values, as a quiet line in the chain.
+fn event(p: &Page<'_>, e: &Event) -> Markup {
+    html! {
+        div.item.event {
+            div.body { span.event-text { (event_line(&p.users, e)) } }
+            div.gutter { span.type-figure.date { (dates::short(p.now, e.at)) } }
+        }
+    }
+}
+
+/// An event in the chain's words: "Sam moved to Do", from the toast
+/// text history keeps. A change adopted from another client has no one
+/// behind it, and its text already says where it came from.
+fn event_line(users: &[User], e: &Event) -> String {
+    let Some(login) = &e.user else {
+        return e.text.clone();
+    };
+    let name = user_name(users, login);
+    if e.text == "Undone" {
+        return format!("{name} undid a change");
+    }
+    let mut chars = e.text.chars();
+    let lowered: String = chars
+        .next()
+        .map(|first| first.to_lowercase().chain(chars).collect())
+        .unwrap_or_default();
+    format!("{name} {lowered}")
 }
 
 fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Account) -> Markup {
@@ -547,6 +579,33 @@ mod tests {
                 "https://app.fastmail.com/mail/search:msgid%3A%3C{}%40fixtures.docket.invalid%3E",
                 crate::fixtures::id(4)
             )
+        );
+    }
+
+    #[test]
+    fn events_read_as_who_did_what() {
+        let users = [User::new("sam@example.com", "Sam")];
+        let line = |user: Option<&str>, text: &str| {
+            event_line(
+                &users,
+                &Event {
+                    message: crate::fixtures::id(1),
+                    user: user.map(str::to_owned),
+                    at: crate::fixtures::now(),
+                    text: text.into(),
+                },
+            )
+        };
+        let sam = Some("sam@example.com");
+        assert_eq!(line(sam, "Moved to Do"), "Sam moved to Do");
+        assert_eq!(line(sam, "Assigned Alex"), "Sam assigned Alex");
+        assert_eq!(line(sam, "Undone"), "Sam undid a change");
+        assert_eq!(line(sam, ""), "Sam ");
+        // A login nobody has stands in for its name.
+        assert_eq!(line(Some("pat@x"), "Deleted"), "pat@x deleted");
+        assert_eq!(
+            line(None, "Moved to Done via another client"),
+            "Moved to Done via another client"
         );
     }
 

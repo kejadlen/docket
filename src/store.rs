@@ -51,6 +51,7 @@ pub struct Flash {
 pub enum Item {
     Message(Message),
     Comment(Comment),
+    Event(Event),
 }
 
 /// Which messages a list asks for.
@@ -341,8 +342,9 @@ impl Store {
         Ok(threads)
     }
 
-    /// The thread's messages and comments in time order. A message sorts
-    /// before a comment made at the same moment.
+    /// The thread's messages, comments, and history events in time
+    /// order. At the same moment a message sorts first, then comments,
+    /// then events, which keep the order they happened in.
     pub fn timeline(&self, thread: &str) -> Result<Vec<Item>, Error> {
         let inner = self.lock();
         let messages = load_messages(&inner.conn, "m.thread = ?1", [thread])?;
@@ -360,14 +362,25 @@ impl Store {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let mut stmt = inner.conn.prepare_cached(
+            "SELECT h.message, h.user, h.at, h.event
+             FROM history h JOIN messages m ON m.id = h.message
+             WHERE m.thread = ?1 ORDER BY h.rowid",
+        )?;
+        let events = stmt
+            .query_map([thread], event_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
         let mut items: Vec<_> = messages
             .into_iter()
             .map(Item::Message)
             .chain(comments.into_iter().map(Item::Comment))
+            .chain(events.into_iter().map(Item::Event))
             .collect();
+        // Stable, so ties keep the chain order above.
         items.sort_by_key(|item| match item {
             Item::Message(m) => m.at,
             Item::Comment(c) => c.at,
+            Item::Event(e) => e.at,
         });
         Ok(items)
     }
@@ -396,14 +409,7 @@ impl Store {
             "SELECT message, user, at, event FROM history WHERE message = ?1 ORDER BY rowid",
         )?;
         let events = stmt
-            .query_map([message], |r| {
-                Ok(Event {
-                    message: r.get(0)?,
-                    user: r.get(1)?,
-                    at: r.get(2)?,
-                    text: r.get(3)?,
-                })
-            })?
+            .query_map([message], event_from_row)?
             .collect::<Result<_, _>>()?;
         Ok(events)
     }
@@ -1075,6 +1081,15 @@ fn migrate(conn: &mut Connection) -> Result<(), Error> {
         conn.pragma_update(None, "foreign_keys", true)?;
     }
     Ok(())
+}
+
+fn event_from_row(r: &Row<'_>) -> rusqlite::Result<Event> {
+    Ok(Event {
+        message: r.get(0)?,
+        user: r.get(1)?,
+        at: r.get(2)?,
+        text: r.get(3)?,
+    })
 }
 
 fn user_from_row(r: &Row<'_>) -> rusqlite::Result<User> {
@@ -1770,8 +1785,20 @@ mod tests {
     }
 
     #[test]
-    fn timeline_interleaves_comments_by_time() {
+    fn timeline_interleaves_comments_and_events_by_time() {
         let store = fixtures::store().unwrap();
+        // Edits stamp the fixed clock, after every fixture message; the
+        // two events keep the order they happened in.
+        store
+            .edit(SAM, &fixtures::id(4), Change::State(State::Do))
+            .unwrap();
+        store
+            .edit(SAM, &fixtures::id(3), Change::Folder(None))
+            .unwrap();
+        // Another thread's history stays out.
+        store
+            .edit(SAM, &fixtures::id(5), Change::State(State::Done))
+            .unwrap();
         let order: Vec<_> = store
             .timeline(&fixtures::id(1))
             .unwrap()
@@ -1779,6 +1806,7 @@ mod tests {
             .map(|item| match item {
                 Item::Message(m) => format!("m{}", m.id),
                 Item::Comment(c) => format!("c{}", c.id),
+                Item::Event(e) => format!("e{} {}", e.message, e.text),
             })
             .collect();
         assert_eq!(
@@ -1789,8 +1817,15 @@ mod tests {
                 format!("m{}", fixtures::id(2)),
                 format!("m{}", fixtures::id(3)),
                 format!("m{}", fixtures::id(4)),
+                format!("e{} Moved to Do", fixtures::id(4)),
+                format!("e{} Unfiled", fixtures::id(3)),
             ]
         );
+
+        // A fresh store, so the history query prepares against the gap.
+        let store = fixtures::store().unwrap();
+        exec(&store, "ALTER TABLE history RENAME TO gone_history;");
+        assert!(store.timeline(&fixtures::id(1)).is_err());
     }
 
     #[test]
@@ -2285,10 +2320,13 @@ mod tests {
         let v = values(&store, &fixtures::id(4));
         assert_eq!(v.state, State::Wait);
         assert_eq!(v.assignees, BTreeSet::from([ALEX.to_owned()]));
-        assert!(matches!(
-            store.timeline(&fixtures::id(1)).unwrap().last(),
-            Some(Item::Comment(c)) if c.text == "Called them."
-        ));
+        assert!(
+            store
+                .timeline(&fixtures::id(1))
+                .unwrap()
+                .iter()
+                .any(|item| matches!(item, Item::Comment(c) if c.text == "Called them."))
+        );
         assert!(
             !store
                 .unread(SAM)

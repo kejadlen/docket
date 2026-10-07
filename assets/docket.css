@@ -109,6 +109,9 @@ button { font: inherit; color: inherit; }
 /* The gutter: date, then the email's values, right-aligned. */
 .gutter { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; text-align: right; }
 .comment .gutter { justify-content: flex-start; }
+/* History: a quiet line between rows, not a card. */
+.item.event { padding-top: 0; padding-bottom: 0; }
+.event-text { font-size: var(--gl-step--2); color: var(--gl-color-text-tertiary); }
 .when { display: flex; align-items: center; gap: 2px; }
 .date { font-size: var(--gl-step--2); color: var(--gl-color-text-secondary); }
 .icon-btn { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: var(--gl-radius); color: var(--gl-color-text-secondary); transition: background var(--gl-dur-fast) var(--gl-ease); }
