@@ -113,6 +113,7 @@ fn mailboxes() -> Vec<Value> {
         ("MB-in", "Inbox", Some("inbox"), &rights),
         ("MB-sent", "Sent", Some("sent"), &rights),
         ("MB-archive", "Archive", Some("archive"), &rights),
+        ("MB-trash", "Trash", Some("trash"), &rights),
         ("MB-drafts", "Drafts", Some("drafts"), &rights),
         ("MB-sched", "Scheduled", Some("scheduled"), &restricted),
         ("MB-do", "Docket/Do", None, &rights),
@@ -929,11 +930,43 @@ async fn new_inbox_mail_arrives_within_one_poll() {
     assert_eq!(arrived.values().unwrap().folder, None);
 }
 
-#[tokio::test]
-async fn edits_refresh_the_row_while_state_adoption_waits() {
-    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+/// Rewrites one household email's memberships, as another client would,
+/// and polls once.
+async fn moved_elsewhere(
+    world: &World,
+    client: &Client,
+    household: &Credential,
+    sync: &mut docket::jmap::Sync,
+    store: &Store,
+    id: &str,
+    mailboxes: Value,
+) {
+    world
+        .lock()
+        .unwrap()
+        .update_email(HOUSEHOLD, id, |mail| mail["mailboxIds"] = mailboxes);
+    client.poll_once(household, sync, store).await.unwrap();
+}
 
-    // A folder picked up elsewhere refreshes the cached row.
+/// The message's state and its history, as (user, text) pairs.
+fn state_and_history(store: &Store, message_id: &str) -> (State, Vec<(Option<String>, String)>) {
+    let message = the(store, message_id).unwrap();
+    let history = store
+        .history(&message.id)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.user, e.text))
+        .collect();
+    (message.values().unwrap().state, history)
+}
+
+fn elsewhere(text: &str) -> (Option<String>, String) {
+    (None, text.to_owned())
+}
+
+#[tokio::test]
+async fn a_folder_picked_up_elsewhere_refreshes_the_row() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
     world
         .lock()
         .unwrap()
@@ -950,22 +983,311 @@ async fn edits_refresh_the_row_while_state_adoption_waits() {
         roofer1.values().unwrap().folder.as_deref(),
         Some("Receipts")
     );
+    // Still in the Inbox: no state changed, so none is adopted.
+    assert_eq!(
+        state_and_history(&store, "E-roofer1@chislan.family"),
+        (State::Inbox, vec![])
+    );
+}
 
-    // A `Docket/` label added elsewhere is adoption's to apply, not the
-    // poll's: Docket-owned state keeps what it holds.
-    world
-        .lock()
+#[tokio::test]
+async fn a_label_added_elsewhere_sets_its_state() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    // Mail.app's drag: out of the Inbox, onto the label.
+    moved_elsewhere(
+        &world,
+        &client,
+        &household,
+        &mut sync,
+        &store,
+        "E-roofer1",
+        json!({"MB-watch": true}),
+    )
+    .await;
+    assert_eq!(
+        state_and_history(&store, "E-roofer1@chislan.family"),
+        (
+            State::Watch,
+            vec![elsewhere("Moved to Watch via another client")]
+        )
+    );
+
+    // Option-drag keeps it in the Inbox too; the label still wins.
+    moved_elsewhere(
+        &world,
+        &client,
+        &household,
+        &mut sync,
+        &store,
+        "E-roofer1",
+        json!({"MB-in": true, "MB-do": true}),
+    )
+    .await;
+    assert_eq!(
+        state_and_history(&store, "E-roofer1@chislan.family").0,
+        State::Do
+    );
+}
+
+#[tokio::test]
+async fn a_label_removed_elsewhere_with_no_replacement_sets_done() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    // School sits in the Inbox, Watch, and School; Docket moves it to
+    // Watch's label alone first, as a Watch message normally sits.
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", &school.id, Change::State(State::Watch))
+        .unwrap();
+    client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(
+        memberships_of(&world, "E-school"),
+        json!({"MB-watch": true, "MB-school": true})
+    );
+
+    moved_elsewhere(
+        &world,
+        &client,
+        &household,
+        &mut sync,
+        &store,
+        "E-school",
+        json!({"MB-school": true}),
+    )
+    .await;
+    let message = store.message(&school.id).unwrap().unwrap();
+    assert_eq!(message.values().unwrap().state, State::Done);
+    let history: Vec<_> = store
+        .history(&school.id)
         .unwrap()
-        .update_email(HOUSEHOLD, "E-roofer1", |mail| {
-            mail["mailboxIds"]["MB-do"] = json!(true);
-        });
+        .into_iter()
+        .map(|e| (e.user, e.text))
+        .collect();
+    assert_eq!(
+        history,
+        [
+            (Some("sam@example.com".into()), "Moved to Watch".into()),
+            elsewhere("Moved to Done via another client"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn trash_is_done_whatever_labels_it_keeps() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    moved_elsewhere(
+        &world,
+        &client,
+        &household,
+        &mut sync,
+        &store,
+        "E-roofer2",
+        json!({"MB-trash": true, "MB-do": true}),
+    )
+    .await;
+    assert_eq!(
+        state_and_history(&store, "E-roofer2@chislan.family"),
+        (
+            State::Done,
+            vec![elsewhere("Moved to Done via another client")]
+        )
+    );
+}
+
+#[tokio::test]
+async fn inbox_mail_filed_out_elsewhere_is_done() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    moved_elsewhere(
+        &world,
+        &client,
+        &household,
+        &mut sync,
+        &store,
+        "E-roofer1",
+        json!({"MB-receipts": true}),
+    )
+    .await;
+    let roofer1 = the(&store, "E-roofer1@chislan.family").unwrap();
+    assert_eq!(
+        roofer1.values().unwrap().folder.as_deref(),
+        Some("Receipts")
+    );
+    assert_eq!(
+        state_and_history(&store, "E-roofer1@chislan.family"),
+        (
+            State::Done,
+            vec![elsewhere("Moved to Done via another client")]
+        )
+    );
+
+    // Dragged back into the Inbox, it's Inbox again.
+    moved_elsewhere(
+        &world,
+        &client,
+        &household,
+        &mut sync,
+        &store,
+        "E-roofer1",
+        json!({"MB-in": true, "MB-receipts": true}),
+    )
+    .await;
+    assert_eq!(
+        state_and_history(&store, "E-roofer1@chislan.family").0,
+        State::Inbox
+    );
+}
+
+#[tokio::test]
+async fn labeled_mail_docket_never_saw_arrives_in_its_state() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    // Filed straight to a label by a rule or another client, never in
+    // the Inbox.
+    world.lock().unwrap().add_email(
+        HOUSEHOLD,
+        email_json(
+            "E-labeled",
+            "T-labeled",
+            ("City Water", "billing@citywater.gov"),
+            "household",
+            &["MB-do", "MB-receipts"],
+            "Overdue notice",
+            Some("Pay by Friday."),
+            "Pay by Friday",
+        ),
+    );
+    // A senderless oddity under a label has nothing to show.
+    let mut noise = email_json(
+        "E-labeled-noise",
+        "T-labeled-noise",
+        ("", ""),
+        "household",
+        &["MB-do"],
+        "(no subject)",
+        None,
+        "",
+    );
+    noise["from"] = Value::Null;
+    world.lock().unwrap().add_email(HOUSEHOLD, noise);
+    // And unlabeled filed mail stays out.
+    world.lock().unwrap().add_email(
+        HOUSEHOLD,
+        email_json(
+            "E-filed",
+            "T-filed",
+            ("City Water", "billing@citywater.gov"),
+            "household",
+            &["MB-receipts"],
+            "Receipt",
+            Some("Thanks."),
+            "Thanks",
+        ),
+    );
+
     let counts = client
         .poll_once(&household, &mut sync, &store)
         .await
         .unwrap();
+
     assert_eq!(counts.imported, 1, "{counts:?}");
+    assert_eq!(
+        state_and_history(&store, "E-labeled@chislan.family"),
+        (State::Do, vec![])
+    );
+    assert!(the(&store, "E-filed@chislan.family").is_none());
+}
+
+#[tokio::test]
+async fn a_queued_docket_change_outranks_one_made_elsewhere() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    // The Archive refuses mail, so Done stays queued.
+    world
+        .lock()
+        .unwrap()
+        .update_mailbox(HOUSEHOLD, "MB-archive", |m| {
+            m["myRights"]["mayAddItems"] = json!(false);
+        });
     let roofer1 = the(&store, "E-roofer1@chislan.family").unwrap();
-    assert_eq!(roofer1.values().unwrap().state, State::Inbox);
+    store
+        .edit("sam@example.com", &roofer1.id, Change::State(State::Done))
+        .unwrap();
+
+    moved_elsewhere(
+        &world,
+        &client,
+        &household,
+        &mut sync,
+        &store,
+        "E-roofer1",
+        json!({"MB-do": true}),
+    )
+    .await;
+
+    assert_eq!(store.pending_moves("household").unwrap().len(), 1);
+    assert_eq!(
+        state_and_history(&store, "E-roofer1@chislan.family"),
+        (
+            State::Done,
+            vec![(Some("sam@example.com".into()), "Moved to Done".into())]
+        )
+    );
+}
+
+#[tokio::test]
+async fn mail_docket_couldnt_move_keeps_its_state() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    // No Docket/Wait on the server: the mail stays in the Inbox while
+    // Docket says Wait.
+    let roofer1 = the(&store, "E-roofer1@chislan.family").unwrap();
+    store
+        .edit("sam@example.com", &roofer1.id, Change::State(State::Wait))
+        .unwrap();
+    client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    // An unrelated change (a folder) brings it back through the poll;
+    // the mailboxes still say what they said, so nothing is adopted.
+    moved_elsewhere(
+        &world,
+        &client,
+        &household,
+        &mut sync,
+        &store,
+        "E-roofer1",
+        json!({"MB-in": true, "MB-receipts": true}),
+    )
+    .await;
+    assert_eq!(
+        state_and_history(&store, "E-roofer1@chislan.family").0,
+        State::Wait
+    );
+}
+
+#[tokio::test]
+async fn read_only_accounts_adopt_nothing() {
+    init_tracing();
+    let (addr, world) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let eli = credential(&dir, "eli", ELI_TOKEN);
+    let store = Store::open_in_memory(Clock::System).unwrap();
+    let (client, mut sync) = synced(&addr, &store, &eli).await;
+
+    world
+        .lock()
+        .unwrap()
+        .update_email(ELI, "E-practice", |mail| {
+            mail["mailboxIds"] = json!({"MB-do": true});
+        });
+    let counts = client.poll_once(&eli, &mut sync, &store).await.unwrap();
+
+    assert_eq!(counts.imported, 1, "{counts:?}");
+    assert_eq!(
+        state_and_history(&store, "E-practice@chislan.family"),
+        (State::Inbox, vec![])
+    );
 }
 
 #[tokio::test]

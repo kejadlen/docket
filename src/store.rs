@@ -28,6 +28,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0005_pending_archives.sql"),
     include_str!("../migrations/0006_jj_style_ids.sql"),
     include_str!("../migrations/0007_pending_moves.sql"),
+    include_str!("../migrations/0008_adoption.sql"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +175,7 @@ impl Store {
         let mut inner = self.lock();
         let import = Import {
             tx: inner.conn.transaction()?,
+            now: self.now(),
         };
         f(&import)?;
         import.tx.commit()?;
@@ -232,6 +234,18 @@ impl Store {
 
     /// True when the account's thread is already imported: the poll
     /// path admits a sent email only into a thread it knows.
+    /// Whether the account already tracks the message, by Message-ID:
+    /// mail that leaves the Inbox stays the poll's business once known.
+    pub fn has_message(&self, account: &str, message_id: &str) -> Result<bool, Error> {
+        let inner = self.lock();
+        let known = inner.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE account = ?1 AND message_id = ?2)",
+            [account, message_id],
+            |r| r.get(0),
+        )?;
+        Ok(known)
+    }
+
     pub fn has_thread(&self, account: &str, jmap_thread_id: &str) -> Result<bool, Error> {
         let found = self.lock().conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM threads
@@ -437,7 +451,7 @@ impl Store {
         };
 
         write_values(&tx, id, &next)?;
-        insert_event(&tx, id, user, self.now(), &text)?;
+        insert_event(&tx, id, Some(user), self.now(), &text)?;
         tx.commit()?;
         inner
             .undo
@@ -475,7 +489,7 @@ impl Store {
             queue_file(&tx, &id, prev.folder.as_deref())?;
         }
         write_values(&tx, &id, &prev)?;
-        insert_event(&tx, &id, user, self.now(), "Undone")?;
+        insert_event(&tx, &id, Some(user), self.now(), "Undone")?;
         tx.commit()?;
         inner.undo.remove(user);
         inner.flash.insert(
@@ -551,7 +565,7 @@ impl Store {
         tx.execute("DELETE FROM pending_files WHERE message = ?1", [id])?;
         tx.execute("DELETE FROM pending_moves WHERE message = ?1", [id])?;
         write_values(&tx, id, &next)?;
-        insert_event(&tx, id, user, self.now(), "Deleted")?;
+        insert_event(&tx, id, Some(user), self.now(), "Deleted")?;
         tx.commit()?;
         inner.flash.insert(
             user.to_owned(),
@@ -732,6 +746,8 @@ pub struct PendingMove {
 /// Writes inside one transaction, from [`Store::import`].
 pub struct Import<'a> {
     tx: Transaction<'a>,
+    /// The clock adopted changes are stamped with.
+    now: DateTime,
 }
 
 impl Import<'_> {
@@ -846,7 +862,15 @@ impl Import<'_> {
     /// values (state, assignees, reads) are written only on first
     /// import, while the server-owned cache (folder, timestamps, body)
     /// refreshes.
+    ///
+    /// The one exception is state changed in another client (task qwt):
+    /// when the mailboxes say a new state since the last sight, Docket
+    /// adopts it with a history event rather than reverting it. A queued
+    /// move or deletion is Docket's newer word and holds; read-only
+    /// accounts keep state in the database alone, so nothing there
+    /// adopts.
     pub fn incoming(&self, account: &str, mail: &Incoming) -> Result<(), Error> {
+        let prior = self.prior(account, &mail.message_id)?;
         self.tx.execute(
             "INSERT INTO threads (id, account, subject, jmap_thread_id)
              VALUES (?1, ?2, ?3, ?4)
@@ -887,10 +911,11 @@ impl Import<'_> {
         let bcc = json(&mail.bcc)?;
         let _upserted = self.tx.execute(
             "INSERT INTO messages (id, account, message_id, jmap_id, thread, at, cc, bcc, body,
-                kind, from_name, from_addr, state, folder, sent_by, sent_to)
-             SELECT ?1, ?2, ?3, ?4, t.id, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+                kind, from_name, from_addr, state, folder, sent_by, sent_to, server_state)
+             SELECT ?1, ?2, ?3, ?4, t.id, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?13
              FROM threads t WHERE t.account = ?2 AND t.jmap_thread_id = ?5
              ON CONFLICT (account, message_id) DO UPDATE SET
+                 server_state = excluded.server_state,
                  jmap_id = excluded.jmap_id,
                  thread = excluded.thread,
                  at = excluded.at,
@@ -921,7 +946,71 @@ impl Import<'_> {
                 sent_to,
             ],
         )?;
+        if let (Some(prior), Some(seen)) = (prior, state)
+            && prior.adopts(*seen)
+        {
+            self.tx.execute(
+                "UPDATE messages SET state = ?2 WHERE id = ?1",
+                params![prior.id, seen],
+            )?;
+            insert_event(
+                &self.tx,
+                &prior.id,
+                None,
+                self.now,
+                &format!("Moved to {seen} via another client"),
+            )?;
+        }
         Ok(())
+    }
+
+    /// What a received message held before this sight, for adoption.
+    fn prior(&self, account: &str, message_id: &str) -> Result<Option<Prior>, Error> {
+        let prior = self
+            .tx
+            .query_row(
+                "SELECT m.id, m.state, m.server_state,
+                     EXISTS (SELECT 1 FROM pending_moves p WHERE p.message = m.id)
+                     OR EXISTS (SELECT 1 FROM pending_deletes d WHERE d.message = m.id),
+                     a.read_only
+                 FROM messages m JOIN accounts a ON a.slug = m.account
+                 WHERE m.account = ?1 AND m.message_id = ?2 AND m.kind = 'received'",
+                [account, message_id],
+                |r| {
+                    Ok(Prior {
+                        id: r.get(0)?,
+                        state: r.get(1)?,
+                        server_state: r.get(2)?,
+                        queued: r.get(3)?,
+                        read_only: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(prior)
+    }
+}
+
+/// A received message as it stood before a sight of it.
+struct Prior {
+    id: MessageId,
+    state: State,
+    /// What the mailboxes said last time; None before any sight.
+    server_state: Option<State>,
+    /// A move or deletion Docket has yet to push.
+    queued: bool,
+    read_only: bool,
+}
+
+impl Prior {
+    /// Whether the mailboxes' `seen` state is another client's change
+    /// to adopt: they moved since the last sight, to somewhere Docket
+    /// doesn't already say, with nothing of Docket's own in flight.
+    fn adopts(&self, seen: State) -> bool {
+        self.server_state.is_some_and(|last| last != seen)
+            && self.state != seen
+            && !self.queued
+            && !self.read_only
     }
 }
 
@@ -1102,10 +1191,11 @@ fn queue_move(conn: &Connection, id: &str, state: State) -> Result<bool, Error> 
     Ok(queued > 0)
 }
 
+/// `user` is None for a change adopted from another client.
 fn insert_event(
     conn: &Connection,
     message: &str,
-    user: &str,
+    user: Option<&str>,
     at: DateTime,
     text: &str,
 ) -> Result<(), Error> {
@@ -1216,8 +1306,8 @@ mod tests {
         assert_eq!(
             history,
             [
-                (SAM.into(), store.now(), "Moved to Do".into()),
-                (SAM.into(), store.now(), "Undone".into()),
+                (Some(SAM.into()), store.now(), "Moved to Do".into()),
+                (Some(SAM.into()), store.now(), "Undone".into()),
             ]
         );
     }
@@ -1393,7 +1483,7 @@ mod tests {
             .into_iter()
             .map(|e| (e.user, e.text))
             .collect();
-        assert_eq!(history, [(SAM.into(), "Moved to Done".into())]);
+        assert_eq!(history, [(Some(SAM.into()), "Moved to Done".into())]);
 
         // Undo reverts the state and queues the move back.
         store.undo(SAM).unwrap();
@@ -1535,8 +1625,8 @@ mod tests {
         assert_eq!(
             history,
             [
-                (SAM.into(), "Filed to House".into()),
-                (SAM.into(), "Deleted".into())
+                (Some(SAM.into()), "Filed to House".into()),
+                (Some(SAM.into()), "Deleted".into())
             ]
         );
 
@@ -1837,7 +1927,12 @@ mod tests {
         assert!(!store.has_thread("household", "T8").unwrap());
         // Threads are scoped to the account.
         assert!(!store.has_thread("eli", "T9").unwrap());
+        assert!(store.has_message("household", "m9@chislan.family").unwrap());
+        assert!(!store.has_message("eli", "m9@chislan.family").unwrap());
 
+        exec(&store, "ALTER TABLE messages RENAME TO gone_messages;");
+        assert!(store.has_message("household", "m9@chislan.family").is_err());
+        exec(&store, "ALTER TABLE gone_messages RENAME TO messages;");
         exec(&store, "ALTER TABLE threads RENAME TO gone_threads;");
         assert!(store.has_thread("household", "T9").is_err());
     }
@@ -1886,6 +1981,45 @@ mod tests {
         assert_eq!(after.body, "$2,120");
         assert_eq!(after.values().unwrap().state, State::Do);
         assert_eq!(after.values().unwrap().folder, None);
+    }
+
+    #[test]
+    fn incoming_adopts_a_state_changed_elsewhere() {
+        let store = Store::open_in_memory(Clock::Fixed(fixtures::now())).unwrap();
+        let sight =
+            |state| store.import(|tx| tx.incoming("household", &incoming(state, None, "x")));
+        store
+            .import(|tx| {
+                tx.account(&Account {
+                    slug: "household".into(),
+                    name: "Household".into(),
+                    address: "household@example.com".into(),
+                    read_only: false,
+                })
+            })
+            .unwrap();
+        sight(State::Inbox).unwrap();
+        let id = store.messages(Filter::Search("x")).unwrap()[0].id.clone();
+
+        sight(State::Watch).unwrap();
+        assert_eq!(values(&store, &id).state, State::Watch);
+        assert_eq!(
+            store.history(&id).unwrap(),
+            [Event {
+                message: id.clone(),
+                user: None,
+                at: fixtures::now(),
+                text: "Moved to Watch via another client".into(),
+            }]
+        );
+
+        // A failed event rolls the adoption back with it.
+        exec(
+            &store,
+            "CREATE TRIGGER no_history BEFORE INSERT ON history BEGIN SELECT RAISE(ABORT, 'no'); END;",
+        );
+        assert!(matches!(sight(State::Do), Err(Error::Db(_))));
+        assert_eq!(values(&store, &id).state, State::Watch);
     }
 
     #[test]

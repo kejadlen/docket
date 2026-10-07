@@ -169,12 +169,13 @@ pub struct Comment {
     pub text: String,
 }
 
-/// A change someone made to a message's values, as its toast put it.
+/// A change someone made to a message's values, as its toast put it,
+/// or one adopted from another client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub message: MessageId,
-    /// A login.
-    pub user: String,
+    /// A login, or None for a change made in another client.
+    pub user: Option<String>,
     pub at: DateTime,
     pub text: String,
 }

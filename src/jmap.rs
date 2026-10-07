@@ -436,6 +436,8 @@ struct Layout {
     pub sent: Option<String>,
     /// The Archive mailbox's id: where Done lands.
     pub archive: Option<String>,
+    /// The Trash mailbox's id: Done whatever labels it keeps.
+    pub trash: Option<String>,
     /// Label mailbox id → the state it carries.
     labels: BTreeMap<String, State>,
     /// Mailbox ids in the Docket namespace: the labels and the parent.
@@ -462,8 +464,9 @@ impl Layout {
                 Some("inbox") => layout.inbox = Some(mailbox.id.clone()),
                 Some("sent") => layout.sent = Some(mailbox.id.clone()),
                 Some("archive") => layout.archive = Some(mailbox.id.clone()),
-                // The other system boxes (Drafts, Junk, Trash)
-                // are neither folders nor labels.
+                Some("trash") => layout.trash = Some(mailbox.id.clone()),
+                // The other system boxes (Drafts, Junk, ...) are
+                // neither folders nor labels.
                 Some(_) => {}
                 None => {
                     let in_docket = mailbox.name == "Docket"
@@ -490,13 +493,33 @@ impl Layout {
         layout
     }
 
-    /// The state the message carries: its `Docket/` label, else Inbox.
+    /// The state the message's mailboxes say (DESIGN.md, State): Done
+    /// in Trash whatever labels it keeps, else its `Docket/` label, else
+    /// Inbox when it sits there, else Done.
     pub fn state_of(&self, email: &Email) -> State {
+        let member = |id: &str| email.mailbox_ids.get(id) == Some(&true);
+        if self.trash.as_deref().is_some_and(member) {
+            return State::Done;
+        }
+        let label = email
+            .mailbox_ids
+            .iter()
+            .filter(|(_, member)| **member)
+            .find_map(|(id, _)| self.labels.get(id).copied());
+        match label {
+            Some(state) => state,
+            None if self.is_inbox(email) => State::Inbox,
+            None => State::Done,
+        }
+    }
+
+    /// True when the message carries a `Docket/` label: state the poll
+    /// follows even if Docket never saw it in the Inbox.
+    pub fn is_labeled(&self, email: &Email) -> bool {
         email
             .mailbox_ids
-            .keys()
-            .find_map(|id| self.labels.get(id).copied())
-            .unwrap_or(State::Inbox)
+            .iter()
+            .any(|(id, member)| *member && self.labels.contains_key(id))
     }
 
     /// The folder the message is filed in: its role-less mailbox outside
@@ -1209,8 +1232,8 @@ impl Client {
     /// received messages land in Inbox — or the state their `Docket/`
     /// label already carries — unassigned; sent ones carry a login when
     /// the From address names one of us, else the shared identity.
-    /// Filed and archived mail stays out until adoption (task qwt)
-    /// watches for it.
+    /// Filed and archived mail stays out; once mail is tracked, the
+    /// poll follows it out of the Inbox (task qwt).
     #[allow(clippy::too_many_arguments)]
     async fn import_mail(
         &self,
@@ -1429,11 +1452,18 @@ impl Client {
                 let (emails, _) = self.emails(&session.api_url, &token, id, &ids).await?;
                 let users = store.users()?;
                 // Received first: a new Inbox message founds the thread
-                // its same-batch sent reply then lands in.
+                // its same-batch sent reply then lands in. Labeled mail
+                // is Docket's too, and mail already tracked stays
+                // followed out of the Inbox: leaving is a state change
+                // (task qwt).
                 for email in &emails {
-                    if sync.layout.is_inbox(email)
-                        && let Some(mail) = incoming(email, &sync.layout, &users)
-                    {
+                    let Some(mail) = incoming(email, &sync.layout, &users) else {
+                        continue;
+                    };
+                    let followed = !sync.layout.is_sent(email)
+                        && (sync.layout.is_labeled(email)
+                            || store.has_message(&credential.name, &mail.message_id)?);
+                    if sync.layout.is_inbox(email) || followed {
                         store.import(|tx| tx.incoming(&credential.name, &mail))?;
                         counts.imported = counts.imported.saturating_add(1);
                     }
@@ -2377,6 +2407,12 @@ mod tests {
         // Not a member: filed out of Inbox, or a sent message.
         let gone = email(&[("M-receipts", true)]);
         assert!(!layout.is_inbox(&gone));
+        // Neither Inbox nor label: Done. A lapsed membership is none.
+        assert_eq!(layout.state_of(&gone), State::Done);
+        assert_eq!(
+            layout.state_of(&email(&[("M-in", true), ("M-do", false)])),
+            State::Inbox
+        );
         assert!(!layout.is_inbox(&email(&[("M-in", false)])));
 
         let mine = email(&[("M-sent", true)]);
