@@ -29,6 +29,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0006_jj_style_ids.sql"),
     include_str!("../migrations/0007_pending_moves.sql"),
     include_str!("../migrations/0008_adoption.sql"),
+    include_str!("../migrations/0009_html.sql"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +285,20 @@ impl Store {
     }
 
     /// The thread's messages, oldest first.
+    /// The message's HTML part as the server sent it: unsanitized, so
+    /// it goes out only through [`crate::html::sanitize`]. None for
+    /// text-only mail.
+    pub fn html(&self, id: &str) -> Result<Option<String>, Error> {
+        let inner = self.lock();
+        let html = inner
+            .conn
+            .query_row("SELECT html FROM messages WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        Ok(html.flatten())
+    }
+
     pub fn thread_messages(&self, thread: &str) -> Result<Vec<Message>, Error> {
         load_messages(&self.lock().conn, "m.thread = ?1", [thread])
     }
@@ -693,6 +708,8 @@ pub struct Incoming {
     pub cc: Vec<String>,
     pub bcc: Vec<String>,
     pub body: String,
+    /// The first text/html part, raw; sanitized when served.
+    pub html: Option<String>,
     pub kind: IncomingKind,
 }
 
@@ -848,6 +865,18 @@ impl Import<'_> {
         Ok(())
     }
 
+    /// Gives an imported message an HTML part, as fixtures do; JMAP
+    /// mail brings its own through [`Import::incoming`].
+    pub fn html(&self, id: &str, raw: &str) -> Result<(), Error> {
+        let updated = self
+            .tx
+            .execute("UPDATE messages SET html = ?2 WHERE id = ?1", [id, raw])?;
+        if updated == 0 {
+            return Err(Error::NotFound("message"));
+        }
+        Ok(())
+    }
+
     pub fn comment(&self, c: &Comment) -> Result<(), Error> {
         insert_comment(&self.tx, Some(&c.id), &c.thread, &c.author, c.at, &c.text)
     }
@@ -911,11 +940,12 @@ impl Import<'_> {
         let bcc = json(&mail.bcc)?;
         let _upserted = self.tx.execute(
             "INSERT INTO messages (id, account, message_id, jmap_id, thread, at, cc, bcc, body,
-                kind, from_name, from_addr, state, folder, sent_by, sent_to, server_state)
-             SELECT ?1, ?2, ?3, ?4, t.id, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?13
+                kind, from_name, from_addr, state, folder, sent_by, sent_to, server_state, html)
+             SELECT ?1, ?2, ?3, ?4, t.id, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?13, ?17
              FROM threads t WHERE t.account = ?2 AND t.jmap_thread_id = ?5
              ON CONFLICT (account, message_id) DO UPDATE SET
                  server_state = excluded.server_state,
+                 html = excluded.html,
                  jmap_id = excluded.jmap_id,
                  thread = excluded.thread,
                  at = excluded.at,
@@ -944,6 +974,7 @@ impl Import<'_> {
                 folder,
                 sent_by,
                 sent_to,
+                mail.html,
             ],
         )?;
         if let (Some(prior), Some(seen)) = (prior, state)
@@ -1109,7 +1140,8 @@ fn load_messages(
         "SELECT m.id, m.message_id, m.thread, m.at, m.cc, m.bcc, m.body, m.kind,
             m.from_name, m.from_addr, m.state, m.folder, m.sent_by, m.sent_to,
             (SELECT json_group_array(user)
-                FROM (SELECT user FROM assignees WHERE message = m.id ORDER BY user))
+                FROM (SELECT user FROM assignees WHERE message = m.id ORDER BY user)),
+            m.html IS NOT NULL
          FROM messages m {MESSAGE_JOINS}
          WHERE {filter}
          ORDER BY m.at, m.id"
@@ -1146,6 +1178,7 @@ fn message_from_row(r: &Row<'_>) -> rusqlite::Result<Message> {
         cc: parse_json(r, 4)?,
         bcc: parse_json(r, 5)?,
         body: r.get(6)?,
+        has_html: r.get(15)?,
         kind,
     })
 }
@@ -1899,6 +1932,7 @@ mod tests {
             cc: Vec::new(),
             bcc: Vec::new(),
             body: body.to_owned(),
+            html: None,
             kind: IncomingKind::Received {
                 from: "Northwind Roofing".into(),
                 addr: "office@northwind.co".into(),
@@ -2162,6 +2196,7 @@ mod tests {
                         cc: Vec::new(),
                         bcc: Vec::new(),
                         body: "Thanks.".into(),
+                        html: None,
                         kind: IncomingKind::Sent {
                             by: None,
                             to: vec!["Northwind".into()],
@@ -2217,6 +2252,9 @@ mod tests {
         let result = store.import(|tx| tx.message(&m));
         assert!(matches!(result, Err(Error::NotFound("thread"))));
         assert!(store.message(&fixtures::id(100)).unwrap().is_none());
+
+        let result = store.import(|tx| tx.html(&fixtures::id(100), "<p>Hi</p>"));
+        assert!(matches!(result, Err(Error::NotFound("message"))));
     }
 
     #[test]

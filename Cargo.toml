@@ -14,6 +14,7 @@ path = "src/bin/docket/main.rs"
 dev = []
 
 [dependencies]
+ammonia = "*"
 axum = "*"
 camino = "*"
 clap = { version = "*", features = ["derive", "env"] }

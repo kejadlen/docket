@@ -965,6 +965,46 @@ fn elsewhere(text: &str) -> (Option<String>, String) {
 }
 
 #[tokio::test]
+async fn html_mail_stores_its_html_beside_the_text() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    // Text-only mail lists its text part under htmlBody too (RFC 8621
+    // §4.1.4); that's no HTML part.
+    let roofer1 = the(&store, "E-roofer1@chislan.family").unwrap();
+    assert!(!roofer1.has_html);
+    world
+        .lock()
+        .unwrap()
+        .update_email(HOUSEHOLD, "E-roofer1", |mail| {
+            mail["htmlBody"] = json!([{"partId": "p1", "type": "text/plain"}]);
+        });
+
+    // Alternative mail: the text stays the body, the HTML rides along —
+    // and mail imported before HTML was kept picks it up on this sight.
+    world
+        .lock()
+        .unwrap()
+        .update_email(HOUSEHOLD, "E-roofer2", |mail| {
+            mail["htmlBody"] = json!([{"partId": "h1", "type": "text/html"}]);
+            mail["bodyValues"]["h1"] = json!({"value": "<p>Revised: <b>$2,120</b></p>"});
+        });
+    client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    let roofer2 = the(&store, "E-roofer2@chislan.family").unwrap();
+    assert!(roofer2.has_html);
+    assert_eq!(roofer2.body, "Revised estimate: $2,120.");
+    assert_eq!(
+        store.html(&roofer2.id).unwrap().as_deref(),
+        Some("<p>Revised: <b>$2,120</b></p>")
+    );
+    let roofer1 = the(&store, "E-roofer1@chislan.family").unwrap();
+    assert!(!roofer1.has_html);
+    assert_eq!(store.html(&roofer1.id).unwrap(), None);
+}
+
+#[tokio::test]
 async fn a_folder_picked_up_elsewhere_refreshes_the_row() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     world

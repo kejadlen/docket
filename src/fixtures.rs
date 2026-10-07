@@ -12,7 +12,18 @@ use crate::store::{Clock, Store};
 
 /// Seeds for the rows tests name by number.
 pub const WATER: u32 = 7;
+pub const BILL: u32 = 8;
 pub const ELI_PRACTICE: u32 = 20;
+
+/// The bill's HTML part: a remote logo to block, a link to send to a
+/// new tab, and a script to strip.
+const BILL_HTML: &str = r##"<table width="100%" cellpadding="16" bgcolor="#f3f6f9"><tr><td>
+<img src="https://www.pge.com/logo.png" alt="PG&amp;E" width="96">
+<h2 style="color:#00539b">Your September bill is ready</h2>
+<p>Amount due: <b>$142.18</b> by October 21.</p>
+<p><a href="https://www.pge.com/myaccount" style="background:#00539b;color:#fff;padding:8px 16px;text-decoration:none">View your bill</a></p>
+<script>document.title = "pwned"</script>
+</td></tr></table>"##;
 
 pub const ALEX: &str = "alex@example.com";
 pub const SAM: &str = "sam@example.com";
@@ -85,6 +96,7 @@ impl Builder {
             cc: strings(cc),
             bcc: Vec::new(),
             body: body.to_owned(),
+            has_html: false,
             kind: Kind::Received {
                 from: from.to_owned(),
                 addr: addr.to_owned(),
@@ -117,6 +129,7 @@ impl Builder {
             cc: strings(cc),
             bcc: strings(bcc),
             body: body.to_owned(),
+            has_html: false,
             kind: Kind::Sent {
                 by: Some(by.to_owned()),
                 to: strings(to),
@@ -246,7 +259,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
 
     b.thread(4, "household", "Your September bill is ready");
     b.recv(
-        8,
+        BILL,
         4,
         at(9, 30, 7, 45),
         ("PG&E", "billing@pge.com"),
@@ -367,6 +380,7 @@ pub fn seed(store: &Store) -> Result<(), Error> {
         for message in &b.messages {
             tx.message(message)?;
         }
+        tx.html(&id(BILL), BILL_HTML)?;
         for comment in &b.comments {
             tx.comment(comment)?;
         }

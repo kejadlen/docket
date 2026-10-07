@@ -146,7 +146,10 @@ pub struct Message {
     pub cc: Vec<String>,
     /// Only known for messages we sent.
     pub bcc: Vec<String>,
+    /// The text: what lists, search, and quote folding read.
     pub body: String,
+    /// An HTML part is stored too, for the thread view to render.
+    pub has_html: bool,
     pub kind: Kind,
 }
 

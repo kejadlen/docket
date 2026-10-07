@@ -382,8 +382,12 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Acco
                 @if !copies.is_empty() {
                     span.copies { (copies.join(" · ")) }
                 }
-                span.text x-show="open" x-cloak[!open] { (body::linked(said)) }
-                @if let Some(quoted) = quoted {
+                @if m.has_html {
+                    (html_frame(&m.id, open))
+                } @else {
+                    span.text x-show="open" x-cloak[!open] { (body::linked(said)) }
+                }
+                @if let (Some(quoted), false) = (quoted, m.has_html) {
                     button.quote-btn type="button" x-show="open" x-cloak[!open]
                         "@click"="quoted = !quoted" ":aria-expanded"="quoted"
                         x-text="quoted ? 'Hide quote' : 'Show quote'" { "Show quote" }
@@ -402,6 +406,23 @@ fn message(p: &Page<'_>, m: &Message, open: bool, selected: bool, account: &Acco
                     None => span.type-label.sent { "Sent" },
                 }
             }
+        }
+    }
+}
+
+/// HTML mail in a frame sandboxed to popups alone: no script, and no
+/// same-origin reach into Docket. Remote images wait for the link,
+/// which reloads the frame (by name) with them allowed; no script is
+/// needed on either side.
+fn html_frame(id: &str, open: bool) -> Markup {
+    let src = format!("/messages/{id}/html");
+    let name = format!("html-{id}");
+    html! {
+        div.html-mail x-show="open" x-cloak[!open] {
+            iframe.html-body name=(name) src=(src) title="Message"
+                sandbox="allow-popups allow-popups-to-escape-sandbox"
+                referrerpolicy="no-referrer" loading="lazy" {}
+            a.images-btn href=(format!("{src}?images=1")) target=(name) { "Show images" }
         }
     }
 }
@@ -540,6 +561,7 @@ mod tests {
             cc: Vec::new(),
             bcc: Vec::new(),
             body: "hi".into(),
+            has_html: false,
             kind: Kind::Sent {
                 by: by.map(str::to_owned),
                 to: vec!["Northwind Roofing".into()],

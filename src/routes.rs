@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use axum::extract::{FromRequestParts, OriginalUri, Path, Query, State as Extract};
-use axum::http::header::{CONTENT_TYPE, HOST, ORIGIN};
+use axum::http::header::{
+    CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, ORIGIN, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS,
+};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method};
 use axum::response::{IntoResponse, Redirect};
@@ -12,11 +14,11 @@ use serde::Deserialize;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::Error;
 use crate::lists::{self, View};
 use crate::model::{MessageId, State, ThreadId, User};
 use crate::store::{Change, Store};
 use crate::views::{self, Page, ThreadView};
+use crate::{Error, html};
 
 // caddy-tailscale sets both from the tailnet identity, overwriting whatever
 // the client sent.
@@ -42,6 +44,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(for_me))
         .route("/{lane}", get(lane))
         .route("/search", get(search))
+        .route("/messages/{id}/html", get(message_html))
         .route("/messages/{id}/state", post(set_state))
         .route("/messages/{id}/folder", post(set_folder))
         .route("/messages/{id}/delete", post(delete_message))
@@ -298,6 +301,34 @@ async fn undo(
 ) -> Result<Redirect, Error> {
     state.store.undo(&me.login)?;
     Ok(Redirect::to(safe_back(&form.back)))
+}
+
+#[derive(Deserialize)]
+struct HtmlQuery {
+    /// Set by the "Show images" link: remote images may load.
+    images: Option<String>,
+}
+
+/// The message's HTML part as a page of its own, for the thread view's
+/// sandboxed frame. The CSP is the frame's real wall: it holds even if
+/// the page is opened directly, outside the frame.
+async fn message_html(
+    Extract(state): Extract<AppState>,
+    Me(_me): Me,
+    Path(id): Path<MessageId>,
+    Query(query): Query<HtmlQuery>,
+) -> Result<impl IntoResponse, Error> {
+    let raw = state.store.html(&id)?.ok_or(Error::NotFound("HTML part"))?;
+    Ok((
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
+            (CONTENT_SECURITY_POLICY, html::csp(query.images.is_some())),
+            (X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            // Remote images, once allowed, don't learn where they're seen.
+            (REFERRER_POLICY, "no-referrer".to_owned()),
+        ],
+        html::document(&raw),
+    ))
 }
 
 async fn gloss_css() -> impl IntoResponse {

@@ -341,24 +341,10 @@ struct Email {
 /// part converted to text, then the server's preview. A message with
 /// none of those says so rather than rendering blank.
 fn body_of(email: &Email) -> String {
-    let first = |parts: Option<&[BodyPart]>, media_type: &str| {
-        parts
-            .unwrap_or_default()
-            .iter()
-            .filter(|part| part.media_type.starts_with(media_type))
-            .filter_map(|part| {
-                email
-                    .body_values
-                    .as_ref()
-                    .and_then(|values| values.get(&part.part_id))
-            })
-            .map(|value| value.value.as_str())
-            .find(|value| !value.trim().is_empty())
-    };
-    if let Some(plain) = first(email.text_body.as_deref(), "text/plain") {
+    if let Some(plain) = first_part(email, email.text_body.as_deref(), "text/plain") {
         return plain.into();
     }
-    if let Some(html) = first(email.html_body.as_deref(), "text/html") {
+    if let Some(html) = html_of(email) {
         // from_read over a byte slice can't fail; the raw HTML is an
         // unreachable stand-in for that error.
         return html2text::from_read(html.as_bytes(), usize::MAX).unwrap_or_else(|_| html.into());
@@ -368,6 +354,33 @@ fn body_of(email: &Email) -> String {
         .as_deref()
         .filter(|preview| !preview.trim().is_empty())
         .map_or_else(|| "(no body)".into(), str::to_owned)
+}
+
+/// The message's first non-blank HTML part, raw. `htmlBody` falls back
+/// to the text parts for text-only mail (RFC 8621 §4.1.4), so the media
+/// type filter is what tells HTML mail apart.
+fn html_of(email: &Email) -> Option<&str> {
+    first_part(email, email.html_body.as_deref(), "text/html")
+}
+
+/// The first of `parts` of `media_type` whose fetched value isn't blank.
+fn first_part<'a>(
+    email: &'a Email,
+    parts: Option<&'a [BodyPart]>,
+    media_type: &str,
+) -> Option<&'a str> {
+    parts
+        .unwrap_or_default()
+        .iter()
+        .filter(|part| part.media_type.starts_with(media_type))
+        .filter_map(|part| {
+            email
+                .body_values
+                .as_ref()
+                .and_then(|values| values.get(&part.part_id))
+        })
+        .map(|value| value.value.as_str())
+        .find(|value| !value.trim().is_empty())
 }
 
 /// Shapes a fetched email for the store. `None` skips a senderless
@@ -421,6 +434,7 @@ fn incoming(email: &Email, layout: &Layout, users: &[User]) -> Option<Incoming> 
         cc: names(empty(&email.cc)),
         bcc: names(empty(&email.bcc)),
         body: body_of(email),
+        html: html_of(email).map(str::to_owned),
         kind,
     })
 }

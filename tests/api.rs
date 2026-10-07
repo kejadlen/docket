@@ -234,6 +234,69 @@ async fn thread_view_shows_the_chain_with_values_in_the_gutter() {
 }
 
 #[tokio::test]
+async fn html_mail_renders_in_a_sandboxed_frame() {
+    let addr = spawn().await;
+    let bill = mid(fixtures::BILL);
+    let (_, body) = get(addr, SAM, &format!("/inbox?m={bill}")).await;
+    // The frame may open popups and nothing else; the closed preview
+    // still reads the text.
+    assert!(body.contains(&format!(
+        r#"<iframe class="html-body" name="html-{bill}" src="/messages/{bill}/html" title="Message" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" loading="lazy"></iframe>"#
+    )));
+    assert!(body.contains(&format!(
+        r#"href="/messages/{bill}/html?images=1" target="html-{bill}">Show images</a>"#
+    )));
+    assert!(body.contains("Amount due $142.18 by October 21."));
+    // Text-only mail keeps its text body.
+    let (_, body) = get(addr, SAM, &format!("/inbox?m={}", mid(fixtures::WATER))).await;
+    assert!(!body.contains("<iframe"));
+
+    let res = client()
+        .get(format!("http://{addr}/messages/{bill}/html"))
+        .header("Remote-User", SAM)
+        .header("X-User-Slug", "Sam")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let header = |name: &str| res.headers()[name].to_str().unwrap().to_owned();
+    assert_eq!(header("content-type"), "text/html; charset=utf-8");
+    assert_eq!(header("x-content-type-options"), "nosniff");
+    assert_eq!(header("referrer-policy"), "no-referrer");
+    let csp = header("content-security-policy");
+    assert!(csp.contains("img-src data:;"), "{csp}");
+    assert!(
+        csp.contains("sandbox allow-popups allow-popups-to-escape-sandbox"),
+        "{csp}"
+    );
+    let page = res.text().await.unwrap();
+    assert!(page.contains("$142.18"), "{page}");
+    assert!(!page.contains("<script"), "{page}");
+    assert!(page.contains(r#"target="_blank""#), "{page}");
+
+    let res = client()
+        .get(format!("http://{addr}/messages/{bill}/html?images=1"))
+        .header("Remote-User", SAM)
+        .header("X-User-Slug", "Sam")
+        .send()
+        .await
+        .unwrap();
+    let csp = res.headers()["content-security-policy"].to_str().unwrap();
+    assert!(csp.contains("img-src data: https: http:;"), "{csp}");
+
+    // Text-only and unknown mail have no page; nor does anyone outside.
+    let water = mid(fixtures::WATER);
+    let (status, _) = get(addr, SAM, &format!("/messages/{water}/html")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get(addr, SAM, "/messages/nope/html").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let res = reqwest::get(format!("http://{addr}/messages/{bill}/html"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn read_only_accounts_show_folder_as_plain_text() {
     let addr = spawn().await;
     let (_, body) = get(addr, SAM, &format!("/watch?m={}", mid(20))).await;
