@@ -488,10 +488,11 @@ async fn api(world: axum::extract::State<World>, headers: HeaderMap, body: Strin
     let method = call[0].as_str().expect("a method name").to_owned();
     let args = &call[1];
 
-    // The mutating methods, so they lock for themselves and answer
-    // early.
-    if method == "Email/set" || method == "Email/destroy" {
-        if method == "Email/destroy" {
+    // The mutating method, so it locks for itself and answers early.
+    if method == "Email/set" {
+        // One method for both: a destroy carries `destroy`, a patch
+        // `update` (RFC 8620 §5.3).
+        if args.get("destroy").is_some() {
             let mut stub = world.lock().unwrap();
             let mut destroyed = Vec::new();
             let mut not_destroyed = serde_json::Map::new();
@@ -515,8 +516,7 @@ async fn api(world: axum::extract::State<World>, headers: HeaderMap, body: Strin
             stub.snapshot(account);
             let reply = json!({"accountId": account, "oldState": "s", "newState": "s",
                                "destroyed": destroyed, "notDestroyed": not_destroyed});
-            return Json(json!({"methodResponses": [["Email/destroy", reply, "0"]]}))
-                .into_response();
+            return Json(json!({"methodResponses": [["Email/set", reply, "0"]]})).into_response();
         }
         let mut stub = world.lock().unwrap();
         let mut updated = serde_json::Map::new();

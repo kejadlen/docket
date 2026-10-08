@@ -7,9 +7,8 @@
 //! Keeping up with the server is polling for now (task lylzwoyo):
 //! `poll_once` applies `Email/changes` and `Mailbox/changes` since the
 //! states the last sync left, and drains the queued filings, archives,
-//! and deletions (tasks rn and sm) with `Email/set` and
-//! `Email/destroy`. Push replaces the timer later (task nwylszul); the
-//! changes application stays.
+//! and deletions (tasks rn and sm) with `Email/set`. Push replaces the
+//! timer later (task nwylszul); the changes application stays.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -720,10 +719,10 @@ fn parse_set_emails(args: Value) -> Result<SetEmailsReply, JmapError> {
     })
 }
 
-/// Parses an `Email/destroy` reply's verdict on each id.
+/// Parses an `Email/set` destroy reply's verdict on each id.
 fn parse_destroy_emails(args: Value) -> Result<DestroyEmailsReply, JmapError> {
     serde_json::from_value(args).map_err(|source| JmapError::Malformed {
-        what: "Email/destroy",
+        what: "Email/set",
         source,
     })
 }
@@ -961,7 +960,8 @@ struct SetEmailsReply {
     not_updated: BTreeMap<String, Value>,
 }
 
-/// `Email/destroy` arguments (RFC 8621 §5.5).
+/// `Email/set` destroy arguments (RFC 8620 §5.3; JMAP has no
+/// `Email/destroy` method).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DestroyEmails<'a> {
@@ -969,7 +969,7 @@ struct DestroyEmails<'a> {
     destroy: &'a [String],
 }
 
-/// The outcome half of an `Email/destroy` reply: which ids went, and
+/// The outcome half of an `Email/set` destroy reply: which ids went, and
 /// which the server refused.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1146,7 +1146,7 @@ impl Client {
         parse_set_emails(args)
     }
 
-    /// Destroys emails with one `Email/destroy`, returning the
+    /// Destroys emails with one `Email/set`, returning the
     /// server's verdict on each id.
     async fn destroy_emails(
         &self,
@@ -1159,7 +1159,7 @@ impl Client {
             .call(
                 api_url,
                 token,
-                "Email/destroy",
+                "Email/set",
                 &DestroyEmails {
                     account_id,
                     destroy,
@@ -1669,7 +1669,7 @@ impl Client {
     }
 
     /// Drains the account's queued deletions (task sm) with
-    /// `Email/destroy` — Fastmail's answer to a destroy is moving the
+    /// `Email/set` destroys — Fastmail's answer to a destroy is moving the
     /// mail to Trash. Ids the server refused or no longer carries are
     /// dropped with a warning rather than retried; the thread already
     /// went Done when the deletion was queued.
@@ -2312,7 +2312,7 @@ mod tests {
     #[test]
     fn a_destroy_reply_that_wont_parse_fails() {
         let err = parse_destroy_emails(json!({"destroyed": 3})).unwrap_err();
-        assert!(err.to_string().contains("malformed Email/destroy"), "{err}");
+        assert!(err.to_string().contains("malformed Email/set"), "{err}");
     }
 
     #[test]
