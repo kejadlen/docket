@@ -75,7 +75,7 @@ State lives in Docket's database. On writable accounts it is also where the mess
 | `Docket/Do`, `Docket/Wait`, or `Docket/Watch` | Do, Wait, or Watch |
 | Neither | Done |
 
-The `Docket/` mailboxes are **labels**. JMAP mailbox membership is per message, so a message can be in `Receipts` and labeled `Docket/Watch` at once, and state is visible (and editable) in Mail.app and Fastmail web. Changing state in Docket moves the message to match: Do, Wait, and Watch take it out of the Inbox and add the label, Done takes it out of both and into Archive, and Inbox puts it back. A message in the Inbox that also has a label takes the label's state. On read-only accounts, state is database-only.
+The `Docket/` mailboxes are **labels**. Docket creates any that are missing on writable accounts, nested under a `Docket` parent. JMAP mailbox membership is per message, so a message can be in `Receipts` and labeled `Docket/Watch` at once, and state is visible (and editable) in Mail.app and Fastmail web. Changing state in Docket moves the message to match: Do, Wait, and Watch take it out of the Inbox and add the label, Done takes it out of both and into Archive, and Inbox puts it back. A message in the Inbox that also has a label takes the label's state. On read-only accounts, state is database-only.
 
 Per-person read tracking lives in the database — `$seen` is shared across clients and can't say who read something. Opening a message in Docket marks it read for that user. Read tracking drives unread marks only; it never changes state or assignees.
 

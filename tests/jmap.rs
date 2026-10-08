@@ -311,6 +311,8 @@ struct Stub {
     accounts: BTreeMap<&'static str, AccountMail>,
     /// Email ids `Email/set` refuses, to exercise the notUpdated path.
     refuse: BTreeSet<String>,
+    /// Mailbox names `Mailbox/set` refuses to create.
+    refuse_mailboxes: BTreeSet<String>,
 }
 
 #[derive(Default)]
@@ -488,7 +490,52 @@ async fn api(world: axum::extract::State<World>, headers: HeaderMap, body: Strin
     let method = call[0].as_str().expect("a method name").to_owned();
     let args = &call[1];
 
-    // The mutating method, so it locks for itself and answers early.
+    // The mutating methods, so they lock for themselves and answer
+    // early.
+    if method == "Mailbox/set" {
+        let mut stub = world.lock().unwrap();
+        let mut created = serde_json::Map::new();
+        let mut not_created = serde_json::Map::new();
+        // Creation ids resolve in order, so a parent comes first; its
+        // `#id` is what children name as their parent (RFC 8620 §5.3).
+        let create = args["create"].as_object().expect("a create map");
+        let mut order: Vec<_> = create.iter().collect();
+        order.sort_by_key(|(_, m)| !m["parentId"].is_null());
+        for (cid, new) in order {
+            let name = new["name"].as_str().expect("a name");
+            let parent = match new["parentId"].as_str() {
+                Some(r) if r.starts_with('#') => match created.get(&r[1..]) {
+                    Some(made) => made["id"].clone(),
+                    None => {
+                        not_created.insert(cid.clone(), json!({"type": "invalidProperties"}));
+                        continue;
+                    }
+                },
+                other => json!(other),
+            };
+            if stub.refuse_mailboxes.contains(name) {
+                not_created.insert(
+                    cid.clone(),
+                    json!({"type": "forbidden", "description": "refused"}),
+                );
+                continue;
+            }
+            let id = format!("MB-new-{cid}");
+            stub.accounts
+                .get_mut(account)
+                .unwrap()
+                .mailboxes
+                .push(json!({
+                    "id": id, "name": name, "parentId": parent, "role": null,
+                    "myRights": full_rights(),
+                }));
+            created.insert(cid.clone(), json!({"id": id}));
+        }
+        stub.snapshot(account);
+        let reply = json!({"accountId": account, "oldState": "s", "newState": "s",
+                           "created": created, "notCreated": not_created});
+        return Json(json!({"methodResponses": [["Mailbox/set", reply, "0"]]})).into_response();
+    }
     if method == "Email/set" {
         // One method for both: a destroy carries `destroy`, a patch
         // `update` (RFC 8620 §5.3).
@@ -1279,6 +1326,7 @@ async fn mail_docket_couldnt_move_keeps_its_state() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     // No Docket/Wait on the server: the mail stays in the Inbox while
     // Docket says Wait.
+    lose_the_wait_label(&world);
     let roofer1 = the(&store, "E-roofer1@chislan.family").unwrap();
     store
         .edit("sam@example.com", &roofer1.id, Change::State(State::Wait))
@@ -1837,8 +1885,9 @@ async fn every_lane_leaves_the_shared_inbox_and_undo_brings_it_back() {
 async fn a_lane_without_its_label_keeps_the_mail_in_the_inbox() {
     let (world, client, household, mut sync, store, _dir) = household_ready().await;
     let school = school_message(&store);
-    // The stub has no Docket/Wait; leaving the Inbox without it would
-    // read as Done to every other client.
+    // Without Docket/Wait, leaving the Inbox would read as Done to
+    // every other client.
+    lose_the_wait_label(&world);
     store
         .edit("sam@example.com", &school.id, Change::State(State::Wait))
         .unwrap();
@@ -1854,6 +1903,104 @@ async fn a_lane_without_its_label_keeps_the_mail_in_the_inbox() {
         memberships_of(&world, "E-school"),
         json!({"MB-in": true, "MB-watch": true, "MB-school": true})
     );
+}
+
+/// The household stub's mailbox named `name`.
+fn mailbox_named(world: &World, name: &str) -> Option<Value> {
+    let world = world.lock().unwrap();
+    world.accounts[HOUSEHOLD]
+        .mailboxes
+        .iter()
+        .find(|m| m["name"] == json!(name))
+        .cloned()
+}
+
+/// Deletes the Docket/Wait label sync created and refuses to make it
+/// again, the way a server whose ACLs shut Docket out would.
+fn lose_the_wait_label(world: &World) {
+    let mut world = world.lock().unwrap();
+    world.refuse_mailboxes.insert("Wait".into());
+    world.remove_mailbox(HOUSEHOLD, "MB-new-wait");
+}
+
+#[tokio::test]
+async fn sync_creates_missing_labels_under_a_docket_parent() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+
+    // The stub carries Docket/Do and Docket/Watch, so only Wait is new,
+    // nested under a new Docket parent.
+    let parent = mailbox_named(&world, "Docket").expect("a Docket parent");
+    assert_eq!(parent["parentId"], Value::Null);
+    let wait = mailbox_named(&world, "Wait").expect("a Wait label");
+    assert_eq!(wait["parentId"], parent["id"]);
+    assert!(mailbox_named(&world, "Do").is_none());
+    // Labels aren't folders.
+    assert_eq!(store.folders().unwrap(), ["Receipts", "School"]);
+
+    // A Wait move now has somewhere to land.
+    let school = school_message(&store);
+    store
+        .edit("sam@example.com", &school.id, Change::State(State::Wait))
+        .unwrap();
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+    assert_eq!(counts.moved, 1, "{counts:?}");
+    assert_eq!(
+        memberships_of(&world, "E-school"),
+        json!({"MB-new-wait": true, "MB-school": true})
+    );
+}
+
+#[tokio::test]
+async fn a_label_deleted_server_side_comes_back() {
+    let (world, client, household, mut sync, store, _dir) = household_ready().await;
+    world
+        .lock()
+        .unwrap()
+        .remove_mailbox(HOUSEHOLD, "MB-new-wait");
+
+    let counts = client
+        .poll_once(&household, &mut sync, &store)
+        .await
+        .unwrap();
+
+    assert!(counts.mailboxes, "{counts:?}");
+    let wait = mailbox_named(&world, "Wait").expect("a recreated Wait label");
+    assert_eq!(wait["parentId"], json!("MB-new-docket"));
+}
+
+#[tokio::test]
+async fn read_only_accounts_get_no_labels() {
+    init_tracing();
+    let (addr, world) = serve().await;
+    let dir = tempfile::tempdir().unwrap();
+    let eli = credential(&dir, "eli", ELI_TOKEN);
+    let store = Store::open_in_memory(Clock::System).unwrap();
+    synced(&addr, &store, &eli).await;
+
+    let world = world.lock().unwrap();
+    assert_eq!(world.accounts[ELI].mailboxes, mailboxes());
+}
+
+#[tokio::test]
+async fn a_refused_docket_parent_still_syncs() {
+    init_tracing();
+    let (addr, world) = serve().await;
+    world
+        .lock()
+        .unwrap()
+        .refuse_mailboxes
+        .insert("Docket".into());
+    let dir = tempfile::tempdir().unwrap();
+    let household = credential(&dir, "household", HOUSEHOLD_TOKEN);
+    let store = Store::open_in_memory(Clock::System).unwrap();
+    synced(&addr, &store, &household).await;
+
+    // The children hang off the refused parent, so none were made.
+    assert!(mailbox_named(&world, "Docket").is_none());
+    assert!(mailbox_named(&world, "Wait").is_none());
 }
 
 #[tokio::test]

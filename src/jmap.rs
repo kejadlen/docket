@@ -134,6 +134,9 @@ pub struct Rights {
 pub struct Mailbox {
     pub id: String,
     pub name: String,
+    /// The enclosing mailbox, or None at the top level: a name is only
+    /// its own leaf (RFC 8621 §2).
+    pub parent_id: Option<String>,
     pub role: Option<String>,
     pub my_rights: MailboxRights,
 }
@@ -455,6 +458,8 @@ struct Layout {
     labels: BTreeMap<String, State>,
     /// Mailbox ids in the Docket namespace: the labels and the parent.
     docket: BTreeSet<String>,
+    /// The `Docket` parent mailbox's id, when the labels nest.
+    parent: Option<String>,
     /// Folder mailbox id → its name and ACLs.
     folders: BTreeMap<String, Folder>,
     /// Every mailbox's ACLs, for the moves that cross system boxes.
@@ -484,9 +489,15 @@ impl Layout {
                 None => {
                     let in_docket = mailbox.name == "Docket"
                         || mailbox.name.starts_with("Docket/")
-                        || parents.contains(mailbox.id.as_str());
+                        || mailbox
+                            .parent_id
+                            .as_deref()
+                            .is_some_and(|p| parents.contains(p));
                     if in_docket {
                         layout.docket.insert(mailbox.id.clone());
+                        if parents.contains(mailbox.id.as_str()) {
+                            layout.parent = Some(mailbox.id.clone());
+                        }
                         let leaf = mailbox.name.rsplit('/').next().unwrap_or_default();
                         if let Some(state) = State::from_slug(&leaf.to_lowercase()) {
                             layout.labels.insert(mailbox.id.clone(), state);
@@ -564,8 +575,16 @@ impl Layout {
         self.folders.values().map(|f| f.name.clone()).collect()
     }
 
+    /// The lane states whose label the server lacks.
+    fn missing_labels(&self) -> Vec<State> {
+        [State::Do, State::Wait, State::Watch]
+            .into_iter()
+            .filter(|state| self.label_of(*state).is_none())
+            .collect()
+    }
+
     /// The label mailbox id that carries `state`, if the server has
-    /// one. Creating missing labels is task xy.
+    /// one.
     fn label_of(&self, state: State) -> Option<&str> {
         self.labels
             .iter()
@@ -719,6 +738,14 @@ fn parse_set_emails(args: Value) -> Result<SetEmailsReply, JmapError> {
     })
 }
 
+/// Parses a `Mailbox/set` create reply's verdict on each creation.
+fn parse_create_mailboxes(args: Value) -> Result<CreateMailboxesReply, JmapError> {
+    serde_json::from_value(args).map_err(|source| JmapError::Malformed {
+        what: "Mailbox/set",
+        source,
+    })
+}
+
 /// Parses an `Email/set` destroy reply's verdict on each id.
 fn parse_destroy_emails(args: Value) -> Result<DestroyEmailsReply, JmapError> {
     serde_json::from_value(args).map_err(|source| JmapError::Malformed {
@@ -799,6 +826,7 @@ struct GetMailboxes<'a> {
 enum MailboxProperty {
     Id,
     Name,
+    ParentId,
     Role,
     MyRights,
 }
@@ -806,9 +834,37 @@ enum MailboxProperty {
 const MAILBOX_PROPERTIES: &[MailboxProperty] = &[
     MailboxProperty::Id,
     MailboxProperty::Name,
+    MailboxProperty::ParentId,
     MailboxProperty::Role,
     MailboxProperty::MyRights,
 ];
+
+/// `Mailbox/set` create arguments (RFC 8621 §2.5), keyed by creation
+/// id; a `#id` parent refers to a mailbox created in the same call
+/// (RFC 8620 §5.3).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateMailboxes<'a> {
+    account_id: &'a str,
+    create: &'a BTreeMap<String, NewMailbox>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NewMailbox {
+    name: String,
+    parent_id: Option<String>,
+}
+
+/// The outcome half of a `Mailbox/set` create reply.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateMailboxesReply {
+    #[serde(default)]
+    created: BTreeMap<String, Value>,
+    #[serde(default)]
+    not_created: BTreeMap<String, SetError>,
+}
 
 /// `Email/query` arguments (RFC 8621 §4.4).
 #[derive(Debug, Serialize)]
@@ -1063,6 +1119,80 @@ impl Client {
         parse_stateful_list("Mailbox/get", args)
     }
 
+    /// The account's mailboxes with Docket's labels in place (task
+    /// xy): a writable account missing any of `Docket/Do`,
+    /// `Docket/Wait`, or `Docket/Watch` gets them under a `Docket`
+    /// parent, created too if need be, so state moves have somewhere
+    /// to land. Read-only accounts keep state database-only.
+    async fn labeled_mailboxes(
+        &self,
+        session: &Session,
+        token: &str,
+        account_id: &str,
+        read_only: bool,
+    ) -> Result<(Vec<Mailbox>, String), JmapError> {
+        let (mailboxes, state) = self.mailboxes(session, token, account_id).await?;
+        let layout = Layout::of(&mailboxes);
+        let missing = layout.missing_labels();
+        if read_only || missing.is_empty() {
+            return Ok((mailboxes, state));
+        }
+        let mut create = BTreeMap::new();
+        let parent = match layout.parent {
+            Some(id) => id,
+            None => {
+                create.insert(
+                    "docket".to_owned(),
+                    NewMailbox {
+                        name: "Docket".to_owned(),
+                        parent_id: None,
+                    },
+                );
+                "#docket".to_owned()
+            }
+        };
+        for state in missing {
+            create.insert(
+                state.slug().to_owned(),
+                NewMailbox {
+                    name: state.name().to_owned(),
+                    parent_id: Some(parent.clone()),
+                },
+            );
+        }
+        let args = self
+            .call(
+                &session.api_url,
+                token,
+                "Mailbox/set",
+                &CreateMailboxes {
+                    account_id,
+                    create: &create,
+                },
+            )
+            .await?;
+        let reply = parse_create_mailboxes(args)?;
+        for (id, error) in &reply.not_created {
+            let name = match create.get(id) {
+                Some(NewMailbox {
+                    parent_id: Some(_),
+                    name,
+                }) => format!("Docket/{name}"),
+                _ => "Docket".to_owned(),
+            };
+            tracing::error!(
+                account = %account_id,
+                "Fastmail refused to create the {name} mailbox ({error}). State moves \
+                 that need it stay in Docket only; create {name} in Fastmail instead."
+            );
+        }
+        if reply.created.is_empty() {
+            return Ok((mailboxes, state));
+        }
+        tracing::info!(account = %account_id, created = ?reply.created.keys(), "created Docket labels");
+        self.mailboxes(session, token, account_id).await
+    }
+
     /// Posts one method call and returns the paired response's arguments.
     async fn call<A>(
         &self,
@@ -1211,7 +1341,9 @@ impl Client {
         let session = self.session(&token).await?;
         let (id, account) = session.mail_account(&credential.name)?;
         let rights = account.rights();
-        let (mailboxes, mailbox_state) = self.mailboxes(&session, &token, id).await?;
+        let (mailboxes, mailbox_state) = self
+            .labeled_mailboxes(&session, &token, id, rights.read_only)
+            .await?;
         let layout = Layout::of(&mailboxes);
         let users = store.users()?;
         let folders = layout.folder_names();
@@ -1417,7 +1549,9 @@ impl Client {
         // An unchanged reply still advances the state (RFC 8620 §5.2).
         sync.mailbox_state = mailboxes.new_state.clone();
         if mailboxes.changed() {
-            let (mailboxes, mailbox_state) = self.mailboxes(&session, &token, id).await?;
+            let (mailboxes, mailbox_state) = self
+                .labeled_mailboxes(&session, &token, id, account.rights().read_only)
+                .await?;
             sync.layout = Layout::of(&mailboxes);
             sync.mailbox_state = mailbox_state;
             let rights = account.rights();
@@ -1888,7 +2022,36 @@ mod tests {
         assert_eq!(
             mailboxes,
             json!({"accountId": "a", "ids": null,
-                   "properties": ["id", "name", "role", "myRights"]})
+                   "properties": ["id", "name", "parentId", "role", "myRights"]})
+        );
+
+        let create = BTreeMap::from([
+            (
+                "docket".to_owned(),
+                NewMailbox {
+                    name: "Docket".into(),
+                    parent_id: None,
+                },
+            ),
+            (
+                "wait".to_owned(),
+                NewMailbox {
+                    name: "Wait".into(),
+                    parent_id: Some("#docket".into()),
+                },
+            ),
+        ]);
+        let labels = serde_json::to_value(CreateMailboxes {
+            account_id: "a",
+            create: &create,
+        })
+        .unwrap();
+        assert_eq!(
+            labels,
+            json!({"accountId": "a", "create": {
+                "docket": {"name": "Docket", "parentId": null},
+                "wait": {"name": "Wait", "parentId": "#docket"},
+            }})
         );
 
         let query = serde_json::to_value(QueryEmails {
@@ -2358,6 +2521,12 @@ mod tests {
     }
 
     #[test]
+    fn a_mailbox_create_reply_that_wont_parse_fails() {
+        let err = parse_create_mailboxes(json!({"created": 3})).unwrap_err();
+        assert!(err.to_string().contains("malformed Mailbox/set"), "{err}");
+    }
+
+    #[test]
     fn set_emails_serializes_and_replies_parse() {
         let update = BTreeMap::from([(
             "E1".to_string(),
@@ -2418,20 +2587,24 @@ mod tests {
         );
 
         // A label nested under a `Docket` parent classifies the same as
-        // a prefixed name.
-        let nested = serde_json::from_value::<Mailbox>(mailbox(
-            "M-parent",
-            "Docket",
-            None,
-            rights(true, true, true, true, true, true, true, true),
-        ))
-        .unwrap();
+        // a prefixed name; its leaf is the whole name.
+        let full = rights(true, true, true, true, true, true, true, true);
+        let parent = mailbox("M-parent", "Docket", None, full.clone());
+        let mut child = mailbox("M-wait", "Wait", None, full);
+        child["parentId"] = json!("M-parent");
         let mut all = mailboxes();
-        all.insert(0, nested);
+        for m in [parent, child] {
+            all.push(serde_json::from_value::<Mailbox>(m).unwrap());
+        }
+        let layout = Layout::of(&all);
         assert_eq!(
-            Layout::of(&all).folder_names(),
+            layout.folder_names(),
             ["Receipts", "School"].map(String::from)
         );
+        assert_eq!(layout.label_of(State::Wait), Some("M-wait"));
+        assert_eq!(layout.parent.as_deref(), Some("M-parent"));
+        assert!(layout.missing_labels().is_empty());
+        assert_eq!(Layout::of(&mailboxes()).missing_labels(), [State::Wait]);
     }
 
     /// An Email with the given mailbox memberships.
