@@ -179,7 +179,13 @@ mod tests {
 
         // Alex's own Inbox messages share the section with unassigned ones.
         let alex = summary(&store, ALEX, &View::ForMe);
-        assert_eq!(heads(&store, ALEX, &View::ForMe), ["INBOX", "WAIT"]);
+        assert_eq!(
+            heads(&store, ALEX, &View::ForMe),
+            ["INBOX", "DO", "WAIT", "WATCH"]
+        );
+        // Unassigned is everyone's in every state, not just Inbox.
+        assert_eq!(alex[1].1, [vec![fixtures::id(13)]]);
+        assert_eq!(alex[3].1, [vec![fixtures::id(14)]]);
         assert_eq!(
             alex[0].1,
             [
@@ -197,7 +203,7 @@ mod tests {
     fn sidebar_count() {
         let store = fixtures::store().unwrap();
         let sam = store.user(SAM).unwrap().unwrap();
-        assert_eq!(count(&store, &sam, &View::ForMe).unwrap(), 7);
+        assert_eq!(count(&store, &sam, &View::ForMe).unwrap(), 9);
 
         // Counts come from SQL, so pin them to the rows each view lists.
         for login in [SAM, ALEX] {

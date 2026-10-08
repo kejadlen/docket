@@ -83,7 +83,7 @@ Per-person read tracking lives in the database — `$seen` is shared across clie
 
 Each message has zero or more assignees (me, them, or both). It's a soft signal, never a lock, and its meaning is the same in every state: these people should deal with this message.
 
-- Unassigned is normal. An unassigned Inbox message is everyone's.
+- Unassigned is normal. An unassigned message is everyone's.
 - Assigning someone else is a handoff; add a comment to say why.
 - Assignees come off by unassigning themselves. Opening a message doesn't unassign.
 - New messages arrive unassigned.
@@ -105,7 +105,7 @@ There is no toolbar and no thread-level action. Each message's state, folder, an
 
 ## Core flows
 
-- **Landing — For me**: individual messages assigned to me (any state) plus unassigned Inbox messages, grouped by state, then by thread. A thread group lists only its messages in that state; the rest of the thread is omitted.
+- **Landing — For me**: individual messages assigned to me or unassigned (any state), grouped by state, then by thread. A thread group lists only its messages in that state; the rest of the thread is omitted.
 - **Triage**: from the list or the thread view. Click the value to change it. No modals; an undo toast after each change.
 - **Thread view**: received messages, sent messages, and comments in time order, as ruled rows of equal weight. Each row has the sender (and cc/bcc when present) and body on the left; a right gutter holds the date and, for received messages, state, folder, and assignees in fixed positions so they line up down the thread. Sent messages show the recipient after the sender and no values. Comments sit on a filled row. Events ("Sam moved to Do", "filed via another client"). Older messages collapse; their values stay clickable.
 - **Lane views**: one list component showing individual messages, grouped by thread (only messages in that lane):

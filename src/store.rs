@@ -60,7 +60,7 @@ pub enum Filter<'a> {
     /// Received messages in a state.
     State(State),
     /// Received messages in a state that are the user's: assigned to them,
-    /// or unassigned in Inbox.
+    /// or unassigned.
     ForMe { user: &'a str, state: State },
     /// Messages whose subject, sender, or body contains the text. Case is
     /// ignored for ASCII letters only, as SQLite's LIKE does.
@@ -80,7 +80,7 @@ impl Filter<'_> {
             Filter::ForMe { user, state } => (
                 "m.kind = 'received' AND m.state = ?1 AND (
                     EXISTS (SELECT 1 FROM assignees a WHERE a.message = m.id AND a.user = ?2)
-                    OR (?1 = 'inbox' AND NOT EXISTS (SELECT 1 FROM assignees a WHERE a.message = m.id))
+                    OR NOT EXISTS (SELECT 1 FROM assignees a WHERE a.message = m.id)
                 )",
                 vec![Text(state.slug().to_owned()), Text(user.to_owned())],
             ),
