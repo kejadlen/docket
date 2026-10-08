@@ -957,7 +957,31 @@ struct SetEmailsReply {
     #[serde(default)]
     updated: BTreeMap<String, Option<Value>>,
     #[serde(default)]
-    not_updated: BTreeMap<String, Value>,
+    not_updated: BTreeMap<String, SetError>,
+}
+
+/// Why the server refused one id in an `Email/set` (RFC 8620 §5.3).
+#[derive(Debug, Deserialize)]
+struct SetError {
+    #[serde(rename = "type")]
+    kind: String,
+    description: Option<String>,
+}
+
+impl SetError {
+    /// RFC 8620 §5.3: the id names nothing on the server.
+    fn is_not_found(&self) -> bool {
+        self.kind == "notFound"
+    }
+}
+
+impl fmt::Display for SetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.description {
+            Some(description) => write!(f, "{}: {description}", self.kind),
+            None => f.write_str(&self.kind),
+        }
+    }
 }
 
 /// `Email/set` destroy arguments (RFC 8620 §5.3; JMAP has no
@@ -977,7 +1001,7 @@ struct DestroyEmailsReply {
     #[serde(default)]
     destroyed: Vec<String>,
     #[serde(default)]
-    not_destroyed: BTreeMap<String, Value>,
+    not_destroyed: BTreeMap<String, SetError>,
 }
 
 /// Opens sessions: one per credential, against Fastmail unless a test
@@ -1567,7 +1591,11 @@ impl Client {
                 .set_emails(&session.api_url, token, account_id, &update)
                 .await?;
             for (id, error) in &reply.not_updated {
-                tracing::error!(jmap_id = %id, %error, "the server refused a filing");
+                tracing::error!(
+                    jmap_id = %id,
+                    "Fastmail refused to file a message ({error}). Docket dropped the filing, \
+                     so the mail stays in its old folder; file it in Fastmail instead."
+                );
             }
             filed = filed.saturating_add(reply.updated.len());
             // Refused ids clear too: the server's verdict stands, and
@@ -1652,7 +1680,11 @@ impl Client {
                 .set_emails(&session.api_url, token, account_id, &update)
                 .await?;
             for (id, error) in &reply.not_updated {
-                tracing::error!(jmap_id = %id, %error, "the server refused a move");
+                tracing::error!(
+                    jmap_id = %id,
+                    "Fastmail refused to move a message to match its state ({error}). Docket \
+                     dropped the move, so Fastmail shows the old state; move it there instead."
+                );
             }
             moved = moved.saturating_add(reply.updated.len());
             // Refused ids clear too: the server's verdict stands, and
@@ -1670,9 +1702,10 @@ impl Client {
 
     /// Drains the account's queued deletions (task sm) with
     /// `Email/set` destroys — Fastmail's answer to a destroy is moving the
-    /// mail to Trash. Ids the server refused or no longer carries are
-    /// dropped with a warning rather than retried; the thread already
-    /// went Done when the deletion was queued.
+    /// mail to Trash. Ids the server refused are dropped with an error
+    /// rather than retried, and ids it no longer carries count as
+    /// deleted already; the thread went Done when the deletion was
+    /// queued.
     async fn push_deletes(
         &self,
         session: &Session,
@@ -1693,7 +1726,16 @@ impl Client {
                 .destroy_emails(&session.api_url, token, account_id, chunk)
                 .await?;
             for (id, error) in &reply.not_destroyed {
-                tracing::error!(jmap_id = %id, %error, "the server refused a deletion");
+                // Mail that's already gone is what the deletion wanted.
+                if error.is_not_found() {
+                    tracing::debug!(jmap_id = %id, "deletion skipped: the mail is already gone");
+                    continue;
+                }
+                tracing::error!(
+                    jmap_id = %id,
+                    "Fastmail refused to delete a message ({error}). Docket dropped the \
+                     deletion, so the mail is still in Fastmail; delete it there instead."
+                );
             }
             deleted = deleted.saturating_add(reply.destroyed.len());
             // Refused ids clear too: the server's verdict stands, and
@@ -2346,6 +2388,17 @@ mod tests {
         let bare = serde_json::from_value::<SetEmailsReply>(json!({"accountId": "a"})).unwrap();
         assert!(bare.updated.is_empty());
         assert!(bare.not_updated.is_empty());
+    }
+
+    #[test]
+    fn a_set_error_reads_as_its_type_and_description() {
+        let error = |v| serde_json::from_value::<SetError>(v).unwrap();
+        let bare = error(json!({"type": "notFound"}));
+        assert!(bare.is_not_found());
+        assert_eq!(bare.to_string(), "notFound");
+        let described = error(json!({"type": "forbidden", "description": "read-only"}));
+        assert!(!described.is_not_found());
+        assert_eq!(described.to_string(), "forbidden: read-only");
     }
 
     #[test]
