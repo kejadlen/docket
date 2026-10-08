@@ -13,7 +13,8 @@ use docket::store::Store;
 const INTERVAL: Duration = Duration::from_secs(30);
 
 /// Runs the loop in the background. Errors are logged and retried on
-/// the next tick — a blip must not take syncing down with it.
+/// the next tick — a blip must not take syncing down with it — at
+/// error level, so each failure reaches Sentry.
 pub fn spawn(client: Client, credential: Credential, store: Store, sync: Sync) {
     tokio::spawn(async move {
         let name = credential.name.clone();
@@ -28,7 +29,7 @@ pub fn spawn(client: Client, credential: Credential, store: Store, sync: Sync) {
                     tracing::info!(credential = %name, ?counts, "poll");
                 }
                 Err(err) => {
-                    tracing::warn!(credential = %name, %err, "poll failed; retrying next tick");
+                    tracing::error!(credential = %name, %err, "poll failed; retrying next tick");
                 }
             }
         }

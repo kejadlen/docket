@@ -42,6 +42,11 @@ impl IntoResponse for Error {
             Error::Forbidden(_) => StatusCode::FORBIDDEN,
             Error::BadRequest(_) => StatusCode::BAD_REQUEST,
         };
+        // A 500 is Docket's fault, so it goes to Sentry as an issue;
+        // the rest are the request's.
+        if status.is_server_error() {
+            tracing::error!(err = %self, "request failed");
+        }
         (status, self.to_string()).into_response()
     }
 }

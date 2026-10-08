@@ -1567,7 +1567,7 @@ impl Client {
                 .set_emails(&session.api_url, token, account_id, &update)
                 .await?;
             for (id, error) in &reply.not_updated {
-                tracing::warn!(jmap_id = %id, %error, "the server refused a filing");
+                tracing::error!(jmap_id = %id, %error, "the server refused a filing");
             }
             filed = filed.saturating_add(reply.updated.len());
             // Refused ids clear too: the server's verdict stands, and
@@ -1652,7 +1652,7 @@ impl Client {
                 .set_emails(&session.api_url, token, account_id, &update)
                 .await?;
             for (id, error) in &reply.not_updated {
-                tracing::warn!(jmap_id = %id, %error, "the server refused a move");
+                tracing::error!(jmap_id = %id, %error, "the server refused a move");
             }
             moved = moved.saturating_add(reply.updated.len());
             // Refused ids clear too: the server's verdict stands, and
@@ -1693,7 +1693,7 @@ impl Client {
                 .destroy_emails(&session.api_url, token, account_id, chunk)
                 .await?;
             for (id, error) in &reply.not_destroyed {
-                tracing::warn!(jmap_id = %id, %error, "the server refused a deletion");
+                tracing::error!(jmap_id = %id, %error, "the server refused a deletion");
             }
             deleted = deleted.saturating_add(reply.destroyed.len());
             // Refused ids clear too: the server's verdict stands, and
