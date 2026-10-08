@@ -11,3 +11,6 @@ database "docket.db"
 // with none and stands in with fixtures.
 // credential "household" token-file="/run/credentials/docket/household"
 // credential "eli" token-file="/run/credentials/docket/eli"
+
+// Errors and panics go to Sentry when a DSN is set.
+// sentry dsn="https://key@o0.ingest.sentry.io/0"

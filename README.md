@@ -46,6 +46,7 @@ credential "household" token-file="/run/credentials/docket/household"
 | `database` | `docket.db` | SQLite database file, created if missing. |
 | `log` | `warn` | Log level for the app, with optional per-target overrides as properties: `log debug hyper=warn`. |
 | `credential` | None | A Fastmail API token to sync mail with. Repeat it once per login. |
+| `sentry` | None | Reports errors and panics to Sentry: `sentry dsn="https://…"`. |
 
 Each `credential` takes a name, which becomes the account's slug, and a
 `token-file` holding the token, which keeps the token out of the config.

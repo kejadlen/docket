@@ -42,6 +42,17 @@ pub struct Config {
     /// `credential "household" token-file="/run/credentials/docket/household"`.
     #[serde(default, rename = "credential")]
     pub credentials: Credentials,
+
+    /// Where to report errors and panics: `sentry dsn="https://…"`.
+    /// Without it, they only reach the log.
+    #[serde(default, deserialize_with = "present")]
+    pub sentry: Option<Sentry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sentry {
+    pub dsn: String,
 }
 
 impl Config {
@@ -153,6 +164,14 @@ impl<'de> Deserialize<'de> for Level {
     }
 }
 
+/// Deserializes a node that must carry its settings when present: plain
+/// `Option` would read a bare node as absent and quietly drop it.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
+}
+
 fn non_empty_path<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Utf8PathBuf, D::Error> {
     deserializer.deserialize_str(NonEmptyPath)
 }
@@ -200,6 +219,7 @@ mod tests {
             assert_eq!(config.bind.to_string(), "127.0.0.1:3000");
             assert_eq!(config.database, "docket.db");
             assert_eq!(config.log, Targets::from_str("warn").unwrap());
+            assert!(config.sentry.is_none());
         }
     }
 
@@ -286,6 +306,15 @@ mod tests {
     }
 
     #[test]
+    fn sentry_takes_a_dsn() {
+        let config = parse(r#"sentry dsn="https://key@o0.ingest.sentry.io/0""#).unwrap();
+        assert_eq!(
+            config.sentry.unwrap().dsn,
+            "https://key@o0.ingest.sentry.io/0"
+        );
+    }
+
+    #[test]
     fn load_rejects_duplicate_credential_names() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("docket.kdl");
@@ -315,6 +344,8 @@ mod tests {
             (r#"database "a.db" "b.db""#, "sequence"),
             (r#"database path="a.db""#, "map"),
             (r#"database "a.db" { inner }"#, "map"),
+            ("sentry", "expected a string"),
+            (r#"sentry dns="x""#, "unknown field `dns`"),
         ] {
             let (err, _) = error(source);
             assert!(err.contains(message), "{source}: {err}");

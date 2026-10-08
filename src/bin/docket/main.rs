@@ -15,12 +15,31 @@ async fn main() -> miette::Result<()> {
 
     let args = config::Args::parse();
     let config = config::Config::load(&args.config)?;
+    // Sentry's panic hook chains to miette's, so it has to come second.
+    // The guard flushes queued events when main returns.
+    let _sentry = config.sentry.as_ref().map(|sentry| {
+        let mut options = sentry::ClientOptions::default();
+        options.release = Some(docket::VERSION.into());
+        sentry::init((sentry.dsn.as_str(), options))
+    });
     // Tracing starts after the config so its filter comes from the file;
     // config errors report through miette, which needs no subscriber.
+    // Sentry turns error events into issues and lesser ones into
+    // breadcrumbs; without a DSN its layer has no client and drops them.
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(config.log)
+        .with(sentry::integrations::tracing::layer())
+        .with(config.log.clone())
         .init();
+
+    // An error that ends the process skips tracing, so report it here.
+    run(config).await.inspect_err(|err| {
+        let err: &(dyn std::error::Error + Send + Sync) = err.as_ref();
+        sentry::capture_error(err);
+    })
+}
+
+async fn run(config: config::Config) -> miette::Result<()> {
     // Dev pins the fixture clock so sample ages stay stable; production
     // runs on real time.
     #[cfg(feature = "dev")]
