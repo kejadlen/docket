@@ -860,9 +860,9 @@ struct NewMailbox {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateMailboxesReply {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     created: BTreeMap<String, Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     not_created: BTreeMap<String, SetError>,
 }
 
@@ -1010,10 +1010,20 @@ struct EmailPatch {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetEmailsReply {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     updated: BTreeMap<String, Option<Value>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     not_updated: BTreeMap<String, SetError>,
+}
+
+/// Reads a `/set` reply's outcome field, which RFC 8620 §5.3 lets the
+/// server send as `null` instead of empty.
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: de::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Why the server refused one id in an `Email/set` (RFC 8620 §5.3).
@@ -1054,9 +1064,9 @@ struct DestroyEmails<'a> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DestroyEmailsReply {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     destroyed: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     not_destroyed: BTreeMap<String, SetError>,
 }
 
@@ -2557,6 +2567,21 @@ mod tests {
         let bare = serde_json::from_value::<SetEmailsReply>(json!({"accountId": "a"})).unwrap();
         assert!(bare.updated.is_empty());
         assert!(bare.not_updated.is_empty());
+    }
+
+    #[test]
+    fn set_replies_read_null_outcomes_as_empty() {
+        let nulls = json!({
+            "accountId": "a", "oldState": "s1", "newState": "s2",
+            "created": null, "updated": null, "destroyed": null,
+            "notCreated": null, "notUpdated": null, "notDestroyed": null,
+        });
+        let set = parse_set_emails(nulls.clone()).unwrap();
+        assert!(set.updated.is_empty() && set.not_updated.is_empty());
+        let destroy = parse_destroy_emails(nulls.clone()).unwrap();
+        assert!(destroy.destroyed.is_empty() && destroy.not_destroyed.is_empty());
+        let create = parse_create_mailboxes(nulls).unwrap();
+        assert!(create.created.is_empty() && create.not_created.is_empty());
     }
 
     #[test]
